@@ -139,7 +139,7 @@ async def async_setup_entry(
             
             if tv_id in tracked:
                 screen_entity = tracked[tv_id]
-                if new_screen_on != old_screen_on:
+                if new_screen_on != old_screen_on and screen_entity.hass is not None:
                     screen_entity.async_write_ha_state()
                     
                     # Update display log when screen state changes

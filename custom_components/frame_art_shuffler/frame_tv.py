@@ -33,10 +33,12 @@ try:
     from . import samsungtvws
     from .samsungtvws.remote import SamsungTVWS
     from .samsungtvws.helper import get_ssl_context
+    from .samsungtvws.exceptions import UnauthorizedError
 except ImportError:
     import samsungtvws
     from samsungtvws.remote import SamsungTVWS
     from samsungtvws.helper import get_ssl_context
+    from samsungtvws.exceptions import UnauthorizedError
 
 from .const import DEFAULT_PORT, DEFAULT_TIMEOUT
 
@@ -215,6 +217,20 @@ def set_art_on_tv_deleteothers(
                 # We don't care about the actual return value (True/False); we just want to confirm
                 # that the TV received the request and responded, proving it is network-reachable.
                 session.art.get_artmode()
+        except UnauthorizedError as err:
+            # TV is reachable but rejecting the stored token. WoL is not relevant here.
+            # Clear the stale token so the next attempt can trigger a fresh pairing prompt.
+            token_path = _token_path(ip)
+            if token_path.exists():
+                token_path.unlink()
+                _log_progress(f"Token rejected by TV — stale token deleted. Please retry to re-pair.")
+            else:
+                _log_progress(f"Token rejected by TV — please retry to trigger a new pairing prompt.")
+            _log_progress(f"***** CONNECTION FAILED *****")
+            raise FrameArtConnectionError(
+                f"TV {ip} rejected the saved token (ms.channel.unauthorized). "
+                f"The stale token has been deleted — please try again to re-pair."
+            ) from err
         except Exception as err:
             # If we have a MAC address, try to wake the TV
             if mac_address:
