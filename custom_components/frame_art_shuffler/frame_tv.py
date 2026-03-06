@@ -176,13 +176,23 @@ def set_art_on_tv_deleteothers(
     mac_address: Optional[str] = None,
     delete_others: bool = False,
     ensure_art_mode: bool = True,
+    screen_on: bool = True,
     matte: Optional[str] = None,
     photo_filter: Optional[str] = None,
     wait_after_upload: float = _INITIAL_UPLOAD_SETTLE,
     brightness: Optional[int] = None,
     debug: bool = False,
 ) -> str:
-    """Upload art to the Frame TV, mirror test script behaviour, and return content_id."""
+    """Upload art to the Frame TV, mirror test script behaviour, and return content_id.
+
+    When screen_on=False the TV screen is left off throughout the operation:
+    - Wake-on-LAN (if needed) sends only a single packet to bring the TV to
+      "network awake, screen off" standby rather than the two-packet sequence
+      that lights up the screen.
+    - Art mode is not forced on (skips KEY_POWER toggle to avoid waking screen).
+    - The uploaded image is selected with show=False so it becomes the active art
+      for the next time the screen turns on, without activating the display now.
+    """
 
     _clear_progress()
     _log_progress(f"Starting process for {ip}...")
@@ -236,13 +246,18 @@ def set_art_on_tv_deleteothers(
             if mac_address:
                 _log_progress(f"TV appears off. Attempting to wake (Wake-on-LAN)...")
                 try:
-                    # tv_on handles the double-WOL sequence and delays
-                    tv_on(ip, mac_address)
-                    _log_progress(f"Wake sequence complete. Retrying connection...")
-
-                    # Retry connection once
-                    with _FrameTVSession(ip, timeout=4) as session:
-                        session.art.get_artmode()
+                    if screen_on:
+                        # Full two-packet WoL: wakes network interface then turns on screen
+                        tv_on(ip, mac_address)
+                        _log_progress(f"Wake sequence complete. Retrying connection...")
+                        # Retry connectivity check after full wake
+                        with _FrameTVSession(ip, timeout=4) as session:
+                            session.art.get_artmode()
+                    else:
+                        # Single-packet WoL: brings TV to network-awake state, screen stays off
+                        _log_progress(f"Waking network interface (screen will stay off)...")
+                        tv_network_wake(mac_address, ip)
+                        _log_progress(f"TV network-awake. Proceeding with upload (screen off).")
 
                 except Exception as wake_err:
                     # If wake or retry failed, fall through to error
@@ -271,7 +286,8 @@ def set_art_on_tv_deleteothers(
             with _FrameTVSession(ip, timeout=120) as session:
                 art = session.art
 
-                if ensure_art_mode and attempt == 0:  # Only check on first attempt
+                if ensure_art_mode and screen_on and attempt == 0:  # Only check on first attempt
+                    # Skip when screen_on=False — KEY_POWER toggle could wake the screen
                     _ensure_art_mode(art, debug=debug)
 
                 if brightness is not None and attempt == 0:  # Only set on first attempt
@@ -430,17 +446,20 @@ def set_art_on_tv_deleteothers(
             
             _wait_with_countdown(wait_after_upload, "Waiting for TV to process upload")
 
-            displayed = _display_uploaded_art(
-                art,
-                content_id,
-                wait_after_upload=wait_after_upload,
-                debug=debug,
-            )
-
-            if not displayed:
-                _LOGGER.warning("Uploaded art %s but could not verify display; check TV manually", content_id)
+            if screen_on:
+                displayed = _display_uploaded_art(
+                    art,
+                    content_id,
+                    wait_after_upload=wait_after_upload,
+                    debug=debug,
+                )
+                if not displayed:
+                    _LOGGER.warning("Uploaded art %s but could not verify display; check TV manually", content_id)
+                else:
+                    _log_progress(f"Art {content_id} successfully displayed on {ip}")
             else:
-                _log_progress(f"Art {content_id} successfully displayed on {ip}")
+                _select_uploaded_art_silent(art, content_id)
+                _log_progress(f"Art {content_id} staged on {ip} (screen off — will show on wake)")
 
             # Apply photo filter if specified
             if photo_filter is not None and photo_filter.lower() not in ("none", ""):
@@ -565,6 +584,49 @@ def is_tv_on(ip: str) -> bool:
     """
     result = is_art_mode_enabled(ip)
     return result is True  # Convert None to False for backwards compatibility
+
+
+def tv_network_wake(mac_address: str, ip: str, *, timeout: int = 45) -> bool:
+    """Bring Frame TV to network-awake state via a single Wake-on-LAN packet.
+
+    This sends ONLY the first WoL packet, which wakes the network interface and
+    moves the TV into "network awake, screen off" standby. The screen does NOT
+    turn on.
+
+    Compare to tv_on(), which sends two WoL packets — the second one turns on the
+    screen. Use this function when you want to upload or change art while keeping
+    the screen off (e.g., during auto-shuffle while the TV is sleeping).
+
+    Polls the art WebSocket until the TV responds or the timeout expires.
+    Returns True when the TV is reachable.
+    Raises FrameArtConnectionError if the TV does not respond within the timeout.
+    """
+    _send_wake_on_lan(mac_address)
+    _LOGGER.info(
+        "Wake-on-LAN packet sent to %s (single packet — network wake only, screen stays off)",
+        mac_address,
+    )
+
+    deadline = time.monotonic() + timeout
+    poll_interval = 3
+    while time.monotonic() < deadline:
+        time.sleep(poll_interval)
+        try:
+            with _FrameTVSession(ip, timeout=4) as session:
+                session.art.get_artmode()
+            _LOGGER.info("TV %s is now network-reachable (screen off)", ip)
+            return True
+        except UnauthorizedError:
+            # Token rejected — TV is reachable but we have auth issues.
+            # Treat as reachable so the upload loop can try (or fail with a clear error).
+            _LOGGER.info("TV %s is network-reachable (token rejected, screen off)", ip)
+            return True
+        except Exception:
+            pass  # Not yet reachable; keep polling
+
+    raise FrameArtConnectionError(
+        f"TV {ip} did not become network-reachable within {timeout}s after Wake-on-LAN"
+    )
 
 
 def tv_on(ip: str, mac_address: str) -> bool:
@@ -772,6 +834,19 @@ def _display_uploaded_art(art, content_id: str, *, wait_after_upload: float, deb
                 _LOGGER.debug("Fallback select_image failed: %s", err)
 
     return False
+
+
+def _select_uploaded_art_silent(art, content_id: str) -> None:
+    """Select uploaded art as the current image without activating the display.
+
+    Uses select_image(show=False) so the image becomes the active art the TV
+    will show next time the screen turns on, without lighting up the screen now.
+    """
+    try:
+        art.select_image(content_id, show=False)
+        _LOGGER.info("Art %s selected silently (screen off — will display on wake)", content_id)
+    except Exception as err:  # pylint: disable=broad-except
+        _LOGGER.warning("Failed to silently select art %s: %s", content_id, err)
 
 
 def _verify_current_art(art, expected_content_id: str, *, debug: bool) -> bool:
