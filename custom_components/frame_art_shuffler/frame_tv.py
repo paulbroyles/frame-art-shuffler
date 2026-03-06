@@ -201,37 +201,44 @@ def set_art_on_tv_deleteothers(
             f"Art file {file_path.name} is {size_mb:.2f} MB; maximum supported size is 5.00 MB"
         )
 
-    # Fail fast: Check if TV is reachable with a short timeout before starting the heavy upload process
+    # Fail fast: Check if TV is reachable with a short timeout before starting the heavy upload process.
     # This prevents the UI from hanging for minutes if the TV is off.
-    try:
-        _log_progress(f"Checking connectivity to {ip}...")
-        with _FrameTVSession(ip, timeout=4) as session:
-            # Perform a lightweight operation to verify connection.
-            # We don't care about the actual return value (True/False); we just want to confirm
-            # that the TV received the request and responded, proving it is network-reachable.
-            session.art.get_artmode()
-    except Exception as err:
-        # If we have a MAC address, try to wake the TV
-        if mac_address:
-            _log_progress(f"TV appears off. Attempting to wake (Wake-on-LAN)...")
-            try:
-                # tv_on handles the double-WOL sequence and delays
-                tv_on(ip, mac_address)
-                _log_progress(f"Wake sequence complete. Retrying connection...")
-                
-                # Retry connection once
-                with _FrameTVSession(ip, timeout=4) as session:
-                    session.art.get_artmode()
-                    
-            except Exception as wake_err:
-                # If wake or retry failed, fall through to error
-                _log_progress(f"Wake attempt failed or TV still unreachable: {wake_err}")
+    # Skip this check when no token exists yet: the 4-second timeout is far too short for the user
+    # to see and accept the TV's "Allow connection?" permission prompt.  The upload session below
+    # uses a 120-second timeout which gives enough time for first-time pairing to complete.
+    token_exists = _token_path(ip).exists()
+    if token_exists:
+        try:
+            _log_progress(f"Checking connectivity to {ip}...")
+            with _FrameTVSession(ip, timeout=4) as session:
+                # Perform a lightweight operation to verify connection.
+                # We don't care about the actual return value (True/False); we just want to confirm
+                # that the TV received the request and responded, proving it is network-reachable.
+                session.art.get_artmode()
+        except Exception as err:
+            # If we have a MAC address, try to wake the TV
+            if mac_address:
+                _log_progress(f"TV appears off. Attempting to wake (Wake-on-LAN)...")
+                try:
+                    # tv_on handles the double-WOL sequence and delays
+                    tv_on(ip, mac_address)
+                    _log_progress(f"Wake sequence complete. Retrying connection...")
+
+                    # Retry connection once
+                    with _FrameTVSession(ip, timeout=4) as session:
+                        session.art.get_artmode()
+
+                except Exception as wake_err:
+                    # If wake or retry failed, fall through to error
+                    _log_progress(f"Wake attempt failed or TV still unreachable: {wake_err}")
+                    _log_progress(f"***** CONNECTION FAILED *****")
+                    raise FrameArtConnectionError(f"TV {ip} is unreachable after wake attempt: {wake_err}") from wake_err
+            else:
+                _log_progress(f"TV appears to be off or unreachable.")
                 _log_progress(f"***** CONNECTION FAILED *****")
-                raise FrameArtConnectionError(f"TV {ip} is unreachable after wake attempt: {wake_err}") from wake_err
-        else:
-            _log_progress(f"TV appears to be off or unreachable.")
-            _log_progress(f"***** CONNECTION FAILED *****")
-            raise FrameArtConnectionError(f"TV {ip} is unreachable (timeout): {err}") from err
+                raise FrameArtConnectionError(f"TV {ip} is unreachable (timeout): {err}") from err
+    else:
+        _log_progress(f"No token found for {ip} — skipping fast connectivity check to allow pairing.")
 
     # Upload with retries - recreate session on each attempt since connection may be broken
     response = None
