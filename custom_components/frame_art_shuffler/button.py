@@ -40,6 +40,7 @@ async def async_setup_entry(
             FrameArtArtModeButton(hass, entry, tv_id),
             FrameArtOnArtModeButton(hass, entry, tv_id),
             FrameArtShuffleButton(hass, entry, tv_id),
+            FrameArtShuffleSilentButton(hass, entry, tv_id),
             FrameArtClearTokenButton(hass, entry, tv_id),
             FrameArtCalibrateDarkButton(hass, entry, tv_id),
             FrameArtCalibrateBrightButton(hass, entry, tv_id),
@@ -287,6 +288,47 @@ class FrameArtShuffleButton(ButtonEntity):
         
         # Fallback: auto-shuffle disabled or data not available
         await async_shuffle_tv(self.hass, self._entry, self._tv_id, reason="button")
+
+
+class FrameArtShuffleSilentButton(ButtonEntity):
+    """Button entity to shuffle to a random image without waking the screen."""
+
+    _attr_has_entity_name = False
+    _attr_icon = "mdi:shuffle-variant"
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: ConfigEntry,
+        tv_id: str,
+    ) -> None:
+        """Initialize the silent shuffle button entity."""
+        self._hass = hass
+        self._tv_id = tv_id
+        self._entry = entry
+
+        tv_config = get_tv_config(entry, tv_id)
+        if tv_config:
+            self._tv_name = tv_config.get("name", tv_id)
+            self._tv_ip = tv_config.get("ip")
+        else:
+            self._tv_name = tv_id
+            self._tv_ip = None
+
+        self._attr_name = f"{self._tv_name} Shuffle Silently"
+        self._attr_unique_id = f"{tv_id}_shuffle_silent"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, tv_id)},
+            name=self._tv_name,
+            manufacturer="Samsung",
+            model="Frame TV",
+        )
+
+    async def async_press(self) -> None:
+        """Handle the button press - shuffle to a random image without waking the screen."""
+        log_activity(self.hass, self._entry.entry_id, self._tv_id, f"Silent shuffle button pressed for {self._tv_name}")
+        _LOGGER.info(f"Silent shuffle button pressed for {self._tv_name}")
+        await async_shuffle_tv(self.hass, self._entry, self._tv_id, reason="button", screen_on=False)
 
 
 class FrameArtClearTokenButton(ButtonEntity):

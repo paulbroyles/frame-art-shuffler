@@ -383,6 +383,7 @@ async def async_shuffle_tv(
     *,
     reason: str = "manual",
     skip_if_screen_off: bool = False,
+    screen_on: bool = True,
     status_callback: StatusCallback | None = None,
     recent_images: set[str] | None = None,
 ) -> bool:
@@ -398,7 +399,7 @@ async def async_shuffle_tv(
     try:
         return await _async_shuffle_tv_inner(
             hass, entry, tv_id, tv_config, tv_name, reason, skip_if_screen_off, _notify,
-            recent_images,
+            recent_images, screen_on=screen_on,
         )
     except Exception as err:  # pylint: disable=broad-except
         _LOGGER.error("Shuffle failed for %s: %s", tv_name, err)
@@ -423,6 +424,8 @@ async def _async_shuffle_tv_inner(
     skip_if_screen_off: bool,
     _notify: Callable[[str, str], None],
     recent_images: set[str] | None = None,
+    *,
+    screen_on: bool = True,
 ) -> bool:
     """Inner implementation of shuffle - exceptions bubble up to caller."""
     if not tv_config:
@@ -431,6 +434,7 @@ async def _async_shuffle_tv_inner(
     tv_ip = tv_config.get("ip")
     if not tv_ip:
         raise FrameArtError(f"Missing IP address in config for {tv_name}")
+    tv_mac = tv_config.get("mac")
 
     metadata_path = Path(entry.data.get("metadata_path", ""))
     if not metadata_path.exists():
@@ -497,6 +501,8 @@ async def _async_shuffle_tv_inner(
             delete_others=True,
             matte=image_matte,
             photo_filter=image_filter,
+            mac_address=tv_mac,
+            screen_on=screen_on,
         )
 
         await hass.async_add_executor_job(upload_func, tv_ip, str(image_path))
