@@ -155,7 +155,7 @@ fi
 
 echo "Deploying to $REMOTE_TARGET:$REMOTE_PATH"
 
-ssh -T "$REMOTE_TARGET" "sudo mkdir -p '$REMOTE_PARENT' && sudo rm -rf '$REMOTE_PATH'"
+ssh -T "$REMOTE_TARGET" "mkdir -p '$REMOTE_PARENT' && rm -rf '$REMOTE_PATH'"
 
 tar -C "$COMPONENT_DIR/.." \
     --exclude='__pycache__' \
@@ -163,7 +163,7 @@ tar -C "$COMPONENT_DIR/.." \
     --exclude='.pytest_cache' \
     --exclude='.DS_Store' \
     -czf - "$COMPONENT_NAME" \
-    | ssh -T "$REMOTE_TARGET" "sudo tar -xzf - -C '$REMOTE_PARENT'"
+    | ssh -T "$REMOTE_TARGET" "tar -xzf - -C '$REMOTE_PARENT'"
 
 echo "✅ Files synced"
 
