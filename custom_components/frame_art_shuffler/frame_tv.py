@@ -458,8 +458,23 @@ def set_art_on_tv_deleteothers(
                 else:
                     _log_progress(f"Art {content_id} successfully displayed on {ip}")
             else:
-                _select_uploaded_art_silent(art, content_id)
-                _log_progress(f"Art {content_id} staged on {ip} (screen off — will show on wake)")
+                # screen_on=False (Shuffle Silently): don't wake the screen if it's off.
+                # But if the screen is already on, display the art visibly — otherwise
+                # the displayed image never changes when the TV is actively showing art.
+                if is_screen_on(ip):
+                    displayed = _display_uploaded_art(
+                        art,
+                        content_id,
+                        wait_after_upload=wait_after_upload,
+                        debug=debug,
+                    )
+                    if not displayed:
+                        _LOGGER.warning("Uploaded art %s but could not verify display; check TV manually", content_id)
+                    else:
+                        _log_progress(f"Art {content_id} successfully displayed on {ip} (screen was already on)")
+                else:
+                    _select_uploaded_art_silent(art, content_id)
+                    _log_progress(f"Art {content_id} staged on {ip} (screen off — will show on wake)")
 
             # Apply photo filter if specified
             if photo_filter is not None and photo_filter.lower() not in ("none", ""):
