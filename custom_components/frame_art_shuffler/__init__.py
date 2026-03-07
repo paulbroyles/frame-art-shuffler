@@ -387,6 +387,7 @@ if _HA_AVAILABLE:
             filename = call.data.get("filename")
             matte = call.data.get("matte")
             filter_id = call.data.get("filter")
+            screen_on = call.data.get("screen_on", True)
 
             # Resolve entity_id to device_id if needed
             if entity_id and not device_id:
@@ -493,6 +494,7 @@ if _HA_AVAILABLE:
                         matte=matte,
                         photo_filter=filter_id,
                         delete_others=True,
+                        screen_on=screen_on,
                     )
                 )
 

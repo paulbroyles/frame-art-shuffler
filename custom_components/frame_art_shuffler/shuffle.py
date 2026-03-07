@@ -448,6 +448,8 @@ async def _async_fetch_and_display_web_source(
     selected_tag: str | None,
     entry_data: dict[str, Any],
     _notify: Callable[[str, str], None],
+    *,
+    screen_on: bool = True,
 ) -> bool:
     """Call the Frame Art Manager add-on API to fetch and display a web source image."""
     registry = dr.async_get(hass)
@@ -462,7 +464,7 @@ async def _async_fetch_and_display_web_source(
         async with asyncio.timeout(65):
             resp = await session.post(
                 f"{frame_art_manager_url}/api/web-sources/fetch-and-display",
-                json={"deviceId": device.id},
+                json={"deviceId": device.id, "screenOn": screen_on},
             )
             data = await resp.json()
     except Exception as err:
@@ -614,7 +616,8 @@ async def _async_shuffle_tv_inner(
     # Web sources sentinel — call add-on API instead of uploading a library image
     if selected_image.get("_web_sources"):
         return await _async_fetch_and_display_web_source(
-            hass, entry, tv_id, tv_name, matching_count, selected_tag, entry_data, _notify
+            hass, entry, tv_id, tv_name, matching_count, selected_tag, entry_data, _notify,
+            screen_on=screen_on,
         )
 
     image_filename = selected_image["filename"]
