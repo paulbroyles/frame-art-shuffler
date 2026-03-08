@@ -311,11 +311,8 @@ async def set_art_on_tv_deleteothers(
     if not file_path.exists():
         raise FrameArtUploadError(f"Art file not found: {file_path}")
 
-    payload = file_path.read_bytes()
-    _log_file_details(file_path, payload)
-
-    file_type = _detect_file_type(file_path)
-    file_size = len(payload)
+    file_size = file_path.stat().st_size
+    _log_file_details(file_path, file_size)
 
     if file_size > _MAX_UPLOAD_BYTES:
         size_mb = file_size / (1024 * 1024)
@@ -458,10 +455,9 @@ async def set_art_on_tv_deleteothers(
                     _log_progress(f"Uploading with placeholder matte (will apply '{desired_matte}' after)")
 
                 upload_result = await art.upload(
-                    payload,
+                    str(file_path),
                     matte=upload_matte,
                     portrait_matte=upload_matte,
-                    file_type=file_type,
                     timeout=120,
                 )
 
@@ -1082,8 +1078,8 @@ async def _ensure_art_mode(art: SamsungTVAsyncArt, *, debug: bool) -> None:
         raise FrameArtUploadError(f"TV art mode still {status}, expected {_ART_MODE_ON}")
 
 
-def _log_file_details(file_path: Path, payload: bytes) -> None:
-    size_mb = len(payload) / (1024 * 1024)
+def _log_file_details(file_path: Path, file_size: int) -> None:
+    size_mb = file_size / (1024 * 1024)
     _LOGGER.info("Preparing upload of %s (%.2f MB)", file_path.name, size_mb)
 
     if size_mb > _LARGE_FILE_MB:
@@ -1095,14 +1091,6 @@ def _log_file_details(file_path: Path, payload: bytes) -> None:
     elif size_mb > _WARN_FILE_MB:
         _LOGGER.info("File %.2f MB; expect longer upload times", size_mb)
 
-
-def _detect_file_type(path: Path) -> str:
-    suffix = path.suffix.lower()
-    if suffix in {".jpg", ".jpeg"}:
-        return "jpeg"
-    if suffix == ".png":
-        return "png"
-    return "jpeg"
 
 
 def _token_path(ip: str) -> Path:
