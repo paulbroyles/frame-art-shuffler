@@ -73,6 +73,8 @@ _POWER_COMMAND_RETRIES = 4
 _POWER_RETRY_DELAY = 2
 _POWER_COMMAND_TIMEOUT = 8
 _SCREEN_CHECK_TIMEOUT = 6
+_WOL_NETWORK_POLL_TIMEOUT = 15  # seconds to poll REST after 1st WoL before sending 2nd
+_WOL_SCREEN_POLL_TIMEOUT = 8    # seconds to poll REST for screen-on after 2nd WoL
 _WOL_BROADCAST_IP = "255.255.255.255"
 _WOL_BROADCAST_PORT = 9
 
@@ -388,7 +390,7 @@ async def set_art_on_tv_deleteothers(
                             _log_progress(f"Network interface already awake — skipping WoL to avoid waking screen.")
                         else:
                             _log_progress(f"Waking network interface (screen will stay off)...")
-                            await tv_network_wake(mac_address, ip)
+                            await tv_network_wake(mac_address, ip, client=client)
                             _log_progress(f"TV network-awake. Proceeding with upload (screen off).")
 
                 except Exception as wake_err:
@@ -717,7 +719,7 @@ async def _check_rest_state(ip: str, timeout: float = 3.0) -> tuple:
     return True, power_on
 
 
-async def tv_network_wake(mac_address: str, ip: str, *, timeout: int = 45) -> bool:
+async def tv_network_wake(mac_address: str, ip: str, *, client: Optional["TVConnectionManager"] = None, timeout: int = 45) -> bool:
     """Bring Frame TV to network-awake state via a single Wake-on-LAN packet.
 
     This sends ONLY the first WoL packet, which wakes the network interface and
@@ -727,6 +729,10 @@ async def tv_network_wake(mac_address: str, ip: str, *, timeout: int = 45) -> bo
     Compare to tv_on(), which sends two WoL packets — the second one turns on the
     screen. Use this function when you want to upload or change art while keeping
     the screen off (e.g., during auto-shuffle while the TV is sleeping).
+
+    When a TVConnectionManager client is provided, its persistent connection is
+    reused for the reachability poll. Otherwise a short-lived connection is opened
+    on each poll iteration.
 
     Polls the art WebSocket until the TV responds or the timeout expires.
     Returns True when the TV is reachable.
@@ -744,8 +750,11 @@ async def tv_network_wake(mac_address: str, ip: str, *, timeout: int = 45) -> bo
     while loop.time() < deadline:
         await asyncio.sleep(poll_interval)
         try:
-            async with _AsyncFrameTVArtSession(ip, timeout=4) as session:
-                await session.art.get_artmode()
+            if client is not None:
+                await client.ensure_connected(timeout=4)
+            else:
+                async with _AsyncFrameTVArtSession(ip, timeout=4) as session:
+                    await session.art.get_artmode()
             _LOGGER.info("TV %s is now network-reachable (screen off)", ip)
             return True
         except UnauthorizedError:
@@ -764,83 +773,78 @@ async def tv_network_wake(mac_address: str, ip: str, *, timeout: int = 45) -> bo
 async def tv_on(ip: str, mac_address: str, *, client: Optional["TVConnectionManager"] = None) -> bool:
     """Wake Frame TV via Wake-on-LAN.
 
-    Samsung Frame TVs require a two-stage Wake-on-LAN approach with significant delay:
+    Samsung Frame TVs require a two-stage Wake-on-LAN approach:
 
-    1. First WOL wakes the network interface, but the TV enters a "network awake,
-       screen off" standby state where the screen remains black.
+    1. First WoL wakes the network interface, putting the TV into "network awake,
+       screen off" standby.
 
-    2. The TV needs 12+ seconds to fully transition into this network-awake state
-       before it will respond to commands.
+    2. Second WoL (sent once the network interface responds) turns on the screen.
 
-    3. Second WOL (sent after the delay) actually turns on the screen and displays
-       art mode.
+    Rather than sleeping a fixed duration between packets, this function polls the
+    REST API after the first WoL and sends the second packet as soon as the TV's
+    network interface comes up (typically 8–12s). This is more adaptive than a
+    fixed delay and avoids unnecessary waiting.
 
-    CRITICAL: The 12-second delay between WOL packets is required. Testing showed that
-    shorter delays (2s, 5s) do not work - the TV must fully enter the network-awake
-    state before the second WOL will turn on the screen. This mimics the reliable
-    behavior of manually running the WOL command twice from the CLI with natural
-    human delay between commands.
-
-    This function intentionally does NOT send KEY_POWER to avoid toggle issues where
-    the TV might switch from art mode to TV content mode unexpectedly.
-
-    Returns True when Wake-on-LAN was sent successfully. For diagnostic purposes,
-    logs the TV's screen and art mode state after waking.
-
+    Returns True when both WoL packets were sent successfully.
     If you need to ensure the TV is in art mode after waking, call set_art_mode()
     separately.
     """
 
-    # First WOL: Wake network interface
+    # First WoL: Wake network interface
     _send_wake_on_lan(mac_address)
-    _LOGGER.info("Wake-on-LAN packet sent to %s (first - waking network)", mac_address)
+    _LOGGER.info("Wake-on-LAN packet sent to %s (first — waking network interface)", mac_address)
 
-    # CRITICAL: Wait for TV to fully enter network-awake state
-    # This delay was determined through testing - shorter delays (2s, 5s) do not work.
-    # The TV needs this time to transition from "fully off" to "network awake, screen off"
-    # before the second WOL packet will successfully turn on the screen.
-    await asyncio.sleep(12)
+    # Poll REST until the network interface responds, then send the second WoL.
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + _WOL_NETWORK_POLL_TIMEOUT
+    network_awake = False
+    while loop.time() < deadline:
+        await asyncio.sleep(2)
+        network_awake, _ = await _check_rest_state(ip)
+        if network_awake:
+            _LOGGER.info("TV %s network interface responded — sending screen-on WoL", ip)
+            break
+    if not network_awake:
+        _LOGGER.warning(
+            "TV %s REST did not respond within %ss — sending second WoL anyway",
+            ip, _WOL_NETWORK_POLL_TIMEOUT,
+        )
 
-    # Second WOL: Turn on screen
+    # Second WoL: Turn on screen
     _send_wake_on_lan(mac_address)
-    _LOGGER.info("Wake-on-LAN packet sent to %s (second - turning on screen)", mac_address)
+    _LOGGER.info("Wake-on-LAN packet sent to %s (second — turning on screen)", mac_address)
 
-    # Give TV time to fully wake up and display art
-    await asyncio.sleep(3)
+    # Poll for screen-on confirmation.
+    deadline = loop.time() + _WOL_SCREEN_POLL_TIMEOUT
+    screen_on = False
+    while loop.time() < deadline:
+        await asyncio.sleep(2)
+        _, screen_on = await _check_rest_state(ip)
+        if screen_on:
+            break
 
-    # Check state for diagnostic purposes (don't take action based on it)
     try:
-        screen = await is_screen_on(ip, timeout=_SCREEN_CHECK_TIMEOUT)
         art_enabled = await is_art_mode_enabled(client) if client else None
         _LOGGER.info(
             "TV %s state after Wake-on-LAN: screen_on=%s, art_mode=%s",
-            ip, screen, art_enabled
+            ip, screen_on, art_enabled,
         )
     except Exception as err:  # pylint: disable=broad-except
-        _LOGGER.debug("Could not check TV state after Wake-on-LAN: %s", err)
+        _LOGGER.debug("Could not check TV art mode after Wake-on-LAN: %s", err)
 
     return True
 
 
 async def set_art_mode(client: TVConnectionManager) -> None:
-    """Switch TV to art mode by sending KEY_POWER.
+    """Switch TV to art mode using the art channel set_artmode command.
 
-    When the TV is powered on and showing content (TV channels, apps, etc.), sending
-    KEY_POWER will switch it to art mode. This is the reliable programmatic method
-    discovered from the Nick Waterton examples.
-
-    If the TV is already in art mode, this is a no-op.
-    If the TV is off, this will turn it on (behavior depends on TV settings).
-
-    Note: KEY_POWER is a toggle, so we must verify current state before sending it.
-    If we cannot determine the current state, we do not send the command to avoid
-    accidentally toggling out of art mode.
+    Unlike KEY_POWER (a toggle requiring known current state), set_artmode is an
+    explicit mode request that is safe to send regardless of current state. If the
+    TV is already in art mode, the command is a no-op.
     """
 
     ip = client.ip
 
-    # First check if already in art mode
-    # KEY_POWER is a toggle, so we MUST know the current state
     await client.ensure_connected()
     try:
         status = await client.art.get_artmode()
@@ -849,29 +853,13 @@ async def set_art_mode(client: TVConnectionManager) -> None:
         if status == _ART_MODE_ON:
             _LOGGER.info("TV %s already in art mode", ip)
             return
-    except Exception as err:  # pylint: disable=broad-except
-        _LOGGER.warning("Could not verify art mode status for %s: %s. Not sending KEY_POWER to avoid toggling out of art mode.", ip, err)
-        # Do NOT continue - KEY_POWER is a toggle so we need to know current state
-        raise FrameArtUploadError(f"Cannot determine art mode status for {ip}, refusing to send KEY_POWER") from err
 
-    # Send KEY_POWER to switch to art mode
-    token_path = _token_path(ip)
-    try:
-        remote = SamsungTVWSAsyncRemote(
-            host=ip,
-            port=DEFAULT_PORT,
-            token_file=str(token_path),
-            name="FrameArtShuffler",
-        )
-        await remote.send_command(SendRemoteKey.click("KEY_POWER"))
-        await remote.close()
-        _LOGGER.info("Sent KEY_POWER to switch %s to art mode", ip)
+        await client.art.set_artmode(_ART_MODE_ON)
+        _LOGGER.info("set_artmode sent to %s", ip)
 
-        # Give TV time to switch
+        # Give TV a moment to process the mode switch before verifying.
         await asyncio.sleep(3)
 
-        # Verify it worked
-        await client.ensure_connected()
         new_status = await client.art.get_artmode()
         if new_status == _ART_MODE_ON:
             _LOGGER.info("TV %s successfully switched to art mode", ip)
