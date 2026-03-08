@@ -729,10 +729,10 @@ if _HA_AVAILABLE:
                 raise ValueError(f"Cannot turn on {tv_name}: missing MAC address")
 
             try:
-                await hass.async_add_executor_job(tv_on, ip, mac)
+                await tv_on(ip, mac)
                 _LOGGER.info(f"Sent Wake-on-LAN to {tv_name}")
 
-                await hass.async_add_executor_job(set_art_mode, ip)
+                await set_art_mode(ip)
                 _LOGGER.info(f"Switched {tv_name} to art mode")
 
                 # Update status cache
@@ -802,7 +802,7 @@ if _HA_AVAILABLE:
             tv_name = tv_data.get("name", tv_id)
 
             try:
-                await hass.async_add_executor_job(tv_off, ip)
+                await tv_off(ip)
                 _LOGGER.info(f"Turned off {tv_name} screen")
 
                 # Update status cache
