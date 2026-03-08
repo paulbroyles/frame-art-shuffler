@@ -2,6 +2,7 @@
 SamsungTVWS - Samsung Smart TV WS API wrapper
 
 Copyright (C) 2019 DSR! <xchwarze@gmail.com>
+Copyright (C) 2025 Nick Waterton <n.waterton@outlook.com>
 
 SPDX-License-Identifier: LGPL-3.0
 """
@@ -42,3 +43,6 @@ def get_ssl_context() -> ssl.SSLContext:
         _SSL_CONTEXT.check_hostname = False
         _SSL_CONTEXT.verify_mode = ssl.CERT_NONE
     return _SSL_CONTEXT
+
+def is_true(value):
+    return value.lower() in ["on", "true"] if isinstance(value, str) else value in [True, 1]

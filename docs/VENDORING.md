@@ -4,8 +4,8 @@
 
 This component includes a bundled ("vendored") copy of the `samsungtvws` library located in `custom_components/frame_art_shuffler/samsungtvws/`.
 
-- **Current Version:** 3.0.3 (Snapshot from Nov 24, 2025)
-- **Upstream Repository:** [xchwarze/samsung-tv-ws-api](https://github.com/xchwarze/samsung-tv-ws-api)
+- **Current Version:** 3.0.5 (Snapshot from Dec 8, 2025)
+- **Upstream Repository:** [NickWaterton/samsung-tv-ws-api](https://github.com/NickWaterton/samsung-tv-ws-api)
 
 ### Why?
 Home Assistant's built-in `samsungtv` integration relies on an older version of this library. Python cannot load two versions of the same library simultaneously. If we rely on the system version, Home Assistant forces us to use the old one, which lacks critical features for modern Frame TVs (specifically `wait_for_response` and reliable chunked uploads).

@@ -13,7 +13,7 @@ import logging
 from types import TracebackType
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Union
 
-from websockets.client import WebSocketClientProtocol, connect
+from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import ConnectionClosed
 from websockets.protocol import State
 
@@ -31,7 +31,7 @@ _LOGGING = logging.getLogger(__name__)
 
 
 class SamsungTVWSAsyncConnection(connection.SamsungTVWSBaseConnection):
-    connection: Optional[WebSocketClientProtocol]
+    connection: Optional[ClientConnection]
     _recv_loop: Optional["asyncio.Task[None]"]
 
     async def __aenter__(self) -> "SamsungTVWSAsyncConnection":
@@ -45,7 +45,7 @@ class SamsungTVWSAsyncConnection(connection.SamsungTVWSBaseConnection):
     ) -> None:
         await self.close()
 
-    async def open(self) -> WebSocketClientProtocol:
+    async def open(self) -> ClientConnection:
         if self.is_alive():
             # someone else already created a new connection
             return self.connection
@@ -99,7 +99,7 @@ class SamsungTVWSAsyncConnection(connection.SamsungTVWSBaseConnection):
     async def _do_start_listening(
         self,
         callback: Optional[Callable[[str, Any], Optional[Awaitable[None]]]],
-        connection: WebSocketClientProtocol,
+        connection: ClientConnection,
     ) -> None:
         """Do start listening."""
         _LOGGING.debug("Listening Connection Started")
@@ -155,7 +155,7 @@ class SamsungTVWSAsyncConnection(connection.SamsungTVWSBaseConnection):
 
     @staticmethod
     async def _send_command(
-        connection: WebSocketClientProtocol,
+        connection: ClientConnection,
         command: Union[SamsungTVCommand, Dict[str, Any]],
         delay: float,
     ) -> None:
@@ -173,4 +173,4 @@ class SamsungTVWSAsyncConnection(connection.SamsungTVWSBaseConnection):
         await asyncio.sleep(delay)
 
     def is_alive(self) -> bool:
-        return self.connection is not None and self.connection.state is State.OPEN
+        return self.connection is not None and self.connection.state is not State.CLOSED
