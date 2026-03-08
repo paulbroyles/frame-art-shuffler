@@ -156,7 +156,11 @@ class FrameArtArtModeButton(ButtonEntity):
             return
 
         try:
-            await self.hass.async_add_executor_job(set_art_mode, self._tv_ip)
+            data = self.hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
+            client = data.get("art_clients", {}).get(self._tv_id)
+            if client is None:
+                raise FrameArtError(f"No art client for {self._tv_name}")
+            await set_art_mode(client)
             _LOGGER.info(f"Switched {self._tv_name} to art mode")
         except FrameArtError as err:
             _LOGGER.error(f"Failed to switch {self._tv_name} to art mode: {err}")
@@ -206,13 +210,18 @@ class FrameArtOnArtModeButton(ButtonEntity):
             return
 
         try:
+            data = self.hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
+            client = data.get("art_clients", {}).get(self._tv_id)
+            if client is None:
+                raise FrameArtError(f"No art client for {self._tv_name}")
+
             # First turn on the TV
-            await self.hass.async_add_executor_job(tv_on, self._tv_ip, self._tv_mac)
+            await tv_on(self._tv_ip, self._tv_mac, client=client)
             _LOGGER.info(f"Sent Wake-on-LAN to {self._tv_name}, waiting for TV to be ready...")
-            
+
             # tv_on already includes the ~12 second wait for the TV to be ready
             # Now switch to art mode
-            await self.hass.async_add_executor_job(set_art_mode, self._tv_ip)
+            await set_art_mode(client)
             _LOGGER.info(f"Switched {self._tv_name} to art mode")
             
             # Log activity
@@ -610,7 +619,7 @@ class FrameArtTriggerMotionOffButton(ButtonEntity):
         # Turn off the TV
         try:
             _LOGGER.info(f"Auto motion trigger: Turning off {self._tv_name} ({ip})")
-            await self._hass.async_add_executor_job(tv_off, ip)
+            await tv_off(ip)
             _LOGGER.info(f"Auto motion trigger: {self._tv_name} turned off successfully")
             log_activity(
                 self._hass, self._entry.entry_id, self._tv_id,

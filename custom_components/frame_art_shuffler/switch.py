@@ -117,9 +117,7 @@ class FrameArtPowerSwitch(SwitchEntity):
         
         try:
             # Poll screen status
-            screen_on = await self._hass.async_add_executor_job(
-                is_screen_on, self._tv_ip, _STATUS_CHECK_TIMEOUT
-            )
+            screen_on = await is_screen_on(self._tv_ip, _STATUS_CHECK_TIMEOUT)
             
             # Update the cache with confirmed state
             data = self._hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
@@ -145,13 +143,17 @@ class FrameArtPowerSwitch(SwitchEntity):
             return
 
         try:
+            data = self._hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
+            client = data.get("art_clients", {}).get(self._tv_id)
+
             # First turn on the TV via Wake-on-LAN
-            await self._hass.async_add_executor_job(tv_on, self._tv_ip, self._tv_mac)
+            await tv_on(self._tv_ip, self._tv_mac, client=client)
             _LOGGER.info(f"Sent Wake-on-LAN to {self._tv_name}, waiting for TV to be ready...")
-            
+
             # tv_on already includes the ~12 second wait for the TV to be ready
             # Now switch to art mode
-            await self._hass.async_add_executor_job(set_art_mode, self._tv_ip)
+            if client:
+                await set_art_mode(client)
             _LOGGER.info(f"Switched {self._tv_name} to art mode")
             
             # Optimistically update the status cache so UI doesn't flip back
@@ -192,7 +194,7 @@ class FrameArtPowerSwitch(SwitchEntity):
             return
 
         try:
-            await self._hass.async_add_executor_job(tv_off, self._tv_ip)
+            await tv_off(self._tv_ip)
             _LOGGER.info(f"Turned off {self._tv_name} screen")
             
             # Optimistically update the status cache so UI doesn't flip back
