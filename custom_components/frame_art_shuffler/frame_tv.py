@@ -213,6 +213,25 @@ def set_art_on_tv_deleteothers(
             f"Art file {file_path.name} is {size_mb:.2f} MB; maximum supported size is 5.00 MB"
         )
 
+    # For screen_on=False (Shuffle Silently): check REST state BEFORE any WoL or WebSocket activity.
+    # This gives us two pieces of information:
+    # 1. pre_network_awake: is the TV's network interface already up?
+    #    If yes, sending WoL would act as the "second packet" of the two-packet sequence
+    #    and wake the screen — so we must skip WoL when network is already awake.
+    # 2. pre_screen_on: was the screen physically on before the upload started?
+    #    Used at display time to decide whether to show the art (screen was on) or
+    #    stage it silently for the next screen wake (screen was off).
+    pre_network_awake = False
+    pre_screen_on = False
+    if not screen_on:
+        pre_network_awake, pre_screen_on = _check_rest_state(ip)
+        if pre_screen_on:
+            _log_progress(f"Pre-upload: screen is on, network awake")
+        elif pre_network_awake:
+            _log_progress(f"Pre-upload: network awake, screen is off")
+        else:
+            _log_progress(f"Pre-upload: TV is in deep sleep")
+
     # Fail fast: Check if TV is reachable with a short timeout before starting the heavy upload process.
     # This prevents the UI from hanging for minutes if the TV is off.
     # Skip this check when no token exists yet: the 4-second timeout is far too short for the user
@@ -244,7 +263,7 @@ def set_art_on_tv_deleteothers(
         except Exception as err:
             # If we have a MAC address, try to wake the TV
             if mac_address:
-                _log_progress(f"TV appears off. Attempting to wake (Wake-on-LAN)...")
+                _log_progress(f"Art WebSocket unreachable. Checking whether WoL is needed...")
                 try:
                     if screen_on:
                         # Full two-packet WoL: wakes network interface then turns on screen
@@ -254,10 +273,16 @@ def set_art_on_tv_deleteothers(
                         with _FrameTVSession(ip, timeout=4) as session:
                             session.art.get_artmode()
                     else:
-                        # Single-packet WoL: brings TV to network-awake state, screen stays off
-                        _log_progress(f"Waking network interface (screen will stay off)...")
-                        tv_network_wake(mac_address, ip)
-                        _log_progress(f"TV network-awake. Proceeding with upload (screen off).")
+                        # Single-packet WoL: brings TV to network-awake state, screen stays off.
+                        # BUT only send WoL if the network interface is not already awake.
+                        # If it is awake, a WoL packet would act as the "second packet"
+                        # in the two-packet sequence and wake the screen.
+                        if pre_network_awake:
+                            _log_progress(f"Network interface already awake — skipping WoL to avoid waking screen.")
+                        else:
+                            _log_progress(f"Waking network interface (screen will stay off)...")
+                            tv_network_wake(mac_address, ip)
+                            _log_progress(f"TV network-awake. Proceeding with upload (screen off).")
 
                 except Exception as wake_err:
                     # If wake or retry failed, fall through to error
@@ -459,9 +484,10 @@ def set_art_on_tv_deleteothers(
                     _log_progress(f"Art {content_id} successfully displayed on {ip}")
             else:
                 # screen_on=False (Shuffle Silently): don't wake the screen if it's off.
-                # But if the screen is already on, display the art visibly — otherwise
-                # the displayed image never changes when the TV is actively showing art.
-                if is_screen_on(ip):
+                # Use pre_screen_on (checked via REST before any WoL) to decide:
+                # - Screen was on  → display the art visibly (it's already showing, no waking needed)
+                # - Screen was off → stage silently so it shows on the next screen wake
+                if pre_screen_on:
                     displayed = _display_uploaded_art(
                         art,
                         content_id,
@@ -569,13 +595,13 @@ def is_screen_on(ip: str, timeout: Optional[float] = None) -> bool:
     This checks the TV's power state via REST API, not WebSocket.
     REST API is faster and more reliable for status checks since it doesn't
     require opening a WebSocket connection.
-    
+
     Note: May return False if the TV is in a deep sleep state where REST
     API is also unresponsive.
     """
     # Import here to avoid circular imports
     from .samsungtvws.rest import SamsungTVRest
-    
+
     try:
         # Use REST API directly - no WebSocket connection needed
         # This is faster and more reliable than opening WebSocket first
@@ -584,6 +610,31 @@ def is_screen_on(ip: str, timeout: Optional[float] = None) -> bool:
     except Exception as err:  # pylint: disable=broad-except
         _LOGGER.debug("Screen status check failed for %s: %s", ip, err)
         return False
+
+
+def _check_rest_state(ip: str, timeout: float = 3.0) -> tuple:
+    """Check TV network and screen state via REST API.
+
+    Returns (network_awake, screen_on) where:
+    - network_awake: True if the REST API responded at all (network interface is up,
+      regardless of whether the screen is on or off)
+    - screen_on: True if the TV reports PowerState='on' (screen is physically on)
+
+    Unlike is_screen_on(), this distinguishes between:
+    - "REST responded but screen off" → (True, False): network awake, screen dark
+    - "REST did not respond"          → (False, False): TV in deep sleep
+
+    This is used before sending Wake-on-LAN to determine whether the network
+    interface needs waking. Sending WoL to a TV whose network is already awake
+    can act as the "second packet" of the two-packet sequence, waking the screen.
+    """
+    from .samsungtvws.rest import SamsungTVRest
+    try:
+        rest_api = SamsungTVRest(ip, DEFAULT_PORT, timeout)
+        power_on = rest_api.rest_power_state()
+        return True, power_on
+    except Exception:  # pylint: disable=broad-except
+        return False, False
 
 
 # Backwards compatibility alias
