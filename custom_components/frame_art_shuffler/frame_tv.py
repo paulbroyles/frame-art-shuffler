@@ -132,6 +132,19 @@ def set_token_directory(path: Path) -> None:
     _LOGGER.info("Token directory set to: %s", TOKEN_DIR)
 
 
+class _SamsungTVAsyncArtNoInit(SamsungTVAsyncArt):
+    """SamsungTVAsyncArt subclass that skips the blocking sync REST call in get_token().
+
+    SamsungTVAsyncArt.__init__ calls get_token() which instantiates SamsungTVWS (sync).
+    SamsungTVWS.__init__ immediately makes a blocking REST call (get_model_year()) that
+    blocks the event loop. Token handling for our use case is done via the token_file
+    parameter, which SamsungTVWSBaseConnection reads lazily, so get_token() is a no-op.
+    """
+
+    def get_token(self) -> None:  # type: ignore[override]
+        pass
+
+
 class _AsyncFrameTVArtSession:
     """Async context manager for Samsung TV art channel WebSocket operations."""
 
@@ -140,7 +153,7 @@ class _AsyncFrameTVArtSession:
         self.token_path = _token_path(ip)
         self._timeout = timeout if timeout is not None else DEFAULT_TIMEOUT
         _LOGGER.debug("Using token path: %s (exists: %s)", self.token_path, self.token_path.exists())
-        self._art = SamsungTVAsyncArt(
+        self._art = _SamsungTVAsyncArtNoInit(
             host=ip,
             port=DEFAULT_PORT,
             timeout=self._timeout,
