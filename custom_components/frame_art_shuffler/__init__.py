@@ -86,7 +86,7 @@ if _HA_AVAILABLE:
     from .coordinator import FrameArtCoordinator
     from .config_entry import get_tv_config, get_global_tagsets, list_tv_configs, remove_tv_config, update_tv_config, update_global_tagsets, get_effective_tags
     from . import frame_tv
-    from .frame_tv import TOKEN_DIR as DEFAULT_TOKEN_DIR, set_token_directory, tv_on, tv_off, set_art_mode, is_screen_on
+    from .frame_tv import TOKEN_DIR as DEFAULT_TOKEN_DIR, TVConnectionManager, set_token_directory, tv_on, tv_off, set_art_mode, is_screen_on
     from .metadata import MetadataStore
     from .dashboard import async_generate_dashboard
     from .activity import log_activity
@@ -351,11 +351,18 @@ if _HA_AVAILABLE:
         coordinator = FrameArtCoordinator(hass, entry, metadata_path)
         await coordinator.async_config_entry_first_refresh()
 
+        art_clients = {
+            tv_id: TVConnectionManager(tv_cfg["ip"])
+            for tv_id, tv_cfg in entry.data.get("tvs", {}).items()
+            if tv_cfg.get("ip")
+        }
+
         hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
             "coordinator": coordinator,
             "metadata_path": metadata_path,
             "token_dir": token_dir,
             "config_snapshot": _get_structural_config(entry.data),
+            "art_clients": art_clients,
             # Initialize dicts that sensors need to read from
             # These will be populated by the timer code after platforms are set up
             "auto_brightness_next_times": {},
@@ -465,6 +472,10 @@ if _HA_AVAILABLE:
 
             tv_name = tv_data.get("name", tv_id)
 
+            client = data.get("art_clients", {}).get(tv_id)
+            if client is None:
+                raise ValueError(f"No art client found for TV {tv_id}")
+
             # Determine display filename for logging
             if filename:
                 display_filename = filename
@@ -485,7 +496,7 @@ if _HA_AVAILABLE:
                 )
 
                 await frame_tv.set_art_on_tv_deleteothers(
-                    ip,
+                    client,
                     final_path,
                     mac_address=mac,
                     matte=matte,
@@ -728,11 +739,14 @@ if _HA_AVAILABLE:
             if not mac:
                 raise ValueError(f"Cannot turn on {tv_name}: missing MAC address")
 
+            data = hass.data.get(DOMAIN, {}).get(target_entry.entry_id, {})
+            client = data.get("art_clients", {}).get(tv_id)
+
             try:
-                await tv_on(ip, mac)
+                await tv_on(ip, mac, client=client)
                 _LOGGER.info(f"Sent Wake-on-LAN to {tv_name}")
 
-                await set_art_mode(ip)
+                await set_art_mode(client)
                 _LOGGER.info(f"Switched {tv_name} to art mode")
 
                 # Update status cache
@@ -1329,7 +1343,11 @@ if _HA_AVAILABLE:
             
             ip = tv_data["ip"]
             tv_name = tv_config.get("name", tv_id)
-            
+            client = data.get("art_clients", {}).get(tv_id)
+            if client is None:
+                _LOGGER.warning(f"Brightness: No art client found for {tv_id}")
+                return False
+
             last_error = None
             for attempt in range(1, max_attempts + 1):
                 try:
@@ -1337,7 +1355,7 @@ if _HA_AVAILABLE:
                         f"Brightness: Attempting to set {tv_name} ({ip}) to {brightness} "
                         f"(attempt {attempt}/{max_attempts})"
                     )
-                    await frame_tv.set_tv_brightness(ip, brightness)
+                    await frame_tv.set_tv_brightness(client, brightness)
                     
                     # Success! Store timestamp and brightness
                     from .config_entry import update_tv_config as update_config
@@ -1460,26 +1478,23 @@ if _HA_AVAILABLE:
             
             _LOGGER.info(f"Post-shuffle brightness sync: Setting {tv_name} to {target_brightness}")
             
-            # Get TV IP for verification
-            coordinator = data.get("coordinator")
-            tv_data = next((tv for tv in coordinator.data if tv["id"] == tv_id), None) if coordinator else None
-            ip = tv_data["ip"] if tv_data else None
-            
+            brightness_client = data.get("art_clients", {}).get(tv_id)
+
             success = await async_set_brightness_with_retry(
                 tv_id,
                 int(target_brightness),
                 reason=reason,
                 log_success=False,  # Don't create noisy activity entries for background sync
             )
-            
-            if success and ip:
+
+            if success and brightness_client:
                 # Schedule delayed verification and reinforcement to catch brightness drift
                 # See docs/BRIGHTNESS_DRIFT.md for details on this issue
                 async def _delayed_brightness_check() -> None:
                     _LOGGER.debug(f"Starting delayed brightness verification for {tv_name}")
                     await asyncio.sleep(5)  # Wait for TV to settle after image render
                     try:
-                        actual = await frame_tv.get_tv_brightness(ip)
+                        actual = await frame_tv.get_tv_brightness(brightness_client)
                         if actual is not None and actual != target_brightness:
                             _LOGGER.warning(
                                 f"Brightness drift detected for {tv_name}: expected {target_brightness}, "
@@ -1957,7 +1972,8 @@ if _HA_AVAILABLE:
                 try:
                     power_on_in_progress[tv_id] = True
                     _LOGGER.info(f"Auto motion: Waking {tv_name} ({ip}) via WOL")
-                    await frame_tv.tv_on(ip, mac)
+                    motion_client = hass.data[DOMAIN][entry.entry_id].get("art_clients", {}).get(tv_id)
+                    await frame_tv.tv_on(ip, mac, client=motion_client)
                     _LOGGER.info(f"Auto motion: {tv_name} wake sequence complete")
                     sensor_short = _get_sensor_short_name(sensor_id) if sensor_id else "motion"
                     log_activity(
@@ -2100,6 +2116,8 @@ if _HA_AVAILABLE:
             display_log: DisplayLogManager | None = data[entry.entry_id].get("display_log")
             if display_log:
                 await display_log.async_shutdown()
+            for client in data[entry.entry_id].get("art_clients", {}).values():
+                await client.async_close()
             data.pop(entry.entry_id)
 
         if not hass.config_entries.async_entries(DOMAIN):

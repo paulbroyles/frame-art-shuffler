@@ -9,7 +9,6 @@ run overlapping transfers for the same device.
 from __future__ import annotations
 
 import asyncio
-import functools
 import json
 import logging
 import random
@@ -631,16 +630,19 @@ async def _async_shuffle_tv_inner(
         image_filter = None
 
     async def _perform_upload() -> bool:
-        upload_func = functools.partial(
-            set_art_on_tv_deleteothers,
+        client = entry_data.get("art_clients", {}).get(tv_id)
+        if client is None:
+            raise FrameArtError(f"No art client found for TV {tv_id}")
+
+        await set_art_on_tv_deleteothers(
+            client,
+            str(image_path),
             delete_others=True,
             matte=image_matte,
             photo_filter=image_filter,
             mac_address=tv_mac,
             screen_on=screen_on,
         )
-
-        await hass.async_add_executor_job(upload_func, tv_ip, str(image_path))
 
         now = datetime.now(timezone.utc)
         timestamp = now.isoformat()

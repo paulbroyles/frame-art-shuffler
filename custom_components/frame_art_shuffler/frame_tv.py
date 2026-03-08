@@ -145,19 +145,53 @@ class _SamsungTVAsyncArtNoInit(SamsungTVAsyncArt):
         pass
 
 
+async def _ensure_token(ip: str, timeout: Optional[float] = None) -> None:
+    """Ensure a token file exists by performing a handshake via the remote control channel.
+
+    The art channel WebSocket does not support the initial pairing handshake; only the
+    remote control channel does. If the token file is missing, this function opens and
+    immediately closes a remote control connection to trigger the TV's "Allow connection?"
+    prompt and save the resulting token.
+    """
+    token_path = _token_path(ip)
+    if token_path.exists():
+        return
+    _LOGGER.info(
+        "No token found for %s at %s, attempting handshake via remote control channel...",
+        ip, token_path,
+    )
+    try:
+        remote = SamsungTVWSAsyncRemote(
+            host=ip,
+            port=DEFAULT_PORT,
+            timeout=timeout or DEFAULT_TIMEOUT,
+            token_file=str(token_path),
+            name="FrameArtShuffler",
+        )
+        await remote.open()
+        await remote.close()
+        _LOGGER.info("Handshake successful, token saved to %s.", token_path)
+    except Exception as err:
+        _LOGGER.warning("Handshake attempt failed: %s", err)
+        # Continue anyway — art channel open will fail with a clear error if token is truly needed
+
+
 class _AsyncFrameTVArtSession:
-    """Async context manager for Samsung TV art channel WebSocket operations."""
+    """Async context manager for Samsung TV art channel WebSocket operations.
+
+    Used internally by tv_network_wake() for short-lived probe connections.
+    Most callers should use TVConnectionManager for persistent connections.
+    """
 
     def __init__(self, ip: str, timeout: Optional[float] = None) -> None:
         self.ip = ip
-        self.token_path = _token_path(ip)
         self._timeout = timeout if timeout is not None else DEFAULT_TIMEOUT
-        _LOGGER.debug("Using token path: %s (exists: %s)", self.token_path, self.token_path.exists())
+        _LOGGER.debug("Using token path: %s (exists: %s)", _token_path(ip), _token_path(ip).exists())
         self._art = _SamsungTVAsyncArtNoInit(
             host=ip,
             port=DEFAULT_PORT,
             timeout=self._timeout,
-            token_file=str(self.token_path),
+            token_file=str(_token_path(ip)),
             name="FrameArtShuffler",
         )
 
@@ -166,33 +200,69 @@ class _AsyncFrameTVArtSession:
         return self._art
 
     async def __aenter__(self) -> "_AsyncFrameTVArtSession":
-        # Ensure we have a valid token by performing a handshake on the remote channel
-        # if the token file is missing. The art channel does not support initial handshake.
-        if not self.token_path.exists():
-            _LOGGER.info(
-                "No token found for %s at %s, attempting handshake via remote control channel...",
-                self.ip, self.token_path,
-            )
-            try:
-                remote = SamsungTVWSAsyncRemote(
-                    host=self.ip,
-                    port=DEFAULT_PORT,
-                    timeout=self._timeout,
-                    token_file=str(self.token_path),
-                    name="FrameArtShuffler",
-                )
-                await remote.open()
-                await remote.close()
-                _LOGGER.info("Handshake successful, token saved to %s.", self.token_path)
-            except Exception as err:
-                _LOGGER.warning("Handshake attempt failed: %s", err)
-                # We continue anyway, as art() might handle it or we want to bubble the error later
-
+        await _ensure_token(self.ip, self._timeout)
         await self._art.open()
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self._art.close()
+
+
+class TVConnectionManager:
+    """Manages a persistent WebSocket connection to one Samsung Frame TV art channel.
+
+    The connection is opened lazily on first use (ensure_connected()) and reused
+    across all art operations. If the connection drops (TV enters deep sleep or reboots),
+    start_listening() inside _send_art_request() reconnects automatically for subsequent
+    operations. Call ensure_connected() explicitly before operations that need a confirmed
+    live connection (e.g., at the start of an upload or after a WoL wake).
+    """
+
+    def __init__(self, ip: str) -> None:
+        self.ip = ip
+        self._art = _SamsungTVAsyncArtNoInit(
+            host=ip,
+            port=DEFAULT_PORT,
+            timeout=DEFAULT_TIMEOUT,
+            token_file=str(_token_path(ip)),
+            name="FrameArtShuffler",
+        )
+        self._lock = asyncio.Lock()
+
+    @property
+    def art(self) -> SamsungTVAsyncArt:
+        return self._art
+
+    async def ensure_connected(self, timeout: Optional[float] = None) -> None:
+        """Open the art channel connection if not already alive.
+
+        When timeout is provided it overrides the connection open_timeout for this
+        single attempt only (e.g. 4 s for a fast-fail connectivity check). The
+        original timeout is restored afterward.
+        """
+        if self._art.is_alive():
+            return
+        async with self._lock:
+            if self._art.is_alive():
+                return
+            await _ensure_token(self.ip)
+            original_timeout = self._art.timeout
+            if timeout is not None:
+                self._art.timeout = timeout
+            try:
+                # start_listening() opens the connection and starts the receive loop.
+                # It becomes a no-op when the connection is already alive.
+                await self._art.start_listening()
+            finally:
+                if timeout is not None:
+                    self._art.timeout = original_timeout
+
+    async def async_close(self) -> None:
+        """Close the persistent connection."""
+        try:
+            await self._art.close()
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.debug("Error closing art client for %s: %s", self.ip, err)
 
 
 async def _rest_device_info(ip: str, timeout: float) -> Optional[dict]:
@@ -208,7 +278,7 @@ async def _rest_device_info(ip: str, timeout: float) -> Optional[dict]:
 
 
 async def set_art_on_tv_deleteothers(
-    ip: str,
+    client: TVConnectionManager,
     artpath: str,
     *,
     mac_address: Optional[str] = None,
@@ -231,6 +301,8 @@ async def set_art_on_tv_deleteothers(
     - The uploaded image is selected with show=False so it becomes the active art
       for the next time the screen turns on, without activating the display now.
     """
+
+    ip = client.ip
 
     _clear_progress()
     _log_progress(f"Starting process for {ip}...")
@@ -279,11 +351,11 @@ async def set_art_on_tv_deleteothers(
     if token_exists:
         try:
             _log_progress(f"Checking connectivity to {ip}...")
-            async with _AsyncFrameTVArtSession(ip, timeout=4) as session:
-                # Perform a lightweight operation to verify connection.
-                # We don't care about the actual return value (True/False); we just want to confirm
-                # that the TV received the request and responded, proving it is network-reachable.
-                await session.art.get_artmode()
+            # Use a short timeout for the fast-fail connectivity check.
+            # If the persistent connection is already alive this returns immediately.
+            await client.ensure_connected(timeout=4)
+            # Lightweight request to confirm the art channel is responding.
+            await client.art.get_artmode()
         except UnauthorizedError as err:
             # TV is reachable but rejecting the stored token. WoL is not relevant here.
             # Clear the stale token so the next attempt can trigger a fresh pairing prompt.
@@ -305,11 +377,11 @@ async def set_art_on_tv_deleteothers(
                 try:
                     if screen_on:
                         # Full two-packet WoL: wakes network interface then turns on screen
-                        await tv_on(ip, mac_address)
+                        await tv_on(ip, mac_address, client=client)
                         _log_progress(f"Wake sequence complete. Retrying connection...")
-                        # Retry connectivity check after full wake
-                        async with _AsyncFrameTVArtSession(ip, timeout=4) as session:
-                            await session.art.get_artmode()
+                        # Retry connectivity check after full wake using the persistent connection
+                        await client.ensure_connected()
+                        await client.art.get_artmode()
                     else:
                         # Single-packet WoL: brings TV to network-awake state, screen stays off.
                         # BUT only send WoL if the network interface is not already awake.
@@ -345,136 +417,136 @@ async def set_art_on_tv_deleteothers(
             await asyncio.sleep(_UPLOAD_RETRY_DELAY)
 
         try:
-            # Use 120s timeout for upload to handle large files/slow networks
-            async with _AsyncFrameTVArtSession(ip, timeout=120) as session:
-                art = session.art
+            # Ensure the persistent connection is alive before each upload attempt.
+            await client.ensure_connected()
+            art = client.art
 
-                if ensure_art_mode and screen_on and attempt == 0:  # Only check on first attempt
-                    # Skip when screen_on=False — KEY_POWER toggle could wake the screen
-                    await _ensure_art_mode(art, debug=debug)
+            if ensure_art_mode and screen_on and attempt == 0:  # Only check on first attempt
+                # Skip when screen_on=False — KEY_POWER toggle could wake the screen
+                await _ensure_art_mode(art, debug=debug)
 
-                if brightness is not None and attempt == 0:  # Only set on first attempt
-                    await _set_brightness(art, brightness, debug=debug)
+            if brightness is not None and attempt == 0:  # Only set on first attempt
+                await _set_brightness(art, brightness, debug=debug)
 
-                # Get current image count before upload
-                images_before = None
-                try:
-                    _log_progress("Checking Art Mode connection and listing current images...")
-                    images_before = await art.available()
-                    ids = [img.get('content_id') for img in images_before] if images_before else []
-                    count = len(images_before) if images_before else 0
+            # Get current image count before upload
+            images_before = None
+            try:
+                _log_progress("Checking Art Mode connection and listing current images...")
+                images_before = await art.available()
+                ids = [img.get('content_id') for img in images_before] if images_before else []
+                count = len(images_before) if images_before else 0
 
-                    # TV firmware often reports the active image twice (once as active, once as available).
-                    # If we see exactly 2 identical IDs, report it as 1 image to avoid user confusion.
-                    if count == 2 and len(ids) == 2 and ids[0] == ids[1]:
-                        count = 1
+                # TV firmware often reports the active image twice (once as active, once as available).
+                # If we see exactly 2 identical IDs, report it as 1 image to avoid user confusion.
+                if count == 2 and len(ids) == 2 and ids[0] == ids[1]:
+                    count = 1
 
-                    _log_progress(f"Art Mode connection OK. Images on TV: {count} {ids}")
-                except Exception as err:  # pylint: disable=broad-except
-                    _LOGGER.warning("Could not list images (Art Mode connection issue?): %s", err)
+                _log_progress(f"Art Mode connection OK. Images on TV: {count} {ids}")
+            except Exception as err:  # pylint: disable=broad-except
+                _LOGGER.warning("Could not list images (Art Mode connection issue?): %s", err)
 
-                # Matte workaround: Samsung firmware has a bug where uploading with a matte
-                # causes Error 40000 when selecting the image. Workaround is to upload with
-                # a placeholder matte, then use change_matte() to apply the desired matte.
-                # See docs/MATTE_BEHAVIOR.md for details.
-                desired_matte = matte
-                upload_matte = _MATTE_PLACEHOLDER if desired_matte and desired_matte != "none" else "none"
+            # Matte workaround: Samsung firmware has a bug where uploading with a matte
+            # causes Error 40000 when selecting the image. Workaround is to upload with
+            # a placeholder matte, then use change_matte() to apply the desired matte.
+            # See docs/MATTE_BEHAVIOR.md for details.
+            desired_matte = matte
+            upload_matte = _MATTE_PLACEHOLDER if desired_matte and desired_matte != "none" else "none"
 
-                try:
-                    _log_progress(f"Uploading image to {ip} (attempt {attempt + 1}/{_UPLOAD_RETRIES})...")
+            try:
+                _log_progress(f"Uploading image to {ip} (attempt {attempt + 1}/{_UPLOAD_RETRIES})...")
+                if desired_matte and desired_matte != "none":
+                    _log_progress(f"Uploading with placeholder matte (will apply '{desired_matte}' after)")
+
+                upload_result = await art.upload(
+                    payload,
+                    matte=upload_matte,
+                    portrait_matte=upload_matte,
+                    file_type=file_type,
+                    timeout=120,
+                )
+
+                if upload_result:
+                    content_id = upload_result
                     if desired_matte and desired_matte != "none":
-                        _log_progress(f"Uploading with placeholder matte (will apply '{desired_matte}' after)")
+                        _log_progress(f"Applying matte: {desired_matte}")
+                        await art.change_matte(content_id, desired_matte)
+                    _log_progress(f"Upload successful, content_id={content_id}")
+                    if debug:
+                        _LOGGER.debug("Upload returned content_id=%s", content_id)
+                    break  # Success, exit retry loop
 
-                    upload_result = await art.upload(
-                        payload,
-                        matte=upload_matte,
-                        portrait_matte=upload_matte,
-                        file_type=file_type,
-                        timeout=120,
+                else:
+                    # art.upload() returned None — timed out waiting for image_added confirmation.
+                    # Check if the image actually appeared on the TV despite the timeout.
+                    _LOGGER.info(
+                        "Upload attempt %s timed out - checking if image appeared on TV...",
+                        attempt + 1,
                     )
 
-                    if upload_result:
-                        content_id = upload_result
-                        if desired_matte and desired_matte != "none":
-                            _log_progress(f"Applying matte: {desired_matte}")
-                            await art.change_matte(content_id, desired_matte)
-                        _log_progress(f"Upload successful, content_id={content_id}")
-                        if debug:
-                            _LOGGER.debug("Upload returned content_id=%s", content_id)
-                        break  # Success, exit retry loop
+                    timeout_recovered = False
+                    try:
+                        await asyncio.sleep(6)  # Give TV more time to finish processing
+                        images_after = await art.available()
 
-                    else:
-                        # art.upload() returned None — timed out waiting for image_added confirmation.
-                        # Check if the image actually appeared on the TV despite the timeout.
-                        _LOGGER.info(
-                            "Upload attempt %s timed out - checking if image appeared on TV...",
-                            attempt + 1,
-                        )
+                        if images_after and images_before is not None:
+                            # Check if a new image appeared by comparing counts
+                            count_before = len(images_before)
+                            count_after = len(images_after)
 
-                        timeout_recovered = False
-                        try:
-                            await asyncio.sleep(6)  # Give TV more time to finish processing
-                            images_after = await art.available()
+                            if count_after > count_before:
+                                # New image(s) appeared! Find the new one by comparing lists
+                                before_ids = {img.get('content_id') for img in images_before}
+                                new_images = [img for img in images_after if img.get('content_id') not in before_ids]
 
-                            if images_after and images_before is not None:
-                                # Check if a new image appeared by comparing counts
-                                count_before = len(images_before)
-                                count_after = len(images_after)
-
-                                if count_after > count_before:
-                                    # New image(s) appeared! Find the new one by comparing lists
-                                    before_ids = {img.get('content_id') for img in images_before}
-                                    new_images = [img for img in images_after if img.get('content_id') not in before_ids]
-
-                                    if new_images:
-                                        # Found new image(s), take the first one
-                                        content_id = new_images[0].get('content_id')
-                                        _LOGGER.info("Upload timed out but new image appeared on TV (content_id=%s)", content_id)
-                                        if content_id and desired_matte and desired_matte != "none":
-                                            await art.change_matte(content_id, desired_matte)
-                                        timeout_recovered = bool(content_id)
-                                    else:
-                                        # Fallback: if count increased but can't identify which, use newest
-                                        _LOGGER.warning("Count increased but couldn't identify new image, using newest")
-                                        content_id = images_after[-1].get('content_id')
-                                        if content_id:
-                                            if desired_matte and desired_matte != "none":
-                                                await art.change_matte(content_id, desired_matte)
-                                            timeout_recovered = True
+                                if new_images:
+                                    # Found new image(s), take the first one
+                                    content_id = new_images[0].get('content_id')
+                                    _LOGGER.info("Upload timed out but new image appeared on TV (content_id=%s)", content_id)
+                                    if content_id and desired_matte and desired_matte != "none":
+                                        await art.change_matte(content_id, desired_matte)
+                                    timeout_recovered = bool(content_id)
                                 else:
-                                    _LOGGER.warning("Upload timed out and no new image appeared - upload actually failed")
-
-                            # If we don't have before count, try to find by comparing with after
-                            elif images_after:
-                                _LOGGER.info("Upload timed out, no before count available, using newest image...")
-                                content_id = images_after[-1].get('content_id')
-                                _LOGGER.warning("Upload timed out, using newest image as best guess (content_id=%s)", content_id)
-                                if content_id:
-                                    timeout_recovered = True
+                                    # Fallback: if count increased but can't identify which, use newest
+                                    _LOGGER.warning("Count increased but couldn't identify new image, using newest")
+                                    content_id = images_after[-1].get('content_id')
+                                    if content_id:
+                                        if desired_matte and desired_matte != "none":
+                                            await art.change_matte(content_id, desired_matte)
+                                        timeout_recovered = True
                             else:
-                                _LOGGER.warning("Upload timed out and TV has no images")
+                                _LOGGER.warning("Upload timed out and no new image appeared - upload actually failed")
 
-                        except Exception as check_err:  # pylint: disable=broad-except
-                            _LOGGER.warning("Could not check TV gallery after timeout: %s", check_err)
-
-                        if timeout_recovered:
-                            break
-
-                        # If timeout recovery failed, this was a real failure - will retry
-                        last_error = FrameArtUploadError(
-                            f"Upload attempt {attempt + 1} timed out and no new image confirmed on TV"
-                        )
-                        if attempt < _UPLOAD_RETRIES - 1:
-                            _LOGGER.info("Upload actually failed (not just timeout), will retry...")
+                        # If we don't have before count, try to find by comparing with after
+                        elif images_after:
+                            _LOGGER.info("Upload timed out, no before count available, using newest image...")
+                            content_id = images_after[-1].get('content_id')
+                            _LOGGER.warning("Upload timed out, using newest image as best guess (content_id=%s)", content_id)
+                            if content_id:
+                                timeout_recovered = True
                         else:
-                            raise last_error
+                            _LOGGER.warning("Upload timed out and TV has no images")
 
-                except Exception as upload_err:  # pylint: disable=broad-except
-                    last_error = upload_err
+                    except Exception as check_err:  # pylint: disable=broad-except
+                        _LOGGER.warning("Could not check TV gallery after timeout: %s", check_err)
+
+                    if timeout_recovered:
+                        break
+
+                    # If timeout recovery failed, this was a real failure - will retry
+                    last_error = FrameArtUploadError(
+                        f"Upload attempt {attempt + 1} timed out and no new image confirmed on TV"
+                    )
                     if attempt < _UPLOAD_RETRIES - 1:
-                        _LOGGER.warning("Upload attempt %s failed: %s", attempt + 1, upload_err)
+                        _LOGGER.info("Upload actually failed (not just timeout), will retry...")
                     else:
-                        raise
+                        raise last_error
+
+            except Exception as upload_err:  # pylint: disable=broad-except
+                last_error = upload_err
+                if attempt < _UPLOAD_RETRIES - 1:
+                    _LOGGER.warning("Upload attempt %s failed: %s", attempt + 1, upload_err)
+                else:
+                    raise
 
         except Exception as err:  # pylint: disable=broad-except
             last_error = err
@@ -486,14 +558,29 @@ async def set_art_on_tv_deleteothers(
     if not content_id:
         raise FrameArtUploadError(f"Upload failed after {_UPLOAD_RETRIES} attempts: {last_error}")
 
-    # We have a content_id, continue with display
+    # We have a content_id, continue with display using the persistent connection.
     try:
-        async with _AsyncFrameTVArtSession(ip) as session:
-            art = session.art
+        await client.ensure_connected()
+        art = client.art
 
-            await _wait_with_countdown(wait_after_upload, "Waiting for TV to process upload")
+        await _wait_with_countdown(wait_after_upload, "Waiting for TV to process upload")
 
-            if screen_on:
+        if screen_on:
+            displayed = await _display_uploaded_art(
+                art,
+                content_id,
+                debug=debug,
+            )
+            if not displayed:
+                _LOGGER.warning("Uploaded art %s but could not verify display; check TV manually", content_id)
+            else:
+                _log_progress(f"Art {content_id} successfully displayed on {ip}")
+        else:
+            # screen_on=False (Shuffle Silently): don't wake the screen if it's off.
+            # Use pre_screen_on (checked via REST before any WoL) to decide:
+            # - Screen was on  → display the art visibly (it's already showing, no waking needed)
+            # - Screen was off → stage silently so it shows on the next screen wake
+            if pre_screen_on:
                 displayed = await _display_uploaded_art(
                     art,
                     content_id,
@@ -502,96 +589,82 @@ async def set_art_on_tv_deleteothers(
                 if not displayed:
                     _LOGGER.warning("Uploaded art %s but could not verify display; check TV manually", content_id)
                 else:
-                    _log_progress(f"Art {content_id} successfully displayed on {ip}")
+                    _log_progress(f"Art {content_id} successfully displayed on {ip} (screen was already on)")
             else:
-                # screen_on=False (Shuffle Silently): don't wake the screen if it's off.
-                # Use pre_screen_on (checked via REST before any WoL) to decide:
-                # - Screen was on  → display the art visibly (it's already showing, no waking needed)
-                # - Screen was off → stage silently so it shows on the next screen wake
-                if pre_screen_on:
-                    displayed = await _display_uploaded_art(
-                        art,
-                        content_id,
-                        debug=debug,
-                    )
-                    if not displayed:
-                        _LOGGER.warning("Uploaded art %s but could not verify display; check TV manually", content_id)
-                    else:
-                        _log_progress(f"Art {content_id} successfully displayed on {ip} (screen was already on)")
-                else:
-                    await _select_uploaded_art_silent(art, content_id)
-                    _log_progress(f"Art {content_id} staged on {ip} (screen off — will show on wake)")
+                await _select_uploaded_art_silent(art, content_id)
+                _log_progress(f"Art {content_id} staged on {ip} (screen off — will show on wake)")
 
-            # Apply photo filter if specified
-            if photo_filter is not None and photo_filter.lower() not in ("none", ""):
-                try:
-                    _log_progress(f"Applying photo filter '{photo_filter}' to {ip}")
-                    if debug:
-                        _LOGGER.debug("Applying photo filter '%s' to content_id=%s", photo_filter, content_id)
-                    await art.set_photo_filter(content_id, photo_filter)
-                    _log_progress(f"Photo filter '{photo_filter}' applied successfully")
-                    if debug:
-                        _LOGGER.debug("Successfully applied photo filter '%s'", photo_filter)
-                except Exception as filter_err:  # pylint: disable=broad-except
-                    _LOGGER.warning("Failed to apply photo filter '%s': %s", photo_filter, filter_err)
+        # Apply photo filter if specified
+        if photo_filter is not None and photo_filter.lower() not in ("none", ""):
+            try:
+                _log_progress(f"Applying photo filter '{photo_filter}' to {ip}")
+                if debug:
+                    _LOGGER.debug("Applying photo filter '%s' to content_id=%s", photo_filter, content_id)
+                await art.set_photo_filter(content_id, photo_filter)
+                _log_progress(f"Photo filter '{photo_filter}' applied successfully")
+                if debug:
+                    _LOGGER.debug("Successfully applied photo filter '%s'", photo_filter)
+            except Exception as filter_err:  # pylint: disable=broad-except
+                _LOGGER.warning("Failed to apply photo filter '%s': %s", photo_filter, filter_err)
 
-            if delete_others:
-                _log_progress("Cleaning up old images from TV memory...")
-                await _delete_other_images(art, content_id, debug=debug)
+        if delete_others:
+            _log_progress("Cleaning up old images from TV memory...")
+            await _delete_other_images(art, content_id, debug=debug)
 
-            _log_progress(f"Upload complete for {ip} (content_id={content_id})")
+        _log_progress(f"Upload complete for {ip} (content_id={content_id})")
 
-            return content_id
+        return content_id
     except Exception as err:  # pylint: disable=broad-except
         # Upload worked but post-processing failed
         _LOGGER.error("Upload succeeded (content_id=%s) but post-processing failed: %s", content_id, err)
         raise FrameArtUploadError(f"Upload succeeded but failed to display/cleanup: {err}") from err
 
 
-async def set_tv_brightness(ip: str, brightness: int) -> None:
+async def set_tv_brightness(client: TVConnectionManager, brightness: int) -> None:
     """Set the art-mode brightness following the reference script behaviour."""
+
+    ip = client.ip
 
     if brightness not in _VALID_BRIGHTNESS:
         raise ValueError("Brightness must be 1-10 for normal or 50 for max")
 
-    async with _AsyncFrameTVArtSession(ip) as session:
-        art = session.art
+    await client.ensure_connected()
+    art = client.art
 
-        # Set brightness directly without pre-checking current value
-        # (TV can be slow/unresponsive to brightness queries)
-        await _set_brightness_value(art, brightness)
-        await asyncio.sleep(_BRIGHTNESS_VERIFY_DELAY)
+    # Set brightness directly without pre-checking current value
+    # (TV can be slow/unresponsive to brightness queries)
+    await _set_brightness_value(art, brightness)
+    await asyncio.sleep(_BRIGHTNESS_VERIFY_DELAY)
 
-        # Try to verify, but don't fail if verification times out
-        try:
-            confirmed = await _get_brightness_value(art)
-            if confirmed != brightness:
-                _LOGGER.warning(
-                    "TV reported brightness %s after setting %s (may be stale)",
-                    confirmed, brightness
-                )
-            else:
-                _LOGGER.info("Brightness set to %s on %s", confirmed, ip)
-        except Exception as err:  # pylint: disable=broad-except
-            # Verification failed but set command was sent
-            _LOGGER.info("Brightness command sent to %s (verification timed out)", ip)
+    # Try to verify, but don't fail if verification times out
+    try:
+        confirmed = await _get_brightness_value(art)
+        if confirmed != brightness:
+            _LOGGER.warning(
+                "TV reported brightness %s after setting %s (may be stale)",
+                confirmed, brightness
+            )
+        else:
+            _LOGGER.info("Brightness set to %s on %s", confirmed, ip)
+    except Exception:  # pylint: disable=broad-except
+        # Verification failed but set command was sent
+        _LOGGER.info("Brightness command sent to %s (verification timed out)", ip)
 
 
-async def get_tv_brightness(ip: str) -> Optional[int]:
+async def get_tv_brightness(client: TVConnectionManager) -> Optional[int]:
     """Query the TV's current brightness value.
 
     Returns the brightness (1-10) or None if the query fails.
-    This opens a new connection to the TV to get the current value.
     """
     try:
-        async with _AsyncFrameTVArtSession(ip) as session:
-            return await _get_brightness_value(session.art)
+        await client.ensure_connected()
+        return await _get_brightness_value(client.art)
     except Exception as err:  # pylint: disable=broad-except
-        _LOGGER.debug("Failed to get brightness from %s: %s", ip, err)
+        _LOGGER.debug("Failed to get brightness from %s: %s", client.ip, err)
         return None
 
 
-async def is_art_mode_enabled(ip: str) -> Optional[bool]:
+async def is_art_mode_enabled(client: TVConnectionManager) -> Optional[bool]:
     """Return True when the TV reports art mode is active, False if not, None if unknown.
 
     Returns None if the Art WebSocket connection times out or fails, indicating
@@ -599,12 +672,12 @@ async def is_art_mode_enabled(ip: str) -> Optional[bool]:
     "art mode is definitely off" (False) and "we couldn't check" (None).
     """
     try:
-        async with _AsyncFrameTVArtSession(ip) as session:
-            status = await session.art.get_artmode()
-            _LOGGER.debug("Art mode status for %s: %s", ip, status)
-            return status == _ART_MODE_ON
+        await client.ensure_connected()
+        status = await client.art.get_artmode()
+        _LOGGER.debug("Art mode status for %s: %s", client.ip, status)
+        return status == _ART_MODE_ON
     except Exception as err:  # pylint: disable=broad-except
-        _LOGGER.debug("Art mode check failed for %s: %s", ip, err)
+        _LOGGER.debug("Art mode check failed for %s: %s", client.ip, err)
         return None  # Unknown state - couldn't connect to check
 
 
@@ -692,7 +765,7 @@ async def tv_network_wake(mac_address: str, ip: str, *, timeout: int = 45) -> bo
     )
 
 
-async def tv_on(ip: str, mac_address: str) -> bool:
+async def tv_on(ip: str, mac_address: str, *, client: Optional["TVConnectionManager"] = None) -> bool:
     """Wake Frame TV via Wake-on-LAN.
 
     Samsung Frame TVs require a two-stage Wake-on-LAN approach with significant delay:
@@ -742,7 +815,7 @@ async def tv_on(ip: str, mac_address: str) -> bool:
     # Check state for diagnostic purposes (don't take action based on it)
     try:
         screen = await is_screen_on(ip, timeout=_SCREEN_CHECK_TIMEOUT)
-        art_enabled = await is_art_mode_enabled(ip)
+        art_enabled = await is_art_mode_enabled(client) if client else None
         _LOGGER.info(
             "TV %s state after Wake-on-LAN: screen_on=%s, art_mode=%s",
             ip, screen, art_enabled
@@ -753,7 +826,7 @@ async def tv_on(ip: str, mac_address: str) -> bool:
     return True
 
 
-async def set_art_mode(ip: str) -> None:
+async def set_art_mode(client: TVConnectionManager) -> None:
     """Switch TV to art mode by sending KEY_POWER.
 
     When the TV is powered on and showing content (TV channels, apps, etc.), sending
@@ -768,20 +841,22 @@ async def set_art_mode(ip: str) -> None:
     accidentally toggling out of art mode.
     """
 
+    ip = client.ip
+
     # First check if already in art mode
     # KEY_POWER is a toggle, so we MUST know the current state
-    async with _AsyncFrameTVArtSession(ip) as session:
-        try:
-            status = await session.art.get_artmode()
-            _LOGGER.debug("Current art mode status for %s: %s", ip, status)
+    await client.ensure_connected()
+    try:
+        status = await client.art.get_artmode()
+        _LOGGER.debug("Current art mode status for %s: %s", ip, status)
 
-            if status == _ART_MODE_ON:
-                _LOGGER.info("TV %s already in art mode", ip)
-                return
-        except Exception as err:  # pylint: disable=broad-except
-            _LOGGER.warning("Could not verify art mode status for %s: %s. Not sending KEY_POWER to avoid toggling out of art mode.", ip, err)
-            # Do NOT continue - KEY_POWER is a toggle so we need to know current state
-            raise FrameArtUploadError(f"Cannot determine art mode status for {ip}, refusing to send KEY_POWER") from err
+        if status == _ART_MODE_ON:
+            _LOGGER.info("TV %s already in art mode", ip)
+            return
+    except Exception as err:  # pylint: disable=broad-except
+        _LOGGER.warning("Could not verify art mode status for %s: %s. Not sending KEY_POWER to avoid toggling out of art mode.", ip, err)
+        # Do NOT continue - KEY_POWER is a toggle so we need to know current state
+        raise FrameArtUploadError(f"Cannot determine art mode status for {ip}, refusing to send KEY_POWER") from err
 
     # Send KEY_POWER to switch to art mode
     token_path = _token_path(ip)
@@ -800,12 +875,12 @@ async def set_art_mode(ip: str) -> None:
         await asyncio.sleep(3)
 
         # Verify it worked
-        async with _AsyncFrameTVArtSession(ip) as session:
-            new_status = await session.art.get_artmode()
-            if new_status == _ART_MODE_ON:
-                _LOGGER.info("TV %s successfully switched to art mode", ip)
-            else:
-                _LOGGER.warning("TV %s may not have switched to art mode (status: %s)", ip, new_status)
+        await client.ensure_connected()
+        new_status = await client.art.get_artmode()
+        if new_status == _ART_MODE_ON:
+            _LOGGER.info("TV %s successfully switched to art mode", ip)
+        else:
+            _LOGGER.warning("TV %s may not have switched to art mode (status: %s)", ip, new_status)
 
     except Exception as err:  # pylint: disable=broad-except
         raise FrameArtUploadError(f"Failed to switch {ip} to art mode: {err}") from err
