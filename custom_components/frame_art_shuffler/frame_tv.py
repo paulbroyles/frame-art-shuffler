@@ -231,6 +231,9 @@ class TVConnectionManager:
         )
         self._lock = asyncio.Lock()
 
+    def __repr__(self) -> str:
+        return f"TV({self.ip})"
+
     @property
     def art(self) -> SamsungTVAsyncArt:
         return self._art
@@ -264,7 +267,7 @@ class TVConnectionManager:
         try:
             await self._art.close()
         except Exception as err:  # pylint: disable=broad-except
-            _LOGGER.debug("Error closing art client for %s: %s", self.ip, err)
+            _LOGGER.debug("Error closing art client for %s: %s", self, err)
 
 
 async def _rest_device_info(ip: str, timeout: float) -> Optional[dict]:
@@ -621,8 +624,6 @@ async def set_art_on_tv_deleteothers(
 async def set_tv_brightness(client: TVConnectionManager, brightness: int) -> None:
     """Set the art-mode brightness following the reference script behaviour."""
 
-    ip = client.ip
-
     if brightness not in _VALID_BRIGHTNESS:
         raise ValueError("Brightness must be 1-10 for normal or 50 for max")
 
@@ -643,10 +644,10 @@ async def set_tv_brightness(client: TVConnectionManager, brightness: int) -> Non
                 confirmed, brightness
             )
         else:
-            _LOGGER.info("Brightness set to %s on %s", confirmed, ip)
+            _LOGGER.info("Brightness set to %s on %s", confirmed, client)
     except Exception:  # pylint: disable=broad-except
         # Verification failed but set command was sent
-        _LOGGER.info("Brightness command sent to %s (verification timed out)", ip)
+        _LOGGER.info("Brightness command sent to %s (verification timed out)", client)
 
 
 async def get_tv_brightness(client: TVConnectionManager) -> Optional[int]:
@@ -658,7 +659,7 @@ async def get_tv_brightness(client: TVConnectionManager) -> Optional[int]:
         await client.ensure_connected()
         return await _get_brightness_value(client.art)
     except Exception as err:  # pylint: disable=broad-except
-        _LOGGER.debug("Failed to get brightness from %s: %s", client.ip, err)
+        _LOGGER.debug("Failed to get brightness from %s: %s", client, err)
         return None
 
 
@@ -672,10 +673,10 @@ async def is_art_mode_enabled(client: TVConnectionManager) -> Optional[bool]:
     try:
         await client.ensure_connected()
         status = await client.art.get_artmode()
-        _LOGGER.debug("Art mode status for %s: %s", client.ip, status)
+        _LOGGER.debug("Art mode status for %s: %s", client, status)
         return status == _ART_MODE_ON
     except Exception as err:  # pylint: disable=broad-except
-        _LOGGER.debug("Art mode check failed for %s: %s", client.ip, err)
+        _LOGGER.debug("Art mode check failed for %s: %s", client, err)
         return None  # Unknown state - couldn't connect to check
 
 
@@ -843,31 +844,29 @@ async def set_art_mode(client: TVConnectionManager) -> None:
     TV is already in art mode, the command is a no-op.
     """
 
-    ip = client.ip
-
     await client.ensure_connected()
     try:
         status = await client.art.get_artmode()
-        _LOGGER.debug("Current art mode status for %s: %s", ip, status)
+        _LOGGER.debug("Current art mode status for %s: %s", client, status)
 
         if status == _ART_MODE_ON:
-            _LOGGER.info("TV %s already in art mode", ip)
+            _LOGGER.info("%s already in art mode", client)
             return
 
         await client.art.set_artmode(_ART_MODE_ON)
-        _LOGGER.info("set_artmode sent to %s", ip)
+        _LOGGER.info("set_artmode sent to %s", client)
 
         # Give TV a moment to process the mode switch before verifying.
         await asyncio.sleep(3)
 
         new_status = await client.art.get_artmode()
         if new_status == _ART_MODE_ON:
-            _LOGGER.info("TV %s successfully switched to art mode", ip)
+            _LOGGER.info("%s successfully switched to art mode", client)
         else:
-            _LOGGER.warning("TV %s may not have switched to art mode (status: %s)", ip, new_status)
+            _LOGGER.warning("%s may not have switched to art mode (status: %s)", client, new_status)
 
     except Exception as err:  # pylint: disable=broad-except
-        raise FrameArtUploadError(f"Failed to switch {ip} to art mode: {err}") from err
+        raise FrameArtUploadError(f"Failed to switch {client} to art mode: {err}") from err
 
 
 async def tv_off(ip: str) -> None:
