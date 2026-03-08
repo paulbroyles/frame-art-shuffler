@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import importlib
 import importlib.util
-import functools
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -485,17 +484,14 @@ if _HA_AVAILABLE:
                     f"Displaying custom image ({display_filename}) via service call",
                 )
 
-                await hass.async_add_executor_job(
-                    functools.partial(
-                        frame_tv.set_art_on_tv_deleteothers,
-                        ip,
-                        final_path,
-                        mac_address=mac,
-                        matte=matte,
-                        photo_filter=filter_id,
-                        delete_others=True,
-                        screen_on=screen_on,
-                    )
+                await frame_tv.set_art_on_tv_deleteothers(
+                    ip,
+                    final_path,
+                    mac_address=mac,
+                    matte=matte,
+                    photo_filter=filter_id,
+                    delete_others=True,
+                    screen_on=screen_on,
                 )
 
                 # Update shuffle_cache with all current state (like shuffle does)
@@ -1341,13 +1337,7 @@ if _HA_AVAILABLE:
                         f"Brightness: Attempting to set {tv_name} ({ip}) to {brightness} "
                         f"(attempt {attempt}/{max_attempts})"
                     )
-                    await hass.async_add_executor_job(
-                        functools.partial(
-                            frame_tv.set_tv_brightness,
-                            ip,
-                            brightness,
-                        )
-                    )
+                    await frame_tv.set_tv_brightness(ip, brightness)
                     
                     # Success! Store timestamp and brightness
                     from .config_entry import update_tv_config as update_config
@@ -1489,9 +1479,7 @@ if _HA_AVAILABLE:
                     _LOGGER.debug(f"Starting delayed brightness verification for {tv_name}")
                     await asyncio.sleep(5)  # Wait for TV to settle after image render
                     try:
-                        actual = await hass.async_add_executor_job(
-                            frame_tv.get_tv_brightness, ip
-                        )
+                        actual = await frame_tv.get_tv_brightness(ip)
                         if actual is not None and actual != target_brightness:
                             _LOGGER.warning(
                                 f"Brightness drift detected for {tv_name}: expected {target_brightness}, "
@@ -1856,7 +1844,7 @@ if _HA_AVAILABLE:
 
                 try:
                     _LOGGER.info(f"Auto motion: Turning off {tv_name} ({ip}) due to no motion")
-                    await hass.async_add_executor_job(frame_tv.tv_off, ip)
+                    await frame_tv.tv_off(ip)
                     _LOGGER.info(f"Auto motion: {tv_name} turned off successfully")
                     
                     # Build message with last sensor info if available
@@ -1937,7 +1925,7 @@ if _HA_AVAILABLE:
 
             # Check if screen is on - if so, just reset timer
             try:
-                screen_on = await hass.async_add_executor_job(frame_tv.is_screen_on, ip)
+                screen_on = await frame_tv.is_screen_on(ip)
                 if screen_on:
                     _LOGGER.debug(f"Auto motion: {tv_name} screen already on, resetting timer")
                     start_motion_off_timer(tv_id)
@@ -1969,7 +1957,7 @@ if _HA_AVAILABLE:
                 try:
                     power_on_in_progress[tv_id] = True
                     _LOGGER.info(f"Auto motion: Waking {tv_name} ({ip}) via WOL")
-                    await hass.async_add_executor_job(frame_tv.tv_on, ip, mac)
+                    await frame_tv.tv_on(ip, mac)
                     _LOGGER.info(f"Auto motion: {tv_name} wake sequence complete")
                     sensor_short = _get_sensor_short_name(sensor_id) if sensor_id else "motion"
                     log_activity(
@@ -2054,7 +2042,7 @@ if _HA_AVAILABLE:
             # This handles HA restart - if motion is stale, don't set timer (TV was probably turned on manually)
             if ip:
                 try:
-                    screen_on = await hass.async_add_executor_job(frame_tv.is_screen_on, ip)
+                    screen_on = await frame_tv.is_screen_on(ip)
                     if screen_on:
                         _LOGGER.info(f"Auto motion: {tv_name} is on at startup, starting off timer")
                         start_motion_off_timer(tv_id)

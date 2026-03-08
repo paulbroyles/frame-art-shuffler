@@ -106,9 +106,7 @@ async def async_setup_entry(
 
             # Check screen status (read-only REST call)
             try:
-                screen_on = await hass.async_add_executor_job(
-                    frame_tv.is_screen_on, ip, TV_STATUS_CHECK_TIMEOUT
-                )
+                screen_on = await frame_tv.is_screen_on(ip, TV_STATUS_CHECK_TIMEOUT)
                 tv_status_cache[tv_id]["screen_on"] = screen_on
             except Exception as err:
                 _LOGGER.debug(f"Failed to check screen status for {tv_name}: {err}")
