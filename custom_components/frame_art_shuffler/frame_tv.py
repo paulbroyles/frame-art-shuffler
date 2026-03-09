@@ -244,9 +244,38 @@ class TVConnectionManager:
         When timeout is provided it overrides the connection open_timeout for this
         single attempt only (e.g. 4 s for a fast-fail connectivity check). The
         original timeout is restored afterward.
+
+        Handles stale connections automatically. Samsung's WebSocket SERVER responds
+        to ping/pong at the transport layer independently of the art APPLICATION that
+        processes art_app_request commands. After a firmware-managed power transition
+        (typically overnight), the art app can reset while the WebSocket transport
+        remains alive. is_alive() returns True, pings succeed, but art requests time
+        out. This method probes the art channel on every call when the connection
+        appears alive, and reconnects transparently if the probe fails.
+
+        See docs/STALE_ART_CHANNEL.md for full analysis and community issue references.
         """
+        # If the recv loop has stopped without a proper close, the connection is stale.
+        # This covers the case where the TV sent a Close frame (art app closed the
+        # WebSocket) but async_close() was never called on our side.
+        if self._art.is_alive() and self._art._recv_loop is None:
+            _LOGGER.debug("Art recv loop stopped for %s; closing stale connection", self)
+            await self.async_close()
+
+        # Probe the art channel whenever the connection appears alive.
+        # A healthy connection responds in well under 100 ms; a stale one times out
+        # after 2 s, triggering a reconnect below.
         if self._art.is_alive():
-            return
+            try:
+                await self._art.get_artmode()
+                return  # Art channel is healthy
+            except Exception:
+                _LOGGER.debug(
+                    "Art channel probe failed for %s; connection is stale — reconnecting",
+                    self,
+                )
+                await self.async_close()
+
         async with self._lock:
             if self._art.is_alive():
                 return
@@ -376,10 +405,9 @@ async def set_art_on_tv_deleteothers(
         try:
             _log_progress(f"Checking connectivity to {ip}...")
             # Use a short timeout for the fast-fail connectivity check.
-            # If the persistent connection is already alive this returns immediately.
+            # ensure_connected() probes the art channel internally and reconnects
+            # automatically if the connection is stale (see docs/STALE_ART_CHANNEL.md).
             await client.ensure_connected(timeout=4)
-            # Lightweight request to confirm the art channel is responding.
-            await client.art.get_artmode()
         except UnauthorizedError as err:
             # TV is reachable but rejecting the stored token. WoL is not relevant here.
             # Clear the stale token so the next attempt can trigger a fresh pairing prompt.
