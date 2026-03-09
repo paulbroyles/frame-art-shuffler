@@ -15,7 +15,7 @@ from homeassistant.helpers import device_registry as dr
 
 from .config_entry import get_tv_config, update_tv_config
 from .const import DOMAIN, CONF_ENABLE_AUTO_SHUFFLE
-from .frame_tv import tv_on, tv_off, set_art_on_tv_deleteothers, set_art_mode, delete_token, toggle_tv_orientation, FrameArtError
+from .frame_tv import tv_on, tv_off, set_art_on_tv_deleteothers, set_art_mode, delete_token, toggle_tv_orientation, get_tv_model_year, FrameArtError
 from .shuffle import async_shuffle_tv
 from .activity import log_activity
 
@@ -676,7 +676,12 @@ class FrameArtToggleOrientationButton(ButtonEntity):
             return
 
         data = self._hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
-        year = data.get("tv_model_years", {}).get(self._tv_id)
+        tv_model_years = data.get("tv_model_years", {})
+        year = tv_model_years.get(self._tv_id)
+        if year is None:
+            year = await get_tv_model_year(self._tv_ip)
+            if year is not None:
+                tv_model_years[self._tv_id] = year
         is_2024 = year is not None and year >= 2024
 
         try:
