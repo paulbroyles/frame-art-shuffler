@@ -682,7 +682,7 @@ class FrameArtToggleOrientationButton(ButtonEntity):
             year = await get_tv_model_year(self._tv_ip)
             if year is not None:
                 tv_model_years[self._tv_id] = year
-        is_2024 = year is not None and year >= 2024
+        is_2024 = year is not None and year >= 24
 
         try:
             await toggle_tv_orientation(self._tv_ip, is_2024=is_2024)

@@ -283,10 +283,16 @@ async def _rest_device_info(ip: str, timeout: float) -> Optional[dict]:
 
 
 async def get_tv_model_year(ip: str) -> Optional[int]:
-    """Return the TV model year (e.g. 2024) from the REST device info.
+    """Return the TV model year as a 2-digit int (e.g. 24 for 2024) from the REST API.
 
-    The REST API returns a 'device.model' field like '2024_QN65LS03D'.
-    Returns None if the TV is unreachable or the model string is unexpected.
+    Replicates the logic of SamsungTVRest.get_model_year() from the vendored samsungtvws
+    library using our async REST helper. The sync-only library version can't be called
+    directly from async code without an executor; if samsungtvws adds an async equivalent
+    this function can be removed in favour of that.
+
+    The 'device.model' field is a board/firmware identifier like '23_KANTSU2E_FTV_OS80'
+    where the 2-digit prefix is the model year. Returns None if the TV is unreachable or
+    the model string is unexpected.
     """
     data = await _rest_device_info(ip, timeout=5.0)
     if not data:
@@ -958,6 +964,12 @@ async def toggle_tv_orientation(ip: str, is_2024: bool = False) -> None:
 
     On 2024 Frame TVs, sends KEY_HOME long press.
     On 2023 and earlier Frame TVs, sends KEY_MUTI_VIEW long press.
+
+    NOTE: Whether this actually works is unconfirmed. Per samsungtvws examples,
+    these are the documented keys for rotation toggle, but testing on a 2023
+    Frame TV produced no response. This feature may be intended for motorized
+    rotating mounts rather than manual orientation changes, or the hold duration
+    or key may differ by firmware version.
     """
     key = "KEY_HOME" if is_2024 else "KEY_MUTI_VIEW"
     token_path = _token_path(ip)
