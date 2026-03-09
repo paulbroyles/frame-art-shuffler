@@ -86,7 +86,7 @@ if _HA_AVAILABLE:
     from .coordinator import FrameArtCoordinator
     from .config_entry import get_tv_config, get_global_tagsets, list_tv_configs, remove_tv_config, update_tv_config, update_global_tagsets, get_effective_tags
     from . import frame_tv
-    from .frame_tv import TOKEN_DIR as DEFAULT_TOKEN_DIR, TVConnectionManager, set_token_directory, tv_on, tv_off, set_art_mode, is_screen_on
+    from .frame_tv import TOKEN_DIR as DEFAULT_TOKEN_DIR, TVConnectionManager, set_token_directory, tv_on, tv_off, set_art_mode, is_screen_on, get_tv_model_year
     from .metadata import MetadataStore
     from .dashboard import async_generate_dashboard
     from .activity import log_activity
@@ -370,7 +370,21 @@ if _HA_AVAILABLE:
             "shuffle_cache": {},
             "upload_in_progress": set(),
             "auto_shuffle_next_times": {},
+            "tv_model_years": {},
         }
+
+        async def _fetch_model_years() -> None:
+            """Fetch and cache model year for each TV in the background."""
+            tv_model_years = hass.data[DOMAIN][entry.entry_id]["tv_model_years"]
+            for tv_id, tv_cfg in entry.data.get("tvs", {}).items():
+                ip = tv_cfg.get("ip")
+                if ip:
+                    year = await get_tv_model_year(ip)
+                    if year is not None:
+                        tv_model_years[tv_id] = year
+                        _LOGGER.debug("TV %s model year: %s", tv_id, year)
+
+        hass.async_create_task(_fetch_model_years())
 
         display_log = DisplayLogManager(hass, entry)
         await display_log.async_setup()

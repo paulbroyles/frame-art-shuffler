@@ -282,6 +282,22 @@ async def _rest_device_info(ip: str, timeout: float) -> Optional[dict]:
         return None
 
 
+async def get_tv_model_year(ip: str) -> Optional[int]:
+    """Return the TV model year (e.g. 2024) from the REST device info.
+
+    The REST API returns a 'device.model' field like '2024_QN65LS03D'.
+    Returns None if the TV is unreachable or the model string is unexpected.
+    """
+    data = await _rest_device_info(ip, timeout=5.0)
+    if not data:
+        return None
+    model = data.get("device", {}).get("model", "")
+    try:
+        return int(model.split("_")[0])
+    except (ValueError, IndexError):
+        return None
+
+
 async def set_art_on_tv_deleteothers(
     client: TVConnectionManager,
     artpath: str,
@@ -935,6 +951,29 @@ async def tv_off(ip: str) -> None:
         "treating as already off",
         ip, _POWER_COMMAND_RETRIES, last_error
     )
+
+
+async def toggle_tv_orientation(ip: str, is_2024: bool = False) -> None:
+    """Toggle TV orientation by sending a long press of the rotation key.
+
+    On 2024 Frame TVs, sends KEY_HOME long press.
+    On 2023 and earlier Frame TVs, sends KEY_MUTI_VIEW long press.
+    """
+    key = "KEY_HOME" if is_2024 else "KEY_MUTI_VIEW"
+    token_path = _token_path(ip)
+
+    remote = SamsungTVWSAsyncRemote(
+        host=ip,
+        port=DEFAULT_PORT,
+        timeout=_POWER_COMMAND_TIMEOUT,
+        token_file=str(token_path),
+        name="FrameArtShuffler",
+    )
+    try:
+        await remote.send_commands(SendRemoteKey.hold(key, 3))
+        _LOGGER.info("Sent orientation toggle (%s) to %s", key, ip)
+    finally:
+        await remote.close()
 
 
 def _send_wake_on_lan(mac_address: str) -> None:

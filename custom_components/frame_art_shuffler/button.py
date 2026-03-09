@@ -15,7 +15,7 @@ from homeassistant.helpers import device_registry as dr
 
 from .config_entry import get_tv_config, update_tv_config
 from .const import DOMAIN, CONF_ENABLE_AUTO_SHUFFLE
-from .frame_tv import tv_on, tv_off, set_art_on_tv_deleteothers, set_art_mode, delete_token, FrameArtError
+from .frame_tv import tv_on, tv_off, set_art_on_tv_deleteothers, set_art_mode, delete_token, toggle_tv_orientation, FrameArtError
 from .shuffle import async_shuffle_tv
 from .activity import log_activity
 
@@ -41,6 +41,7 @@ async def async_setup_entry(
             FrameArtOnArtModeButton(hass, entry, tv_id),
             FrameArtShuffleButton(hass, entry, tv_id),
             FrameArtShuffleSilentButton(hass, entry, tv_id),
+            FrameArtToggleOrientationButton(hass, entry, tv_id),
             FrameArtClearTokenButton(hass, entry, tv_id),
             FrameArtCalibrateDarkButton(hass, entry, tv_id),
             FrameArtCalibrateBrightButton(hass, entry, tv_id),
@@ -597,7 +598,7 @@ class FrameArtTriggerMotionOffButton(ButtonEntity):
     async def async_press(self) -> None:
         """Handle the button press - turn TV off and cancel motion timer."""
         from datetime import datetime, timezone
-        
+
         tv_config = get_tv_config(self._entry, self._tv_id)
         if not tv_config:
             _LOGGER.error(f"Cannot trigger motion off for {self._tv_name}: TV config not found")
@@ -633,3 +634,53 @@ class FrameArtTriggerMotionOffButton(ButtonEntity):
                 "error",
                 f"Turn off failed: {err}",
             )
+
+
+class FrameArtToggleOrientationButton(ButtonEntity):
+    """Button entity to toggle TV orientation (portrait/landscape)."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Toggle Orientation"
+    _attr_icon = "mdi:screen-rotation"
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: ConfigEntry,
+        tv_id: str,
+    ) -> None:
+        self._hass = hass
+        self._tv_id = tv_id
+        self._entry = entry
+
+        tv_config = get_tv_config(entry, tv_id)
+        if tv_config:
+            self._tv_name = tv_config.get("name", tv_id)
+            self._tv_ip = tv_config.get("ip")
+        else:
+            self._tv_name = tv_id
+            self._tv_ip = None
+
+        self._attr_unique_id = f"{tv_id}_toggle_orientation"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, tv_id)},
+            name=self._tv_name,
+            manufacturer="Samsung",
+            model="Frame TV",
+        )
+
+    async def async_press(self) -> None:
+        """Handle the button press - toggle TV orientation."""
+        if not self._tv_ip:
+            _LOGGER.error(f"Cannot toggle orientation for {self._tv_name}: missing IP address")
+            return
+
+        data = self._hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
+        year = data.get("tv_model_years", {}).get(self._tv_id)
+        is_2024 = year is not None and year >= 2024
+
+        try:
+            await toggle_tv_orientation(self._tv_ip, is_2024=is_2024)
+            _LOGGER.info(f"Toggled orientation for {self._tv_name} (model year: {year})")
+        except Exception as err:
+            _LOGGER.error(f"Failed to toggle orientation for {self._tv_name}: {err}")
