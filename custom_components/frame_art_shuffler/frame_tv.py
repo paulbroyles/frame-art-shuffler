@@ -680,6 +680,27 @@ async def is_art_mode_enabled(client: TVConnectionManager) -> Optional[bool]:
         return None  # Unknown state - couldn't connect to check
 
 
+async def get_tv_orientation(client: TVConnectionManager) -> Optional[str]:
+    """Return 'portrait', 'landscape', or None if orientation cannot be determined.
+
+    Uses the art WebSocket API's get_current_rotation request. Returns None if
+    the connection fails or the TV is unreachable.
+
+    current_rotation_status values: 1 = landscape, 2 = portrait.
+    """
+    try:
+        await client.ensure_connected()
+        rotation = await client.art.get_rotation()
+        if rotation == 2:
+            return "portrait"
+        elif rotation == 1:
+            return "landscape"
+        return None
+    except Exception as err:  # pylint: disable=broad-except
+        _LOGGER.debug("Orientation check failed for %s: %s", client, err)
+        return None
+
+
 async def is_screen_on(ip: str, timeout: Optional[float] = None) -> bool:
     """Return True when the TV screen is actually on and displaying content.
 

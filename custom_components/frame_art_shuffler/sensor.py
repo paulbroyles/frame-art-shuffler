@@ -33,6 +33,7 @@ from .const import (
     DOMAIN,
     SIGNAL_SHUFFLE,
     SIGNAL_AUTO_SHUFFLE_NEXT,
+    SIGNAL_ORIENTATION,
 )
 from .coordinator import FrameArtCoordinator
 from .activity import FrameArtActivitySensor
@@ -204,6 +205,12 @@ MATCHING_IMAGE_COUNT_DESCRIPTION = SensorEntityDescription(
     translation_key="shuffled_matching_images",
 )
 
+ORIENTATION_DESCRIPTION = SensorEntityDescription(
+    key="orientation",
+    icon="mdi:phone-rotate-landscape",
+    translation_key="orientation",
+)
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -257,9 +264,11 @@ async def async_setup_entry(
             matching_count_entity = FrameArtMatchingImageCountEntity(hass, entry, tv_id)
             # Activity history sensor
             activity_entity = FrameArtActivitySensor(hass, entry, tv_id)
-            
-            tracked[tv_id] = (current_artwork_entity, last_image_entity, last_timestamp_entity, auto_shuffle_next_entity, ip_entity, mac_entity, motion_entity, light_entity, auto_bright_last_entity, auto_bright_next_entity, auto_bright_target_entity, auto_bright_lux_entity, auto_motion_last_entity, auto_motion_off_at_entity, current_matte_entity, current_filter_entity, matte_filter_entity, tags_combined_entity, selected_tagset_entity, selected_tagset_weighting_entity, override_tagset_entity, override_expiry_entity, matching_count_entity, activity_entity)
-            new_entities.extend([current_artwork_entity, last_image_entity, last_timestamp_entity, auto_shuffle_next_entity, ip_entity, mac_entity, motion_entity, light_entity, auto_bright_last_entity, auto_bright_next_entity, auto_bright_target_entity, auto_bright_lux_entity, auto_motion_last_entity, auto_motion_off_at_entity, current_matte_entity, current_filter_entity, matte_filter_entity, tags_combined_entity, selected_tagset_entity, selected_tagset_weighting_entity, override_tagset_entity, override_expiry_entity, matching_count_entity, activity_entity])
+            # Orientation sensor
+            orientation_entity = FrameArtOrientationEntity(hass, entry, tv_id)
+
+            tracked[tv_id] = (current_artwork_entity, last_image_entity, last_timestamp_entity, auto_shuffle_next_entity, ip_entity, mac_entity, motion_entity, light_entity, auto_bright_last_entity, auto_bright_next_entity, auto_bright_target_entity, auto_bright_lux_entity, auto_motion_last_entity, auto_motion_off_at_entity, current_matte_entity, current_filter_entity, matte_filter_entity, tags_combined_entity, selected_tagset_entity, selected_tagset_weighting_entity, override_tagset_entity, override_expiry_entity, matching_count_entity, activity_entity, orientation_entity)
+            new_entities.extend([current_artwork_entity, last_image_entity, last_timestamp_entity, auto_shuffle_next_entity, ip_entity, mac_entity, motion_entity, light_entity, auto_bright_last_entity, auto_bright_next_entity, auto_bright_target_entity, auto_bright_lux_entity, auto_motion_last_entity, auto_motion_off_at_entity, current_matte_entity, current_filter_entity, matte_filter_entity, tags_combined_entity, selected_tagset_entity, selected_tagset_weighting_entity, override_tagset_entity, override_expiry_entity, matching_count_entity, activity_entity, orientation_entity])
             
         if new_entities:
             async_add_entities(new_entities)
@@ -1632,7 +1641,7 @@ class FrameArtMatchingImageCountEntity(SensorEntity):
         @callback
         def _shuffle_updated() -> None:
             self.async_write_ha_state()
-        
+
         signal = f"{SIGNAL_SHUFFLE}_{self._entry.entry_id}_{self._tv_id}"
         self._unsubscribe_shuffle = async_dispatcher_connect(
             self._hass,
@@ -1656,6 +1665,65 @@ class FrameArtMatchingImageCountEntity(SensorEntity):
         if count is not None:
             return int(count)
         return None
+
+    @property
+    def available(self) -> bool:  # type: ignore[override]
+        """Return if entity is available."""
+        return get_tv_config(self._entry, self._tv_id) is not None
+
+
+class FrameArtOrientationEntity(SensorEntity):
+    """Sensor for TV physical orientation (portrait or landscape).
+
+    Reads from tv_status_cache populated by binary_sensor.py's polling loop,
+    which calls get_tv_orientation() via the art WebSocket API. The last known
+    value is retained when the TV is unreachable.
+    """
+
+    entity_description = ORIENTATION_DESCRIPTION
+    _attr_has_entity_name = True
+    _attr_name = "Orientation"
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, tv_id: str) -> None:
+        self._hass = hass
+        self._tv_id = tv_id
+        self._entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_{tv_id}_orientation"
+        self._unsubscribe_orientation: Callable[[], None] | None = None
+
+        tv_config = get_tv_config(entry, tv_id)
+        tv_name = tv_config.get("name", tv_id) if tv_config else tv_id
+
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, tv_id)},
+            name=tv_name,
+            manufacturer="Samsung",
+            model="Frame TV",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to orientation signal for updates."""
+        @callback
+        def _orientation_updated() -> None:
+            self.async_write_ha_state()
+
+        signal = f"{SIGNAL_ORIENTATION}_{self._entry.entry_id}_{self._tv_id}"
+        self._unsubscribe_orientation = async_dispatcher_connect(
+            self._hass, signal, _orientation_updated
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Unsubscribe from orientation signal."""
+        if self._unsubscribe_orientation:
+            self._unsubscribe_orientation()
+            self._unsubscribe_orientation = None
+
+    @property
+    def native_value(self) -> str | None:  # type: ignore[override]
+        """Return 'portrait', 'landscape', or None if not yet known."""
+        data = self._hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
+        status_cache = data.get("tv_status_cache", {})
+        return status_cache.get(self._tv_id, {}).get("orientation")
 
     @property
     def available(self) -> bool:  # type: ignore[override]

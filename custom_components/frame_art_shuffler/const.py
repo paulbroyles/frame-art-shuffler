@@ -46,3 +46,4 @@ DEFAULT_LOG_FLUSH_MINUTES = 5
 
 SIGNAL_SHUFFLE = f"{DOMAIN}_shuffle"
 SIGNAL_AUTO_SHUFFLE_NEXT = f"{DOMAIN}_auto_shuffle_next"
+SIGNAL_ORIENTATION = f"{DOMAIN}_orientation"  # {SIGNAL_ORIENTATION}_{entry_id}_{tv_id}

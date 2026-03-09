@@ -14,11 +14,13 @@ from homeassistant.components.binary_sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_track_time_interval
 
 from .config_entry import get_active_tagset_name, get_tv_config
-from .const import DOMAIN
+from .const import DOMAIN, SIGNAL_ORIENTATION
 from . import frame_tv
+from .frame_tv import get_tv_orientation
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -63,6 +65,7 @@ async def async_setup_entry(
             # Initialize status cache for this TV
             tv_status_cache[tv_id] = {
                 "screen_on": None,
+                "orientation": None,
             }
 
             # Create binary sensors per TV
@@ -110,6 +113,18 @@ async def async_setup_entry(
                 tv_status_cache[tv_id]["screen_on"] = screen_on
             except Exception as err:
                 _LOGGER.debug(f"Failed to check screen status for {tv_name}: {err}")
+
+            # Check orientation via art WebSocket (retain last known value on failure)
+            client = data.get("art_clients", {}).get(tv_id)
+            if client:
+                old_orientation = tv_status_cache[tv_id].get("orientation")
+                orientation = await get_tv_orientation(client)
+                if orientation is not None and orientation != old_orientation:
+                    tv_status_cache[tv_id]["orientation"] = orientation
+                    async_dispatcher_send(
+                        hass,
+                        f"{SIGNAL_ORIENTATION}_{entry.entry_id}_{tv_id}",
+                    )
 
             # Handle motion control based on screen state
             if tv_status_cache[tv_id]["screen_on"]:
