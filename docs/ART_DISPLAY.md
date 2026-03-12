@@ -1,4 +1,4 @@
-# Shuffle Image Feature
+# Art Display and Tracking
 
 ## Overview
 
@@ -113,7 +113,42 @@ After filtering, if the only candidate is already displayed, the button will sel
 
 ## Sensors
 
-Each TV gets these shuffle-related sensors automatically created:
+Each TV gets these sensors automatically created:
+
+### `sensor.<tv_name>_artwork_info`
+
+The primary source of truth for what is currently displayed on the TV.
+
+- **State**: Samsung `content_id` of the currently displayed artwork (e.g. `MY_F0010`), or `None` if unknown
+- **Attributes**: Flat dict of artwork metadata — schema varies by source:
+
+| Source | Typical Attributes |
+|---|---|
+| Local shuffle | `source_type: "local"`, `filename`, `tags`, plus any fields from `metadata.json` |
+| Web source (add-on) | `source_type: "web_source"`, fields from the user-configured attribute mapping (title, artist, etc.) |
+| External change | `source_type: "external"` only (no metadata available) |
+
+**How it gets updated:**
+
+- **Integration-set art**: Updated immediately after every shuffle or `display_image` service call, with full metadata.
+- **Web sources**: The Frame Art Manager add-on passes `artwork_metadata` (the `attributeSnapshot` from the user's field mapping) through the `display_image` service call; the sensor stores it directly.
+- **External changes** (Samsung app, Art Store): Detected two ways — WebSocket `art_mode_changed`/`wakeup` events trigger an immediate `get_current_artwork` query; a 2-minute periodic poll catches mid-session changes. When an external change is detected, only `content_id` is known, so the sensor records `source_type: "external"` with no other metadata.
+
+The sensor uses `RestoreEntity` to survive HA restarts, preserving the last known `content_id` and attributes.
+
+**Example automation** (push artwork info to an eink display):
+
+```yaml
+trigger:
+  - platform: state
+    entity_id: sensor.frame_tv_artwork_info
+action:
+  - variables:
+      title: "{{ state_attr('sensor.frame_tv_artwork_info', 'title') }}"
+      artist: "{{ state_attr('sensor.frame_tv_artwork_info', 'artist') }}"
+```
+
+Attribute names depend on the user's attribute mapping configuration in the web sources settings.
 
 ### `sensor.<tv_name>_last_shuffle_image`
 - Shows the filename of the last shuffled image

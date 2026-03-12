@@ -214,6 +214,11 @@ class MetadataStore:
                 return tv
         raise TVNotFoundError(f"TV {tv_id} not found")
 
+    def get_image(self, filename: str) -> Optional[Dict[str, Any]]:
+        """Return the metadata entry for a single image, or None if not found."""
+        data = _load_metadata(self._path)
+        return data.get("images", {}).get(filename)
+
 
 def normalize_mac(mac: Optional[str]) -> Optional[str]:
     """Normalize MAC address to lowercase colon-separated form.

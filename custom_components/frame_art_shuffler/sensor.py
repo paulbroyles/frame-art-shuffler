@@ -12,6 +12,7 @@ from homeassistant.const import CONF_HOST, CONF_NAME, EntityCategory
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.helpers.restore_state import RestoreEntity
 
 from .config_entry import (
     get_active_tagset_name,
@@ -266,9 +267,13 @@ async def async_setup_entry(
             activity_entity = FrameArtActivitySensor(hass, entry, tv_id)
             # Orientation sensor
             orientation_entity = FrameArtOrientationEntity(hass, entry, tv_id)
+            # Artwork info sensor (for automations driving external displays)
+            artwork_info_entity = FrameArtArtworkInfoSensor(hass, entry, tv_id)
+            # Store reference so __init__.py and shuffle.py can update it
+            hass.data[DOMAIN][entry.entry_id].setdefault("artwork_sensors", {})[tv_id] = artwork_info_entity
 
-            tracked[tv_id] = (current_artwork_entity, last_image_entity, last_timestamp_entity, auto_shuffle_next_entity, ip_entity, mac_entity, motion_entity, light_entity, auto_bright_last_entity, auto_bright_next_entity, auto_bright_target_entity, auto_bright_lux_entity, auto_motion_last_entity, auto_motion_off_at_entity, current_matte_entity, current_filter_entity, matte_filter_entity, tags_combined_entity, selected_tagset_entity, selected_tagset_weighting_entity, override_tagset_entity, override_expiry_entity, matching_count_entity, activity_entity, orientation_entity)
-            new_entities.extend([current_artwork_entity, last_image_entity, last_timestamp_entity, auto_shuffle_next_entity, ip_entity, mac_entity, motion_entity, light_entity, auto_bright_last_entity, auto_bright_next_entity, auto_bright_target_entity, auto_bright_lux_entity, auto_motion_last_entity, auto_motion_off_at_entity, current_matte_entity, current_filter_entity, matte_filter_entity, tags_combined_entity, selected_tagset_entity, selected_tagset_weighting_entity, override_tagset_entity, override_expiry_entity, matching_count_entity, activity_entity, orientation_entity])
+            tracked[tv_id] = (current_artwork_entity, last_image_entity, last_timestamp_entity, auto_shuffle_next_entity, ip_entity, mac_entity, motion_entity, light_entity, auto_bright_last_entity, auto_bright_next_entity, auto_bright_target_entity, auto_bright_lux_entity, auto_motion_last_entity, auto_motion_off_at_entity, current_matte_entity, current_filter_entity, matte_filter_entity, tags_combined_entity, selected_tagset_entity, selected_tagset_weighting_entity, override_tagset_entity, override_expiry_entity, matching_count_entity, activity_entity, orientation_entity, artwork_info_entity)
+            new_entities.extend([current_artwork_entity, last_image_entity, last_timestamp_entity, auto_shuffle_next_entity, ip_entity, mac_entity, motion_entity, light_entity, auto_bright_last_entity, auto_bright_next_entity, auto_bright_target_entity, auto_bright_lux_entity, auto_motion_last_entity, auto_motion_off_at_entity, current_matte_entity, current_filter_entity, matte_filter_entity, tags_combined_entity, selected_tagset_entity, selected_tagset_weighting_entity, override_tagset_entity, override_expiry_entity, matching_count_entity, activity_entity, orientation_entity, artwork_info_entity])
             
         if new_entities:
             async_add_entities(new_entities)
@@ -1729,3 +1734,78 @@ class FrameArtOrientationEntity(SensorEntity):
     def available(self) -> bool:  # type: ignore[override]
         """Return if entity is available."""
         return get_tv_config(self._entry, self._tv_id) is not None
+
+
+ARTWORK_INFO_DESCRIPTION = SensorEntityDescription(
+    key="artwork_info",
+    icon="mdi:palette",
+    translation_key="artwork_info",
+)
+
+
+class FrameArtArtworkInfoSensor(SensorEntity, RestoreEntity):
+    """Tracks what is currently displayed on the TV with its full artwork metadata.
+
+    State is the Samsung content_id of the displayed artwork (stable and unique).
+    Attributes carry whatever metadata was provided at display time — title, artist,
+    medium, museum, source URL, etc. — with no fixed schema. For locally shuffled
+    images the attributes include the filename and tags; for web-source images they
+    include the rich metadata passed through the display_image service call.
+
+    Source of truth for automations that drive external displays (e.g. eink).
+    """
+
+    entity_description = ARTWORK_INFO_DESCRIPTION
+    _attr_has_entity_name = True
+    _attr_name = "Artwork Info"
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, tv_id: str) -> None:
+        self._hass = hass
+        self._entry = entry
+        self._tv_id = tv_id
+        self._attr_unique_id = f"{entry.entry_id}_{tv_id}_artwork_info"
+        self._content_id: str | None = None
+        self._artwork_attrs: dict[str, Any] = {}
+
+        tv_config = get_tv_config(entry, tv_id)
+        tv_name = tv_config.get("name", tv_id) if tv_config else tv_id
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, tv_id)},
+            name=tv_name,
+            manufacturer="Samsung",
+            model="Frame TV",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        """Restore last known state on HA restart."""
+        await super().async_added_to_hass()
+        last_state = await self.async_get_last_state()
+        if last_state and last_state.state not in (None, "unknown", "unavailable"):
+            self._content_id = last_state.state
+            self._artwork_attrs = dict(last_state.attributes)
+
+    @property
+    def native_value(self) -> str | None:
+        return self._content_id
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return self._artwork_attrs
+
+    def set_artwork(
+        self,
+        content_id: str,
+        metadata: dict[str, Any],
+        source_type: str = "local",
+    ) -> None:
+        """Update the displayed artwork. Caller must call async_write_ha_state() after."""
+        self._content_id = content_id
+        self._artwork_attrs = {
+            "source_type": source_type,
+            **{k: v for k, v in metadata.items() if v is not None},
+        }
+
+    def set_external_artwork(self, content_id: str) -> None:
+        """Update when an externally-set artwork is detected (no metadata available)."""
+        self._content_id = content_id
+        self._artwork_attrs = {"source_type": "external"}

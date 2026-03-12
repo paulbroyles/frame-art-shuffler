@@ -398,6 +398,50 @@ if _HA_AVAILABLE:
             _register_device_removal_listener(hass, entry, metadata_path)
         )
 
+        # --- External artwork change detection ---
+        # Polls the TV for the current content_id and updates the Artwork Info sensor
+        # when something else (Samsung app, Art Store gallery rotation, etc.) changed
+        # what's displayed without going through this integration.
+        async def _check_external_artwork_change(tv_id: str, client) -> None:
+            """Query TV for current artwork; update sensor only if it changed externally."""
+            data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+            artwork_sensor = data.get("artwork_sensors", {}).get(tv_id)
+            if not artwork_sensor:
+                return
+            try:
+                current = await client.art.get_current()
+                content_id = current.get("content_id") if current else None
+                if content_id and content_id != artwork_sensor.native_value:
+                    _LOGGER.debug(
+                        "External artwork change detected on %s: %s → %s",
+                        tv_id, artwork_sensor.native_value, content_id,
+                    )
+                    artwork_sensor.set_external_artwork(content_id)
+                    artwork_sensor.async_write_ha_state()
+            except Exception as err:  # pylint: disable=broad-except
+                _LOGGER.debug("Could not query current artwork for %s: %s", tv_id, err)
+
+        # Register WebSocket event callbacks (art_mode_changed, wakeup) on each client.
+        # These fire at natural transition moments; the callback schedules a check as a task.
+        for tv_id, client in art_clients.items():
+            def _make_callback(tid: str, c) -> Any:
+                async def _on_art_event(event: Any, response: Any) -> None:
+                    await _check_external_artwork_change(tid, c)
+                return _on_art_event
+            client.set_artwork_change_callback(_make_callback(tv_id, client))
+
+        # Periodic poll: catch mid-session changes (e.g. user browses gallery on TV).
+        _ARTWORK_POLL_INTERVAL = timedelta(minutes=2)
+
+        async def _poll_artwork_changes(_now: Any = None) -> None:
+            data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+            for tv_id, client in data.get("art_clients", {}).items():
+                await _check_external_artwork_change(tv_id, client)
+
+        entry.async_on_unload(
+            async_track_time_interval(hass, _poll_artwork_changes, _ARTWORK_POLL_INTERVAL)
+        )
+
         async def async_handle_display_image(call: ServiceCall) -> None:
             """Handle the display_image service."""
             device_id = call.data.get("device_id")
@@ -408,6 +452,7 @@ if _HA_AVAILABLE:
             matte = call.data.get("matte")
             filter_id = call.data.get("filter")
             screen_on = call.data.get("screen_on", True)
+            artwork_metadata = call.data.get("artwork_metadata")  # Optional dict from add-on
 
             # Resolve entity_id to device_id if needed
             if entity_id and not device_id:
@@ -509,7 +554,7 @@ if _HA_AVAILABLE:
                     f"Displaying custom image ({display_filename}) via service call",
                 )
 
-                await frame_tv.set_art_on_tv_deleteothers(
+                content_id = await frame_tv.set_art_on_tv_deleteothers(
                     client,
                     final_path,
                     mac_address=mac,
@@ -526,6 +571,35 @@ if _HA_AVAILABLE:
                 shuffle_cache["current_matte"] = matte
                 shuffle_cache["current_filter"] = filter_id
                 shuffle_cache["matching_image_count"] = 0  # Not a shuffle
+
+                # Update artwork info sensor
+                artwork_sensor = data.get("artwork_sensors", {}).get(tv_id)
+                if artwork_sensor and content_id:
+                    if artwork_metadata:
+                        # Rich metadata passed by add-on (web source)
+                        artwork_sensor.set_artwork(content_id, artwork_metadata, source_type="web_source")
+                    else:
+                        # Local image — look up tags from metadata.json
+                        meta: dict = {}
+                        try:
+                            from .metadata import MetadataStore
+                            metadata_path = data.get("metadata_path")
+                            if metadata_path and filename:
+                                store = MetadataStore(metadata_path)
+                                image_meta = store.get_image(filename)
+                                if image_meta:
+                                    meta = {
+                                        "filename": filename,
+                                        "tags": image_meta.get("tags", []),
+                                    }
+                                    if not meta["filename"]:
+                                        meta["filename"] = display_filename
+                        except Exception:
+                            pass
+                        if not meta:
+                            meta = {"filename": display_filename}
+                        artwork_sensor.set_artwork(content_id, meta, source_type="local")
+                    artwork_sensor.async_write_ha_state()
 
                 # Send signal to update sensors
                 signal = f"{DOMAIN}_shuffle_{target_entry.entry_id}_{tv_id}"

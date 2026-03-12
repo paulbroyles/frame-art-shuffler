@@ -634,7 +634,7 @@ async def _async_shuffle_tv_inner(
         if client is None:
             raise FrameArtError(f"No art client found for TV {tv_id}")
 
-        await set_art_on_tv_deleteothers(
+        content_id = await set_art_on_tv_deleteothers(
             client,
             str(image_path),
             delete_others=True,
@@ -643,6 +643,19 @@ async def _async_shuffle_tv_inner(
             mac_address=tv_mac,
             screen_on=screen_on,
         )
+
+        # Update artwork info sensor
+        artwork_sensor = entry_data.get("artwork_sensors", {}).get(tv_id)
+        if artwork_sensor and content_id:
+            artwork_sensor.set_artwork(
+                content_id,
+                {
+                    "filename": image_filename,
+                    "tags": list(selected_image.get("tags", [])),
+                },
+                source_type="local",
+            )
+            artwork_sensor.async_write_ha_state()
 
         now = datetime.now(timezone.utc)
         timestamp = now.isoformat()

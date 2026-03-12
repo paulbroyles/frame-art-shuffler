@@ -291,6 +291,16 @@ class TVConnectionManager:
                 if timeout is not None:
                     self._art.timeout = original_timeout
 
+    def set_artwork_change_callback(self, callback) -> None:
+        """Register an async callback for art_mode_changed and wakeup events.
+
+        The callback receives (event, response) and is invoked by the existing
+        WebSocket receive loop — no extra connection is needed. Pass None to
+        unregister. Useful for detecting externally-changed artwork.
+        """
+        self._art.set_callback("art_mode_changed", callback)
+        self._art.set_callback("wakeup", callback)
+
     async def async_close(self) -> None:
         """Close the persistent connection."""
         try:

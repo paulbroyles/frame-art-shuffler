@@ -106,7 +106,7 @@ Always `.copy()` nested dicts before calling `async_update_entry()`.
 Feature design docs in `/docs/`:
 - `TAGSETS_FEATURE.md` - Tagset system design
 - `TAG_WEIGHTS_FEATURE.md` - Tag weighting algorithm
-- `SHUFFLE_FEATURE.md` - Shuffle mechanics
+- `ART_DISPLAY.md` - Shuffle mechanics, artwork tracking sensors
 - `TV_STATES.md` - Samsung Frame TV state machine
 - `MATTE_BEHAVIOR.md` - Matte upload workarounds
 
