@@ -33,6 +33,22 @@ _LOGGER = logging.getLogger(__name__)
 # When selected during shuffle, the add-on API is called to display a web image.
 WEB_SOURCES_VIRTUAL_TAG = "web_sources"
 
+# Prefix for specific virtual web source tags (e.g. "ws:paintings").
+# The part after the prefix is the add-on's virtual tag ID.
+WS_TAG_PREFIX = "ws:"
+
+
+def is_virtual_web_tag(tag: str) -> bool:
+    """Return True if tag is any virtual web source tag (umbrella or specific)."""
+    return tag == WEB_SOURCES_VIRTUAL_TAG or tag.startswith(WS_TAG_PREFIX)
+
+
+def get_virtual_tag_id(tag: str) -> str | None:
+    """Extract the add-on virtual tag ID from a ws: prefixed tag, or None for umbrella."""
+    if tag.startswith(WS_TAG_PREFIX):
+        return tag[len(WS_TAG_PREFIX):]
+    return None
+
 UploadWork = Callable[[], Awaitable[Any]]
 SkipCallback = Callable[[], None]
 StatusCallback = Callable[[str, str], None]
@@ -156,15 +172,24 @@ def _select_random_image(
         _LOGGER.warning("No images found in metadata for %s", tv_name)
         return None, 0, None, 0, False
 
-    # Separate the virtual web_sources tag from real library tags.
-    # No image in the library carries WEB_SOURCES_VIRTUAL_TAG; it must be handled specially.
-    has_web_sources = WEB_SOURCES_VIRTUAL_TAG in include_tags
-    library_include_tags = [t for t in include_tags if t != WEB_SOURCES_VIRTUAL_TAG]
+    # Separate virtual web source tags from real library tags.
+    # No image in the library carries these tags; they must be handled specially.
+    virtual_web_tags = [t for t in include_tags if is_virtual_web_tag(t)]
+    has_web_sources = len(virtual_web_tags) > 0
+    library_include_tags = [t for t in include_tags if not is_virtual_web_tag(t)]
 
-    # If the tagset includes only web_sources with no library tags, return sentinel immediately.
+    # If tagset includes only virtual web tags with no library tags, pick one and return sentinel.
     if has_web_sources and not library_include_tags:
-        _LOGGER.info("web_sources is the only include tag for %s; returning web source sentinel", tv_name)
-        return {"_web_sources": True}, 1, WEB_SOURCES_VIRTUAL_TAG, 0, False
+        chosen_tag = random.choices(
+            virtual_web_tags,
+            weights=[tag_weights.get(t, 1.0) for t in virtual_web_tags],
+        )[0]
+        vtag_id = get_virtual_tag_id(chosen_tag)
+        _LOGGER.info(
+            "Virtual web tag '%s' is the only include for %s; returning sentinel%s",
+            chosen_tag, tv_name, f" (virtualTagId={vtag_id})" if vtag_id else "",
+        )
+        return {"_web_sources": True, "_virtual_tag_id": vtag_id}, 1, chosen_tag, 0, False
 
     # Handle case where no include tags means "all images" (image-weighted flat selection)
     if not library_include_tags:
@@ -241,13 +266,15 @@ def _select_random_image(
 
         library_count = len(eligible_images)
 
-        # Web sources gets effective count = avg images per library tag, so it
+        # Each virtual web tag gets effective count = avg images per library tag, so it
         # behaves like one equally-weighted library tag regardless of library size.
-        web_effective = (
+        per_vtag_effective = (
             max(1, library_count // max(1, len(library_include_tags)))
-            if has_web_sources
+            if has_web_sources and library_include_tags
+            else 1 if has_web_sources
             else 0
         )
+        web_effective = per_vtag_effective * len(virtual_web_tags)
         eligible_count = library_count + web_effective
 
         if eligible_count == 0:
@@ -259,27 +286,34 @@ def _select_random_image(
             )
             return None, 0, None, 0, False
 
-        # Roll for web_sources first (proportional to its effective share)
+        # Roll for virtual web tags first (proportional to their effective share)
         if has_web_sources and random.random() < web_effective / eligible_count:
+            # Pick which virtual web tag, weighted
+            chosen_tag = random.choices(
+                virtual_web_tags,
+                weights=[tag_weights.get(t, 1.0) for t in virtual_web_tags],
+            )[0]
+            vtag_id = get_virtual_tag_id(chosen_tag)
             _LOGGER.info(
-                "web_sources selected for TV %s (image-weighted, effective=%d of %d total)",
-                tv_name,
-                web_effective,
-                eligible_count,
+                "Virtual web tag '%s' selected for TV %s (image-weighted, effective=%d of %d total)",
+                chosen_tag, tv_name, web_effective, eligible_count,
             )
-            return {"_web_sources": True}, eligible_count, WEB_SOURCES_VIRTUAL_TAG, 0, False
+            return {"_web_sources": True, "_virtual_tag_id": vtag_id}, eligible_count, chosen_tag, 0, False
 
         if not eligible_images:
-            # has_web_sources was True but the roll didn't hit it (shouldn't happen with
-            # only web_sources, handled above), or library is empty.
             _LOGGER.warning("No library images matching tag criteria for %s", tv_name)
             return None, 0, None, 0, False
 
         candidates = [img for img in eligible_images if img["filename"] != current_image]
         if not candidates:
             if has_web_sources:
-                # No library candidates but web_sources is available — use it
-                return {"_web_sources": True}, eligible_count, WEB_SOURCES_VIRTUAL_TAG, 0, False
+                # No library candidates but virtual web tags are available — pick one
+                chosen_tag = random.choices(
+                    virtual_web_tags,
+                    weights=[tag_weights.get(t, 1.0) for t in virtual_web_tags],
+                )[0]
+                vtag_id = get_virtual_tag_id(chosen_tag)
+                return {"_web_sources": True, "_virtual_tag_id": vtag_id}, eligible_count, chosen_tag, 0, False
             if library_count == 1:
                 _LOGGER.info(
                     "Only one image (%s) matches criteria for %s and it's already displayed."
@@ -325,9 +359,9 @@ def _select_random_image(
             all_eligible.add(img["filename"])
     eligible_count = len(all_eligible)
 
-    # web_sources is always "eligible" as a virtual option (add 1 to count for display purposes)
+    # Virtual web tags are always "eligible" (add 1 per tag to count for display purposes)
     if has_web_sources:
-        eligible_count += 1
+        eligible_count += len(virtual_web_tags)
 
     if eligible_count == 0:
         _LOGGER.warning(
@@ -363,17 +397,17 @@ def _select_random_image(
                 selected_tag = tag
                 break
 
-        # Web sources is always available — return sentinel immediately when selected
-        if selected_tag == WEB_SOURCES_VIRTUAL_TAG:
+        # Virtual web tags are always available — return sentinel immediately when selected
+        if is_virtual_web_tag(selected_tag):
             total_weight_all = sum(tag_weights.get(t, 1.0) for t in include_tags)
-            ws_weight = tag_weights.get(WEB_SOURCES_VIRTUAL_TAG, 1.0)
+            ws_weight = tag_weights.get(selected_tag, 1.0)
             ws_pct = round((ws_weight / total_weight_all) * 100) if total_weight_all > 0 else 0
+            vtag_id = get_virtual_tag_id(selected_tag)
             _LOGGER.info(
-                "web_sources selected for TV %s (tag-weighted, %d%% weight)",
-                tv_name,
-                ws_pct,
+                "Virtual web tag '%s' selected for TV %s (tag-weighted, %d%% weight)",
+                selected_tag, tv_name, ws_pct,
             )
-            return {"_web_sources": True}, eligible_count, WEB_SOURCES_VIRTUAL_TAG, 0, False
+            return {"_web_sources": True, "_virtual_tag_id": vtag_id}, eligible_count, selected_tag, 0, False
 
         # Get candidates from selected tag's pool (excluding current image)
         pool = tag_pools.get(selected_tag, [])
@@ -449,6 +483,7 @@ async def _async_fetch_and_display_web_source(
     _notify: Callable[[str, str], None],
     *,
     screen_on: bool = True,
+    virtual_tag_id: str | None = None,
 ) -> bool:
     """Call the Frame Art Manager add-on API to fetch and display a web source image."""
     registry = dr.async_get(hass)
@@ -459,11 +494,15 @@ async def _async_fetch_and_display_web_source(
     frame_art_manager_url = entry.data.get("frame_art_manager_url", "http://localhost:8099")
     session = async_get_clientsession(hass)
 
+    payload: dict[str, Any] = {"deviceId": device.id, "screenOn": screen_on}
+    if virtual_tag_id:
+        payload["virtualTagId"] = virtual_tag_id
+
     try:
         async with asyncio.timeout(65):
             resp = await session.post(
                 f"{frame_art_manager_url}/api/web-sources/fetch-and-display",
-                json={"deviceId": device.id, "screenOn": screen_on},
+                json=payload,
             )
             data = await resp.json()
     except Exception as err:
@@ -617,6 +656,7 @@ async def _async_shuffle_tv_inner(
         return await _async_fetch_and_display_web_source(
             hass, entry, tv_id, tv_name, matching_count, selected_tag, entry_data, _notify,
             screen_on=screen_on,
+            virtual_tag_id=selected_image.get("_virtual_tag_id"),
         )
 
     image_filename = selected_image["filename"]
