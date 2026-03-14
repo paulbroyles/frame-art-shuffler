@@ -21,7 +21,7 @@ from typing import Any, Callable
 
 import voluptuous as vol
 
-from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.dispatcher import async_dispatcher_connect, async_dispatcher_send
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -57,6 +57,7 @@ if ha_spec is not None:  # pragma: no cover - depends on optional dependency
         HomeAssistant = getattr(_core, "HomeAssistant")
         callback = getattr(_core, "callback")
         ServiceCall = getattr(_core, "ServiceCall")
+        SupportsResponse = getattr(_core, "SupportsResponse")
         ServiceValidationError = getattr(_exceptions, "ServiceValidationError")
         dr = _helpers_dr
         er = _helpers_er
@@ -368,6 +369,7 @@ if _HA_AVAILABLE:
             "auto_brightness_next_times": {},
             "motion_off_times": {},
             "shuffle_cache": {},
+            "staged_images": {},
             "upload_in_progress": set(),
             "auto_shuffle_next_times": {},
             "tv_model_years": {},
@@ -546,6 +548,12 @@ if _HA_AVAILABLE:
             async def _perform_upload() -> bool:
                 from datetime import datetime, timezone as dt_timezone
 
+                # Invalidate staged image — gallery state is changing externally
+                staged = data.get("staged_images", {})
+                if tv_id in staged:
+                    _LOGGER.debug("display_image: invalidating staged image for %s", tv_id)
+                    del staged[tv_id]
+
                 log_activity(
                     hass,
                     target_entry.entry_id,
@@ -660,6 +668,114 @@ if _HA_AVAILABLE:
 
         hass.services.async_register(
             DOMAIN, "display_image", async_handle_display_image
+        )
+
+        async def async_handle_upload_image(call: ServiceCall) -> dict[str, Any] | None:
+            """Handle the upload_image service (pre-upload pipeline).
+
+            Uploads an image to the TV without selecting or displaying it.
+            Returns the content_id so the caller can stage it for fast-path shuffle.
+            """
+            device_id = call.data.get("device_id")
+            entity_id = call.data.get("entity_id")
+            image_path = call.data.get("image_path")
+            matte = call.data.get("matte")
+
+            # Resolve entity_id to device_id if needed
+            if entity_id and not device_id:
+                ent_reg = er.async_get(hass)
+                entity_entry = ent_reg.async_get(entity_id)
+                if entity_entry:
+                    device_id = entity_entry.device_id
+
+            if not device_id:
+                raise ValueError("Must provide device_id or entity_id")
+
+            device_registry = dr.async_get(hass)
+            device = device_registry.async_get(device_id)
+            if not device:
+                raise ValueError(f"Device {device_id} not found")
+
+            # Find the config entry for this device
+            target_entry: Any | None = None
+            for eid in device.config_entries:
+                config_entry = hass.config_entries.async_get_entry(eid)
+                if config_entry and config_entry.domain == DOMAIN:
+                    target_entry = config_entry
+                    break
+
+            if not target_entry:
+                raise ValueError(
+                    f"No config entry found for device {device_id} in domain {DOMAIN}"
+                )
+
+            data = hass.data.get(DOMAIN, {}).get(target_entry.entry_id)
+            if not data:
+                raise ValueError(
+                    f"Integration data not found for entry {target_entry.entry_id}"
+                )
+
+            coordinator = data["coordinator"]
+
+            if not image_path:
+                raise ValueError("Must provide image_path")
+
+            # Find TV ID and IP
+            tv_id = None
+            for identifier in device.identifiers:
+                if identifier[0] == DOMAIN:
+                    tv_id = identifier[1]
+                    break
+
+            if not tv_id:
+                raise ValueError(f"Could not determine TV ID from device {device_id}")
+
+            tv_data = next((tv for tv in coordinator.data if tv["id"] == tv_id), None)
+            if not tv_data:
+                raise ValueError(f"TV {tv_id} not found in coordinator data")
+
+            mac = tv_data.get("mac")
+
+            client = data.get("art_clients", {}).get(tv_id)
+            if client is None:
+                raise ValueError(f"No art client found for TV {tv_id}")
+
+            content_id: str | None = None
+
+            async def _perform_upload() -> bool:
+                nonlocal content_id
+                content_id = await frame_tv.upload_to_tv_only(
+                    client,
+                    image_path,
+                    mac_address=mac,
+                    matte=matte,
+                )
+                return True
+
+            def _on_skip() -> None:
+                _LOGGER.info(
+                    "upload_image skipped for %s: upload already running", tv_id,
+                )
+                raise ServiceValidationError(
+                    f"Upload skipped for {tv_id}: another upload is already in progress."
+                )
+
+            await async_guarded_upload(
+                hass,
+                target_entry,
+                tv_id,
+                "upload_image",
+                _perform_upload,
+                _on_skip,
+            )
+
+            return {"content_id": content_id}
+
+        hass.services.async_register(
+            DOMAIN,
+            "upload_image",
+            async_handle_upload_image,
+            supports_response=SupportsResponse.ONLY,
         )
 
         log_options_schema = vol.Schema(
@@ -1023,6 +1139,58 @@ if _HA_AVAILABLE:
                         _LOGGER.info(f"Cleared expired tagset override for {tv_config.get('name', tv_id)}")
                 except (ValueError, TypeError) as e:
                     _LOGGER.warning(f"Invalid override expiry time for {tv_id}: {e}")
+
+        # --- Staged image invalidation on tagset changes ---
+        # When a tagset definition or TV assignment changes, clear staged images
+        # whose fingerprint no longer matches and kick off a new pre-upload.
+        from .shuffle import _async_pre_upload_next  # noqa: E402 - late import avoids circular
+
+        def _invalidate_staged_for_all_tvs(*_args: Any) -> None:
+            """Global tagset changed — check all TVs."""
+            staged = hass.data[DOMAIN][entry.entry_id].get("staged_images", {})
+            entry_data = hass.data[DOMAIN][entry.entry_id]
+            for tid in list(staged.keys()):
+                from .config_entry import get_tagset_fingerprint  # noqa: E402
+                current_fp = get_tagset_fingerprint(entry, tid)
+                if staged[tid].get("tagset_fingerprint") != current_fp:
+                    _LOGGER.debug("Tagset changed: invalidating staged image for %s", tid)
+                    del staged[tid]
+                    hass.async_create_task(
+                        _async_pre_upload_next(hass, entry, tid, entry_data),
+                        f"pre-upload-restage-{tid}",
+                    )
+
+        def _make_tv_invalidator(tid: str) -> Callable[..., None]:
+            """Per-TV tagset changed — check specific TV."""
+            def _invalidate(*_args: Any) -> None:
+                staged = hass.data[DOMAIN][entry.entry_id].get("staged_images", {})
+                entry_data = hass.data[DOMAIN][entry.entry_id]
+                if tid in staged:
+                    from .config_entry import get_tagset_fingerprint  # noqa: E402
+                    current_fp = get_tagset_fingerprint(entry, tid)
+                    if staged[tid].get("tagset_fingerprint") != current_fp:
+                        _LOGGER.debug("Tagset changed: invalidating staged image for %s", tid)
+                        del staged[tid]
+                        hass.async_create_task(
+                            _async_pre_upload_next(hass, entry, tid, entry_data),
+                            f"pre-upload-restage-{tid}",
+                        )
+            return _invalidate
+
+        # Listen for global tagset definition changes (upsert/delete)
+        async_dispatcher_connect(
+            hass,
+            f"{DOMAIN}_tagset_updated_{entry.entry_id}",
+            _invalidate_staged_for_all_tvs,
+        )
+
+        # Listen for per-TV tagset assignment changes (select/override/clear)
+        for tv_id in list_tv_configs(entry):
+            async_dispatcher_connect(
+                hass,
+                f"{DOMAIN}_tagset_updated_{entry.entry_id}_{tv_id}",
+                _make_tv_invalidator(tv_id),
+            )
 
         async def async_handle_upsert_tagset(call: ServiceCall) -> None:
             """Create or update a global tagset definition.

@@ -59,6 +59,37 @@ display_image:
       selector:
         text:
 
+upload_image:
+  name: Upload Image (Pre-upload)
+  description: Upload an image to a Frame TV without selecting or displaying it. Returns the content_id for later use with select_image. Used by the pre-upload pipeline for near-instant shuffles.
+  fields:
+    device_id:
+      name: Device
+      description: The TV device to upload to. Required if entity_id is not provided.
+      required: false
+      selector:
+        device:
+          integration: frame_art_shuffler
+    entity_id:
+      name: Entity
+      description: The entity ID of the TV. Required if device_id is not provided.
+      required: false
+      selector:
+        entity:
+          integration: frame_art_shuffler
+    image_path:
+      name: Image Path
+      description: Full local path to the image file.
+      required: true
+      selector:
+        text:
+    matte:
+      name: Matte
+      description: Matte ID to apply (e.g. shadowbox_polar).
+      required: false
+      selector:
+        text:
+
 set_log_options:
   name: Configure Display Logging
   description: Update the shared display log settings used by the Frame Art Manager dashboard.
