@@ -1020,11 +1020,17 @@ async def _async_shuffle_tv_inner(
 
     # Web sources sentinel — call add-on API instead of uploading a library image
     if selected_image.get("_web_sources"):
-        return await _async_fetch_and_display_web_source(
+        ws_result = await _async_fetch_and_display_web_source(
             hass, entry, tv_id, tv_name, matching_count, selected_tag, entry_data, _notify,
             screen_on=screen_on,
             virtual_tag_id=selected_image.get("_virtual_tag_id"),
         )
+        if ws_result:
+            hass.async_create_task(
+                _async_pre_upload_next(hass, entry, tv_id, entry_data),
+                f"pre-upload-{tv_id}",
+            )
+        return ws_result
 
     image_filename = selected_image["filename"]
     image_path = metadata_path.parent / "library" / image_filename
