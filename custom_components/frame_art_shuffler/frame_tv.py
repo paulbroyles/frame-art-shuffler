@@ -21,7 +21,7 @@ import re
 import socket
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 import aiohttp
 
@@ -54,16 +54,22 @@ TOKEN_DIR = Path(__file__).resolve().parent / "tokens"
 _ART_MODE_ON = "on"
 _UPLOAD_RETRIES = 3
 _UPLOAD_RETRY_DELAY = 2
-_INITIAL_UPLOAD_SETTLE = 6
+
+# Poll-based verification ceilings (replace old fixed sleeps).
+# Ceilings match the original fixed delays so worst case is unchanged;
+# polls return early when the TV responds quickly.
+_UPLOAD_SETTLE_MAX_WAIT = 6    # was _INITIAL_UPLOAD_SETTLE = 6
+_ART_MODE_MAX_WAIT = 6         # was 6s in _ensure_art_mode, 3s in set_art_mode
+_DISPLAY_VERIFY_MAX_WAIT = 8   # was _POST_DISPLAY_VERIFY_DELAY = 8
+_DELETE_SETTLE_MAX_WAIT = 4    # was _DELETE_SETTLE = 4
+_POLL_INTERVAL = 0.5
 
 # Placeholder matte used during upload to enable matte support.
 # The actual desired matte is applied via change_matte() after upload.
 # This workaround avoids Samsung firmware bug causing Error 40000.
 # See docs/MATTE_BEHAVIOR.md for details.
 _MATTE_PLACEHOLDER = "flexible_warm"
-_DISPLAY_RETRY_DELAYS = (0, 10, 15)
-_POST_DISPLAY_VERIFY_DELAY = 8
-_DELETE_SETTLE = 4
+_DISPLAY_RETRY_DELAYS = (0, 2, 5)
 _BRIGHTNESS_VERIFY_DELAY = 1
 _VALID_BRIGHTNESS = set(range(1, 11)) | {50}
 _WARN_FILE_MB = 10
@@ -353,7 +359,6 @@ async def set_art_on_tv_deleteothers(
     screen_on: bool = True,
     matte: Optional[str] = None,
     photo_filter: Optional[str] = None,
-    wait_after_upload: float = _INITIAL_UPLOAD_SETTLE,
     brightness: Optional[int] = None,
     debug: bool = False,
 ) -> str:
@@ -369,6 +374,7 @@ async def set_art_on_tv_deleteothers(
     """
 
     ip = client.ip
+    _op_start = asyncio.get_event_loop().time()
 
     _clear_progress()
     _log_progress(f"Starting process for {ip}...")
@@ -624,7 +630,20 @@ async def set_art_on_tv_deleteothers(
         await client.ensure_connected()
         art = client.art
 
-        await _wait_with_countdown(wait_after_upload, "Waiting for TV to process upload")
+        # Poll until the uploaded image is visible in the gallery.
+        # upload() already awaited the image_added WebSocket confirmation,
+        # so the image is usually queryable immediately.
+        if content_id:
+            appeared = await _poll_until(
+                lambda: _content_id_in_gallery(art, content_id),
+                max_wait=_UPLOAD_SETTLE_MAX_WAIT,
+                label="upload settle",
+            )
+            if not appeared:
+                _LOGGER.warning(
+                    "Uploaded content_id %s not yet visible in gallery after %.0fs",
+                    content_id, _UPLOAD_SETTLE_MAX_WAIT,
+                )
 
         if screen_on:
             displayed = await _display_uploaded_art(
@@ -672,7 +691,9 @@ async def set_art_on_tv_deleteothers(
             _log_progress("Cleaning up old images from TV memory...")
             await _delete_other_images(art, content_id, debug=debug)
 
+        _op_elapsed = asyncio.get_event_loop().time() - _op_start
         _log_progress(f"Upload complete for {ip} (content_id={content_id})")
+        _LOGGER.info("set_art_on_tv_deleteothers completed in %.1fs for %s", _op_elapsed, ip)
 
         return content_id
     except Exception as err:  # pylint: disable=broad-except
@@ -937,14 +958,14 @@ async def set_art_mode(client: TVConnectionManager) -> None:
         await client.art.set_artmode(_ART_MODE_ON)
         _LOGGER.info("set_artmode sent to %s", client)
 
-        # Give TV a moment to process the mode switch before verifying.
-        await asyncio.sleep(3)
+        # Poll for art mode confirmation instead of fixed 3s sleep.
+        async def _art_mode_is_on() -> bool:
+            return await client.art.get_artmode() == _ART_MODE_ON
 
-        new_status = await client.art.get_artmode()
-        if new_status == _ART_MODE_ON:
+        if await _poll_until(_art_mode_is_on, max_wait=_ART_MODE_MAX_WAIT, label="set art mode"):
             _LOGGER.info("%s successfully switched to art mode", client)
         else:
-            _LOGGER.warning("%s may not have switched to art mode (status: %s)", client, new_status)
+            _LOGGER.warning("%s may not have switched to art mode after %.0fs", client, _ART_MODE_MAX_WAIT)
 
     except Exception as err:  # pylint: disable=broad-except
         raise FrameArtUploadError(f"Failed to switch {client} to art mode: {err}") from err
@@ -1044,7 +1065,7 @@ def _send_wake_on_lan(mac_address: str) -> None:
 
 
 async def _display_uploaded_art(art: SamsungTVAsyncArt, content_id: str, *, debug: bool) -> bool:
-    # Method 1: try direct selection with retries mirroring the reference script
+    # Method 1: try direct selection with retries
     for attempt, delay in enumerate(_DISPLAY_RETRY_DELAYS):
         if attempt and delay:
             _LOGGER.debug("Waiting %ss before retrying display", delay)
@@ -1055,8 +1076,14 @@ async def _display_uploaded_art(art: SamsungTVAsyncArt, content_id: str, *, debu
             _LOGGER.debug("select_image failed on attempt %s: %s", attempt + 1, err)
             continue
 
-        await _wait_with_countdown(_POST_DISPLAY_VERIFY_DELAY, "Image selected. Verifying display")
-        if await _verify_current_art(art, content_id, debug=debug):
+        # Poll for verification instead of fixed delay — select_image already
+        # awaited a WebSocket ACK, so the TV usually updates immediately.
+        verified = await _poll_until(
+            lambda: _verify_current_art(art, content_id, debug=debug),
+            max_wait=_DISPLAY_VERIFY_MAX_WAIT,
+            label="verify display",
+        )
+        if verified:
             return True
 
     # Method 2: fallback to selecting the newest image from the gallery
@@ -1071,8 +1098,12 @@ async def _display_uploaded_art(art: SamsungTVAsyncArt, content_id: str, *, debu
         if newest:
             try:
                 await art.select_image(newest, show=True)
-                await asyncio.sleep(_POST_DISPLAY_VERIFY_DELAY)
-                return await _verify_current_art(art, newest, debug=debug)
+                verified = await _poll_until(
+                    lambda: _verify_current_art(art, newest, debug=debug),
+                    max_wait=_DISPLAY_VERIFY_MAX_WAIT,
+                    label="verify fallback display",
+                )
+                return verified
             except Exception as err:  # pylint: disable=broad-except
                 _LOGGER.debug("Fallback select_image failed: %s", err)
 
@@ -1125,7 +1156,17 @@ async def _delete_other_images(art: SamsungTVAsyncArt, keep_content_id: str, *, 
     await art.delete_list(deletions)
     if debug:
         _LOGGER.debug("Deleted %s old images", len(deletions))
-    await asyncio.sleep(_DELETE_SETTLE)
+
+    # Poll until deleted images are gone from the gallery instead of fixed 4s sleep.
+    # delete_list already awaited a WebSocket ACK.
+    deleted_set = set(deletions)
+
+    async def _deletions_gone() -> bool:
+        current = await art.available() or []
+        remaining = {item.get("content_id") for item in current} & deleted_set
+        return len(remaining) == 0
+
+    await _poll_until(_deletions_gone, max_wait=_DELETE_SETTLE_MAX_WAIT, label="delete settle")
 
 
 async def _set_brightness(art: SamsungTVAsyncArt, brightness: int, *, debug: bool) -> None:
@@ -1166,13 +1207,16 @@ async def _ensure_art_mode(art: SamsungTVAsyncArt, *, debug: bool) -> None:
 
     try:
         await art.set_artmode(_ART_MODE_ON)
-        await asyncio.sleep(_INITIAL_UPLOAD_SETTLE)
-        status = await art.get_artmode()
     except Exception as err:  # pylint: disable=broad-except
         raise FrameArtUploadError(f"Unable to enable art mode: {err}") from err
 
-    if status != _ART_MODE_ON:
-        raise FrameArtUploadError(f"TV art mode still {status}, expected {_ART_MODE_ON}")
+    # Poll until art mode is confirmed instead of a fixed 6s sleep.
+    # set_artmode already awaited a WebSocket ACK.
+    async def _art_mode_is_on() -> bool:
+        return await art.get_artmode() == _ART_MODE_ON
+
+    if not await _poll_until(_art_mode_is_on, max_wait=_ART_MODE_MAX_WAIT, label="ensure art mode"):
+        raise FrameArtUploadError(f"TV art mode not confirmed after {_ART_MODE_MAX_WAIT}s")
 
 
 def _log_file_details(file_path: Path, file_size: int) -> None:
@@ -1234,6 +1278,50 @@ def delete_token(ip: str) -> None:
             raise FrameArtError(f"Failed to delete token file for {ip}: {err}") from err
     else:
         _LOGGER.info("No token file found for %s", ip)
+
+
+async def _poll_until(
+    check: Callable[[], Awaitable[bool]],
+    *,
+    max_wait: float,
+    interval: float = _POLL_INTERVAL,
+    label: str = "",
+) -> bool:
+    """Poll check() until it returns True or max_wait elapses.
+
+    Checks immediately, then every `interval` seconds.  Returns True if the
+    check passed, False on timeout.  Logs timing for diagnostics.
+    """
+    loop = asyncio.get_event_loop()
+    start = loop.time()
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            if await check():
+                elapsed = loop.time() - start
+                _LOGGER.debug(
+                    "Poll '%s' succeeded on attempt %d after %.1fs",
+                    label, attempt, elapsed,
+                )
+                return True
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.debug("Poll '%s' attempt %d error: %s", label, attempt, err)
+
+        elapsed = loop.time() - start
+        if elapsed >= max_wait:
+            _LOGGER.debug(
+                "Poll '%s' timed out after %d attempts (%.1fs)",
+                label, attempt, elapsed,
+            )
+            return False
+        await asyncio.sleep(min(interval, max_wait - elapsed))
+
+
+async def _content_id_in_gallery(art: SamsungTVAsyncArt, content_id: str) -> bool:
+    """Check whether content_id is visible in the TV gallery."""
+    available = await art.available() or []
+    return any(item.get("content_id") == content_id for item in available)
 
 
 async def _wait_with_countdown(seconds: float, msg: str) -> None:
