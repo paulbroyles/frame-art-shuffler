@@ -290,7 +290,7 @@ class TVConnectionManager:
                 _LOGGER.debug("Art probe skipped for %s (last ok %.1fs ago)", self, now - self._last_art_ok)
                 return
             try:
-                await self._art.get_artmode()
+                await asyncio.wait_for(self._art.get_artmode(), timeout=2.0)
                 self._last_art_ok = now
                 return  # Art channel is healthy
             except Exception:
