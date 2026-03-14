@@ -295,25 +295,43 @@ You can still automate manual shuffles (e.g., specific tags at certain times) by
    - Load `metadata.json`
    - Filter by tags
    - Random selection excluding current
-4. **Upload image** (sync, in executor thread)
-   - Call `set_art_on_tv_deleteothers()`
-   - Handles retries internally
+4. **Upload and display** (async, on event loop via `set_art_on_tv_deleteothers()`)
+   - Uses vendored `samsungtvws` async art WebSocket client
+   - All TV operations (upload, select, delete, get_current, available, etc.) are request/response — the library awaits a WebSocket confirmation from the TV before returning
+   - Upload retries internally (up to 3 attempts)
+   - After upload: `select_image(show=True)` to display, then poll-based verification
+   - Old images deleted via `delete_list()`
 5. **Update config** (async, HA event loop)
 6. **Refresh coordinator** (async, triggers sensor updates)
 
-### Thread Safety
+### Concurrency
 
-- Image selection runs in executor (blocking I/O)
-- Upload runs in executor (blocking network I/O)
+- Image selection runs in executor (blocking file I/O for `metadata.json`)
+- TV WebSocket operations are fully async (no executor needed)
 - Config updates run on event loop (atomic)
 - Coordinator refresh is async-safe
+- Per-TV upload lock (`async_guarded_upload`) prevents overlapping operations
 
 ### Performance
 
 - Image selection: O(n) where n = total images
 - Random selection: O(1) after filtering
-- Upload time: 5-15 seconds depending on image size and network
-- No polling or background tasks
+- `set_art_on_tv_deleteothers` typical wall-clock time: ~12s (dominated by network upload)
+- Post-operation verification uses poll-based checking (`_poll_until`) instead of fixed delays — checks succeed on first attempt in <1s when the TV responds promptly, with configurable ceilings matching historical worst-case timings
+
+### Legacy Sync-Era Delays (Historical Note)
+
+The original codebase used synchronous `samsungtvws` operations that were fire-and-forget at the WebSocket level — the library sent a command but did not await a TV response. To compensate, the code added fixed `asyncio.sleep()` / `time.sleep()` delays after each operation:
+
+- 6s after upload (wait for image to appear in gallery)
+- 8s after `select_image` (wait for display to update)
+- 4s after `delete_list` (wait for deletions to propagate)
+- 3–6s after `set_artmode` (wait for mode switch)
+- 10–15s between display retry attempts
+
+The async `samsungtvws` library (vendored v3.0.3+) changed all art operations to request/response — `_send_art_request()` creates a Future, sends the WebSocket message, and `wait_for_response()` blocks until the TV confirms. This made most post-operation delays unnecessary.
+
+The current code retains poll-based verification only where confirmation adds genuine value (verifying `get_current` matches after `select_image`). Operations with reliable WebSocket ACKs (upload `image_added`, `delete_list` confirmation) trust the library's built-in confirmation and proceed immediately.
 
 ## Pool Health API
 

@@ -104,66 +104,44 @@ Art mode is enabled
 from custom_components.frame_art_shuffler.frame_tv import (
     is_art_mode_enabled,
     is_screen_on,
-    tv_on,
-    set_art_mode,
 )
 
-tv_ip = "192.168.1.249"
+# is_screen_on takes an IP (uses REST API, no WebSocket needed)
+screen_on = await is_screen_on("192.168.1.249")
 
-# Comprehensive status check
-screen_on = is_screen_on(tv_ip)
-art_enabled = is_art_mode_enabled(tv_ip)
+# is_art_mode_enabled takes a TVConnectionManager (uses WebSocket art channel)
+art_enabled = await is_art_mode_enabled(client)
 
 if screen_on and art_enabled:
-    print("✅ Screen on, displaying artwork")
+    print("Screen on, displaying artwork")
 elif screen_on and not art_enabled:
-    print("📺 Screen on, in TV mode")
+    print("Screen on, in TV mode")
 elif not screen_on and art_enabled:
-    print("😴 Screen off, art mode standby")
+    print("Screen off, art mode standby")
 else:
-    print("💤 Fully off")
+    print("Fully off")
 ```
 
 ### Smart Preparation
 ```python
-# Ensure TV is ready for art operations
-def prepare_tv_for_art(tv_ip: str, tv_mac: str):
-    """Ensure TV is on and in art mode."""
-    
-    # Turn screen on if needed
-    if not is_screen_on(tv_ip):
-        print("Turning screen on...")
-        tv_on(tv_ip, tv_mac)
-        time.sleep(2)  # Give it a moment
-    
-    # Switch to art mode if needed
-    if not is_art_mode_enabled(tv_ip):
-        print("Switching to art mode...")
-        set_art_mode(tv_ip)
-        time.sleep(2)
-    
-    print("TV ready for art operations!")
-
-# Use it
-prepare_tv_for_art("192.168.1.249", "28:AF:42:18:64:08")
-set_tv_brightness("192.168.1.249", 7)
+# The integration handles this automatically via _ensure_art_mode() and
+# the power/wake sequence in set_art_on_tv_deleteothers(). All TV operations
+# use the async samsungtvws WebSocket client with request/response confirmation,
+# so no manual time.sleep() delays are needed.
+#
+# For manual scripting, see scripts/frame_tv_cli.py.
 ```
 
-## Backwards Compatibility
+## API Notes
 
-The old `is_tv_on()` function still works but is deprecated:
+The old sync `is_tv_on()` function has been removed. Current async equivalents:
+
 ```python
-# Old way (deprecated but works)
-if is_tv_on(tv_ip):  # Checks art mode only
-    ...
+# Art mode check (via TVConnectionManager)
+status = await art.get_artmode()  # returns "on" or "off"
 
-# New way (clearer)
-if is_art_mode_enabled(tv_ip):  # Same behavior, clearer name
-    ...
-
-# Check screen separately
-if is_screen_on(tv_ip):
-    ...
+# Screen check (via REST API)
+screen_on = await is_screen_on(ip)  # True if screen is lit
 ```
 
 ## Common Patterns
