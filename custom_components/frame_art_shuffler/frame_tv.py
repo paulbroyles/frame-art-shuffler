@@ -230,6 +230,12 @@ class TVConnectionManager:
     live connection (e.g., at the start of an upload or after a WoL wake).
     """
 
+    # Skip the art-channel probe in ensure_connected if the last successful
+    # art operation was within this window.  Avoids a redundant get_artmode()
+    # round-trip (~1-2 s) on the fast-path shuffle where the pre-upload just
+    # used the connection moments earlier.
+    _PROBE_SKIP_WINDOW = 60  # seconds
+
     def __init__(self, ip: str) -> None:
         self.ip = ip
         self._art = _SamsungTVAsyncArtNoInit(
@@ -240,6 +246,7 @@ class TVConnectionManager:
             name="FrameArtShuffler",
         )
         self._lock = asyncio.Lock()
+        self._last_art_ok: float = 0  # monotonic timestamp of last successful art op
 
     def __repr__(self) -> str:
         return f"TV({self.ip})"
@@ -275,9 +282,16 @@ class TVConnectionManager:
         # Probe the art channel whenever the connection appears alive.
         # A healthy connection responds in well under 100 ms; a stale one times out
         # after 2 s, triggering a reconnect below.
+        # Skip the probe if we had a successful art operation very recently (e.g.
+        # pre-upload just finished) — the connection is known-good.
         if self._art.is_alive():
+            now = asyncio.get_event_loop().time()
+            if now - self._last_art_ok < self._PROBE_SKIP_WINDOW:
+                _LOGGER.debug("Art probe skipped for %s (last ok %.1fs ago)", self, now - self._last_art_ok)
+                return
             try:
                 await self._art.get_artmode()
+                self._last_art_ok = now
                 return  # Art channel is healthy
             except Exception:
                 _LOGGER.debug(
@@ -542,6 +556,7 @@ async def set_art_on_tv_deleteothers(
                         _log_progress(f"Applying matte: {desired_matte}")
                         await art.change_matte(content_id, desired_matte)
                     _log_progress(f"Upload successful, content_id={content_id}")
+                    client._last_art_ok = asyncio.get_event_loop().time()
                     if debug:
                         _LOGGER.debug("Upload returned content_id=%s", content_id)
                     break  # Success, exit retry loop
@@ -782,6 +797,7 @@ async def upload_to_tv_only(
                     "upload_to_tv_only: uploaded %s to %s (content_id=%s)",
                     file_path.name, ip, content_id,
                 )
+                client._last_art_ok = asyncio.get_event_loop().time()
                 break
             else:
                 last_error = FrameArtUploadError(
@@ -877,6 +893,7 @@ async def select_and_cleanup(
 
     try:
         await art.select_image(content_id, show=show)
+        client._last_art_ok = asyncio.get_event_loop().time()
     except Exception as err:
         _LOGGER.warning("select_and_cleanup: select_image failed for %s: %s", content_id, err)
         return False
@@ -902,15 +919,17 @@ async def select_and_cleanup(
         except Exception as filter_err:
             _LOGGER.warning("Failed to apply photo filter '%s': %s", photo_filter, filter_err)
 
-    # --- Cleanup old images ---
-    try:
-        await _delete_other_images(art, keep_content_ids, debug=debug)
-    except Exception as err:
-        # Cleanup failure is non-fatal — the image is already selected
-        _LOGGER.warning("select_and_cleanup: cleanup failed (non-fatal): %s", err)
-
     elapsed = asyncio.get_event_loop().time() - _op_start
-    _LOGGER.info("select_and_cleanup: completed in %.1fs for %s", elapsed, ip)
+    _LOGGER.info("select_and_cleanup: selected in %.1fs for %s", elapsed, ip)
+
+    # --- Cleanup old images (background, non-blocking) ---
+    async def _background_cleanup() -> None:
+        try:
+            await _delete_other_images(art, keep_content_ids, debug=debug)
+        except Exception as err:
+            _LOGGER.warning("select_and_cleanup: cleanup failed (non-fatal): %s", err)
+
+    asyncio.get_event_loop().create_task(_background_cleanup())
     return True
 
 
