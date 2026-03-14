@@ -840,8 +840,14 @@ async def select_and_cleanup(
     else:
         keep_content_ids = keep_content_ids | {content_id}
 
-    # --- Connectivity / Wake ---
+    # --- Check screen state (before any WoL) ---
+    # When screen_on=False, check actual screen state so we can show the image
+    # if the screen happens to be on, without waking it if it's off.
     pre_screen_on = False
+    if not screen_on:
+        _, pre_screen_on = await _check_rest_state(ip)
+
+    # --- Connectivity / Wake ---
     try:
         await client.ensure_connected(timeout=4)
     except Exception:
@@ -850,7 +856,7 @@ async def select_and_cleanup(
                 await tv_on(ip, mac_address, client=client)
                 await client.ensure_connected()
             else:
-                pre_network_awake, pre_screen_on = await _check_rest_state(ip)
+                pre_network_awake = pre_screen_on  # REST responded above
                 if not pre_network_awake:
                     _LOGGER.info("select_and_cleanup: waking network for %s (screen stays off)", ip)
                     await tv_network_wake(mac_address, ip, client=client)
