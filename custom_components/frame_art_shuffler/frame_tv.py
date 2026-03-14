@@ -58,10 +58,12 @@ _UPLOAD_RETRY_DELAY = 2
 # Poll-based verification ceilings (replace old fixed sleeps).
 # Ceilings match the original fixed delays so worst case is unchanged;
 # polls return early when the TV responds quickly.
-_UPLOAD_SETTLE_MAX_WAIT = 6    # was _INITIAL_UPLOAD_SETTLE = 6
+# Upload settle poll removed — upload() already awaits image_added WebSocket
+# confirmation, so the content_id is reliably available immediately.
 _ART_MODE_MAX_WAIT = 6         # was 6s in _ensure_art_mode, 3s in set_art_mode
 _DISPLAY_VERIFY_MAX_WAIT = 8   # was _POST_DISPLAY_VERIFY_DELAY = 8
-_DELETE_SETTLE_MAX_WAIT = 4    # was _DELETE_SETTLE = 4
+# Delete settle poll removed — delete_list() already awaits WebSocket
+# confirmation, and nothing downstream depends on the gallery state.
 _POLL_INTERVAL = 0.5
 
 # Placeholder matte used during upload to enable matte support.
@@ -630,21 +632,6 @@ async def set_art_on_tv_deleteothers(
         await client.ensure_connected()
         art = client.art
 
-        # Poll until the uploaded image is visible in the gallery.
-        # upload() already awaited the image_added WebSocket confirmation,
-        # so the image is usually queryable immediately.
-        if content_id:
-            appeared = await _poll_until(
-                lambda: _content_id_in_gallery(art, content_id),
-                max_wait=_UPLOAD_SETTLE_MAX_WAIT,
-                label="upload settle",
-            )
-            if not appeared:
-                _LOGGER.warning(
-                    "Uploaded content_id %s not yet visible in gallery after %.0fs",
-                    content_id, _UPLOAD_SETTLE_MAX_WAIT,
-                )
-
         if screen_on:
             displayed = await _display_uploaded_art(
                 art,
@@ -1157,16 +1144,8 @@ async def _delete_other_images(art: SamsungTVAsyncArt, keep_content_id: str, *, 
     if debug:
         _LOGGER.debug("Deleted %s old images", len(deletions))
 
-    # Poll until deleted images are gone from the gallery instead of fixed 4s sleep.
-    # delete_list already awaited a WebSocket ACK.
-    deleted_set = set(deletions)
-
-    async def _deletions_gone() -> bool:
-        current = await art.available() or []
-        remaining = {item.get("content_id") for item in current} & deleted_set
-        return len(remaining) == 0
-
-    await _poll_until(_deletions_gone, max_wait=_DELETE_SETTLE_MAX_WAIT, label="delete settle")
+    # No post-delete settle needed — delete_list() already awaited a WebSocket
+    # ACK, and nothing downstream queries the gallery.
 
 
 async def _set_brightness(art: SamsungTVAsyncArt, brightness: int, *, debug: bool) -> None:
@@ -1316,12 +1295,6 @@ async def _poll_until(
             )
             return False
         await asyncio.sleep(min(interval, max_wait - elapsed))
-
-
-async def _content_id_in_gallery(art: SamsungTVAsyncArt, content_id: str) -> bool:
-    """Check whether content_id is visible in the TV gallery."""
-    available = await art.available() or []
-    return any(item.get("content_id") == content_id for item in available)
 
 
 async def _wait_with_countdown(seconds: float, msg: str) -> None:
