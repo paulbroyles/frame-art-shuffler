@@ -742,31 +742,15 @@ if _HA_AVAILABLE:
 
             content_id: str | None = None
 
-            async def _perform_upload() -> bool:
-                nonlocal content_id
-                content_id = await frame_tv.upload_to_tv_only(
-                    client,
-                    image_path,
-                    mac_address=mac,
-                    matte=matte,
-                )
-                return True
-
-            def _on_skip() -> None:
-                _LOGGER.info(
-                    "upload_image skipped for %s: upload already running", tv_id,
-                )
-                raise ServiceValidationError(
-                    f"Upload skipped for {tv_id}: another upload is already in progress."
-                )
-
-            await async_guarded_upload(
-                hass,
-                target_entry,
-                tv_id,
-                "upload_image",
-                _perform_upload,
-                _on_skip,
+            # No upload guard here — upload_image is used by the pre-upload
+            # pipeline (background optimization). It must not block user-initiated
+            # display_image calls which DO use the guard. If a concurrent conflict
+            # occurs, the pre-upload will fail gracefully (non-fatal).
+            content_id = await frame_tv.upload_to_tv_only(
+                client,
+                image_path,
+                mac_address=mac,
+                matte=matte,
             )
 
             return {"content_id": content_id}
