@@ -668,6 +668,12 @@ async def _async_fast_path_shuffle(
         activity_msg = f"Web source displayed (fast): \"{title}\" from {source}"
         log_activity(hass, entry.entry_id, tv_id, "shuffle", activity_msg)
 
+        # Update artwork info sensor with web source metadata
+        artwork_sensor = entry_data.get("artwork_sensors", {}).get(tv_id)
+        if artwork_sensor and content_id:
+            artwork_sensor.set_artwork(content_id, art_metadata, source_type="web_source")
+            artwork_sensor.async_write_ha_state()
+
         shuffle_cache[tv_id] = {
             "current_image": None,
             "current_matte": None,
