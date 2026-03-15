@@ -636,6 +636,23 @@ async def _async_fast_path_shuffle(
     include_tags, _ = get_effective_tags(entry, tv_id)
 
     if staged.get("source_type") == "web_source":
+        # Promote staged cache → display cache on the add-on so the artwork
+        # page serves the correct image for what's now on the TV.
+        registry = dr.async_get(hass)
+        device = registry.async_get_device(identifiers={(DOMAIN, tv_id)})
+        if device:
+            frame_art_manager_url = entry.data.get(
+                "frame_art_manager_url", "http://localhost:8099",
+            )
+            session = async_get_clientsession(hass)
+            try:
+                async with asyncio.timeout(10):
+                    await session.post(
+                        f"{frame_art_manager_url}/api/web-sources/cache/{device.id}/promote",
+                    )
+            except Exception as err:
+                _LOGGER.warning("fast-path: cache promote failed for %s: %s", tv_name, err)
+
         art_metadata = staged.get("metadata", {})
         title = art_metadata.get("title") or "Unknown"
         source = art_metadata.get("source") or "web source"
