@@ -22,9 +22,21 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 
 from .activity import log_activity
-from .config_entry import get_active_tagset_name, get_effective_tags, get_tag_weights, get_tv_config, get_weighting_type
+from .config_entry import (
+    get_active_tagset_name,
+    get_effective_tags,
+    get_tag_weights,
+    get_tagset_fingerprint,
+    get_tv_config,
+    get_weighting_type,
+)
 from .const import DOMAIN
-from .frame_tv import FrameArtError, set_art_on_tv_deleteothers
+from .frame_tv import (
+    FrameArtError,
+    select_and_cleanup,
+    set_art_on_tv_deleteothers,
+    upload_to_tv_only,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -472,74 +484,397 @@ def _select_random_image(
     return selected, eligible_count, selected_tag, fresh_count, used_fallback
 
 
-async def _async_fetch_and_display_web_source(
+async def _async_web_source_send(
     hass: HomeAssistant,
     entry: Any,
     tv_id: str,
     tv_name: str,
-    matching_count: int,
-    selected_tag: str | None,
     entry_data: dict[str, Any],
-    _notify: Callable[[str, str], None],
     *,
+    select: bool = True,
     screen_on: bool = True,
     virtual_tag_id: str | None = None,
-) -> bool:
-    """Call the Frame Art Manager add-on API to fetch and display a web source image."""
+    matte: str | None = None,
+    matching_count: int = 0,
+    selected_tag: str | None = None,
+    _notify: Callable[[str, str], None] | None = None,
+) -> dict[str, Any] | None:
+    """Call the Frame Art Manager add-on to fetch and send a web source image.
+
+    When select=True: fetches, uploads, selects on TV, updates activity/cache/signals.
+    When select=False: fetches, uploads only. Returns metadata for staging.
+
+    Returns a dict with response data, or None on failure (select=False only).
+    Raises FrameArtError on failure when select=True.
+    """
     registry = dr.async_get(hass)
     device = registry.async_get_device(identifiers={(DOMAIN, tv_id)})
     if not device:
-        raise FrameArtError(f"Could not find HA device for TV '{tv_name}' (id: {tv_id})")
+        if select:
+            raise FrameArtError(f"Could not find HA device for TV '{tv_name}' (id: {tv_id})")
+        _LOGGER.warning("pre-upload: no HA device for TV '%s'", tv_name)
+        return None
 
     frame_art_manager_url = entry.data.get("frame_art_manager_url", "http://localhost:8099")
     session = async_get_clientsession(hass)
 
-    payload: dict[str, Any] = {"deviceId": device.id, "screenOn": screen_on}
+    payload: dict[str, Any] = {"deviceId": device.id, "select": select}
+    if select:
+        payload["screenOn"] = screen_on
     if virtual_tag_id:
         payload["virtualTagId"] = virtual_tag_id
+    if matte:
+        payload["matte"] = matte
 
     try:
-        async with asyncio.timeout(65):
+        async with asyncio.timeout(65 if select else 120):
             resp = await session.post(
-                f"{frame_art_manager_url}/api/web-sources/fetch-and-display",
+                f"{frame_art_manager_url}/api/web-sources/fetch-and-send",
                 json=payload,
             )
             data = await resp.json()
     except Exception as err:
-        raise FrameArtError(f"Web source API call failed for {tv_name}: {err}") from err
+        if select:
+            raise FrameArtError(f"Web source API call failed for {tv_name}: {err}") from err
+        _LOGGER.warning("pre-upload: web source fetch-and-send failed for %s: %s", tv_name, err)
+        return None
 
     if not data.get("success"):
-        raise FrameArtError(
-            f"Web source fetch failed for {tv_name}: {data.get('error', 'Unknown error')}"
-        )
+        error_msg = data.get("error", "Unknown error")
+        if select:
+            raise FrameArtError(f"Web source fetch failed for {tv_name}: {error_msg}")
+        _LOGGER.warning("pre-upload: web source fetch-and-send returned error for %s: %s", tv_name, error_msg)
+        return None
 
-    art_metadata = data.get("metadata", {})
-    title = art_metadata.get("title") or "Unknown"
-    source = art_metadata.get("source") or "web source"
-    activity_msg = f"Web source displayed: \"{title}\" from {source}"
+    if select:
+        # Update activity, cache, signals
+        art_metadata = data.get("metadata", {})
+        title = art_metadata.get("title") or "Unknown"
+        source = art_metadata.get("source") or "web source"
+        log_activity(hass, entry.entry_id, tv_id, "shuffle", f"Web source selected: \"{title}\" from {source}")
 
-    log_activity(hass, entry.entry_id, tv_id, "shuffle", activity_msg)
+        now = datetime.now(timezone.utc)
+        shuffle_cache = entry_data.setdefault("shuffle_cache", {})
+        shuffle_cache[tv_id] = {
+            "current_image": None,
+            "current_matte": None,
+            "current_filter": None,
+            "matching_image_count": matching_count,
+            "last_shuffle_timestamp": now.isoformat(),
+            "selected_tag": selected_tag,
+            "web_source": True,
+        }
 
-    now = datetime.now(timezone.utc)
-    shuffle_cache = entry_data.setdefault("shuffle_cache", {})
-    shuffle_cache[tv_id] = {
-        "current_image": None,
-        "current_matte": None,
-        "current_filter": None,
-        "matching_image_count": matching_count,
-        "last_shuffle_timestamp": now.isoformat(),
-        "selected_tag": selected_tag,
-        "web_source": True,
+        signal = f"{DOMAIN}_shuffle_{entry.entry_id}_{tv_id}"
+        async_dispatcher_send(hass, signal)
+
+        if coordinator := entry_data.get("coordinator"):
+            await coordinator.async_set_active_image(tv_id, None, is_shuffle=True)
+
+        if _notify:
+            _notify("success", f"Web source selected: {title}")
+
+    return {
+        "content_id": data.get("contentId"),
+        "metadata": data.get("metadata", {}),
+        "artwork_metadata": data.get("artworkMetadata", {}),
+        "source_id": data.get("sourceId"),
+        "virtual_tag_id": data.get("virtualTagId"),
+        "cache_file": data.get("cacheFile"),
     }
 
-    signal = f"{DOMAIN}_shuffle_{entry.entry_id}_{tv_id}"
-    async_dispatcher_send(hass, signal)
 
-    if coordinator := entry_data.get("coordinator"):
-        await coordinator.async_set_active_image(tv_id, None, is_shuffle=True)
+async def _async_fast_path_shuffle(
+    hass: HomeAssistant,
+    entry: Any,
+    tv_id: str,
+    tv_name: str,
+    staged: dict[str, Any],
+    entry_data: dict[str, Any],
+    _notify: Callable[[str, str], None],
+    *,
+    screen_on: bool = True,
+    reason: str = "manual",
+    recent_images: set[str] | None = None,
+) -> bool:
+    """Execute a fast-path shuffle using a pre-uploaded staged image.
 
-    _notify("success", f"Web source displayed: {title}")
+    Calls select_and_cleanup to display the staged image without re-uploading.
+    Updates sensors, activity, display log — same as a full shuffle.
+    Returns True on success, False if the staged image could not be selected.
+    """
+    content_id = staged["content_id"]
+    tv_config = get_tv_config(entry, tv_id)
+    tv_mac = tv_config.get("mac") if tv_config else None
+
+    client = entry_data.get("art_clients", {}).get(tv_id)
+    if client is None:
+        _LOGGER.warning("fast-path: no art client for %s", tv_name)
+        return False
+
+    photo_filter = staged.get("photo_filter")
+
+    try:
+        ok = await select_and_cleanup(
+            client,
+            content_id,
+            screen_on=screen_on,
+            mac_address=tv_mac,
+            photo_filter=photo_filter,
+            debug=False,
+        )
+    except Exception as err:
+        _LOGGER.warning("fast-path: select_and_cleanup failed for %s: %s", tv_name, err)
+        return False
+
+    if not ok:
+        return False
+
+    # --- Update sensors, cache, activity (mirrors full-path _perform_upload) ---
+    now = datetime.now(timezone.utc)
+    shuffle_cache = entry_data.setdefault("shuffle_cache", {})
+    include_tags, _ = get_effective_tags(entry, tv_id)
+
+    if staged.get("source_type") == "web_source":
+        # Promote staged cache → display cache on the add-on so the artwork
+        # page serves the correct image for what's now on the TV.
+        registry = dr.async_get(hass)
+        device = registry.async_get_device(identifiers={(DOMAIN, tv_id)})
+        if device:
+            frame_art_manager_url = entry.data.get(
+                "frame_art_manager_url", "http://localhost:8099",
+            )
+            session = async_get_clientsession(hass)
+            try:
+                async with asyncio.timeout(10):
+                    await session.post(
+                        f"{frame_art_manager_url}/api/web-sources/cache/{device.id}/promote",
+                    )
+            except Exception as err:
+                _LOGGER.warning("fast-path: cache promote failed for %s: %s", tv_name, err)
+
+        art_metadata = staged.get("metadata", {})
+        title = art_metadata.get("title") or "Unknown"
+        source = art_metadata.get("source") or "web source"
+        activity_msg = f"Web source displayed (fast): \"{title}\" from {source}"
+        log_activity(hass, entry.entry_id, tv_id, "shuffle", activity_msg)
+
+        # Update artwork info sensor with mapped HA metadata (rich fields)
+        artwork_metadata = staged.get("artwork_metadata", {})
+        artwork_sensor = entry_data.get("artwork_sensors", {}).get(tv_id)
+        if artwork_sensor and content_id:
+            artwork_sensor.set_artwork(
+                content_id, artwork_metadata or art_metadata, source_type="web_source",
+            )
+            artwork_sensor.async_write_ha_state()
+
+        shuffle_cache[tv_id] = {
+            "current_image": None,
+            "current_matte": None,
+            "current_filter": None,
+            "matching_image_count": 0,
+            "last_shuffle_timestamp": now.isoformat(),
+            "selected_tag": staged.get("selected_tag"),
+            "web_source": True,
+        }
+
+        signal = f"{DOMAIN}_shuffle_{entry.entry_id}_{tv_id}"
+        async_dispatcher_send(hass, signal)
+
+        if coordinator := entry_data.get("coordinator"):
+            await coordinator.async_set_active_image(tv_id, None, is_shuffle=True)
+
+        _notify("success", f"Web source displayed (fast): {title}")
+    else:
+        image_filename = staged.get("filename", "unknown")
+        image_data = staged.get("image_data", {})
+        image_matte = staged.get("matte")
+        image_filter = staged.get("photo_filter")
+        selected_tag = staged.get("selected_tag")
+
+        # Update artwork info sensor
+        artwork_sensor = entry_data.get("artwork_sensors", {}).get(tv_id)
+        if artwork_sensor and content_id:
+            artwork_sensor.set_artwork(
+                content_id,
+                {
+                    "filename": image_filename,
+                    "tags": list(image_data.get("tags", [])),
+                },
+                source_type="local",
+            )
+            artwork_sensor.async_write_ha_state()
+
+        shuffle_cache[tv_id] = {
+            "current_image": image_filename,
+            "current_matte": image_matte,
+            "current_filter": image_filter,
+            "matching_image_count": 0,
+            "last_shuffle_timestamp": now.isoformat(),
+            "selected_tag": selected_tag,
+        }
+
+        activity_msg = f"Shuffled to {image_filename} (fast path)"
+        log_activity(hass, entry.entry_id, tv_id, "shuffle", activity_msg)
+
+        signal = f"{DOMAIN}_shuffle_{entry.entry_id}_{tv_id}"
+        async_dispatcher_send(hass, signal)
+
+        if coordinator := entry_data.get("coordinator"):
+            await coordinator.async_set_active_image(tv_id, image_filename, is_shuffle=True)
+
+        display_log = entry_data.get("display_log")
+        if display_log:
+            tagset_name = get_active_tagset_name(entry, tv_id)
+            display_log.note_display_start(
+                tv_id=tv_id,
+                tv_name=tv_name,
+                filename=image_filename,
+                tags=list(image_data.get("tags", [])),
+                source="shuffle",
+                shuffle_mode=reason,
+                started_at=now,
+                tv_tags=include_tags if include_tags else None,
+                matte=image_matte,
+                photo_filter=image_filter,
+                tagset_name=tagset_name,
+            )
+
+        _notify("success", f"Shuffled to {image_filename} (fast)")
+
+    # Sync brightness (same as full path)
+    if screen_on:
+        async_sync_brightness = entry_data.get("async_sync_brightness_after_shuffle")
+        if async_sync_brightness:
+            try:
+                await async_sync_brightness(tv_id)
+            except Exception as err:
+                _LOGGER.warning("Post-shuffle brightness sync failed for %s: %s", tv_name, err)
+
     return True
+
+
+async def _async_pre_upload_next(
+    hass: HomeAssistant,
+    entry: Any,
+    tv_id: str,
+    entry_data: dict[str, Any],
+) -> None:
+    """Background task: select and pre-upload the next image for fast-path shuffle.
+
+    Runs after each shuffle completes.  Stores the result in
+    entry_data["staged_images"][tv_id] for use by the next shuffle.
+    """
+    tv_config = get_tv_config(entry, tv_id)
+    if not tv_config:
+        return
+    tv_name = tv_config.get("name", tv_id)
+    tv_mac = tv_config.get("mac")
+
+    _LOGGER.debug("pre-upload: starting for %s", tv_name)
+
+    # Compute current tagset fingerprint
+    fingerprint = get_tagset_fingerprint(entry, tv_id)
+
+    include_tags, exclude_tags = get_effective_tags(entry, tv_id)
+    tag_weights = get_tag_weights(entry, tv_id)
+    weighting_type = get_weighting_type(entry, tv_id)
+
+    metadata_path = Path(entry.data.get("metadata_path", ""))
+    if not metadata_path.exists():
+        _LOGGER.debug("pre-upload: metadata not found for %s", tv_name)
+        return
+
+    shuffle_cache = entry_data.setdefault("shuffle_cache", {})
+    runtime_state = shuffle_cache.get(tv_id, {})
+    current_image = runtime_state.get("current_image")
+
+    selected_image, _count, selected_tag, _fresh, _fallback = await hass.async_add_executor_job(
+        _select_random_image,
+        metadata_path,
+        include_tags,
+        exclude_tags,
+        tag_weights,
+        weighting_type,
+        current_image,
+        tv_name,
+        None,  # No recency filtering for pre-upload
+    )
+
+    if not selected_image:
+        _LOGGER.debug("pre-upload: no eligible image for %s", tv_name)
+        return
+
+    staged_images = entry_data.setdefault("staged_images", {})
+
+    try:
+        if selected_image.get("_web_sources"):
+            # Web source pre-upload
+            result = await _async_web_source_send(
+                hass, entry, tv_id, tv_name, entry_data,
+                select=False,
+                virtual_tag_id=selected_image.get("_virtual_tag_id"),
+            )
+            if not result or not result.get("content_id"):
+                _LOGGER.debug("pre-upload: web source upload failed for %s", tv_name)
+                return
+
+            staged_images[tv_id] = {
+                "content_id": result["content_id"],
+                "tagset_fingerprint": fingerprint,
+                "source_type": "web_source",
+                "metadata": result.get("metadata", {}),
+                "artwork_metadata": result.get("artwork_metadata", {}),
+                "virtual_tag_id": result.get("virtual_tag_id"),
+                "selected_tag": selected_tag,
+                "matte": None,
+                "photo_filter": None,
+                "staged_at": datetime.now(timezone.utc).isoformat(),
+            }
+        else:
+            # Local library image pre-upload
+            image_filename = selected_image["filename"]
+            image_path = metadata_path.parent / "library" / image_filename
+            if not image_path.exists():
+                _LOGGER.debug("pre-upload: image file missing: %s", image_filename)
+                return
+
+            image_matte = selected_image.get("matte")
+            image_filter = selected_image.get("filter")
+            if image_filter and isinstance(image_filter, str) and image_filter.lower() == "none":
+                image_filter = None
+
+            client = entry_data.get("art_clients", {}).get(tv_id)
+            if client is None:
+                _LOGGER.debug("pre-upload: no art client for %s", tv_name)
+                return
+
+            content_id = await upload_to_tv_only(
+                client,
+                str(image_path),
+                mac_address=tv_mac,
+                matte=image_matte,
+            )
+
+            staged_images[tv_id] = {
+                "content_id": content_id,
+                "tagset_fingerprint": fingerprint,
+                "source_type": "local",
+                "image_data": selected_image,
+                "filename": image_filename,
+                "selected_tag": selected_tag,
+                "matte": image_matte,
+                "photo_filter": image_filter,
+                "staged_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        _LOGGER.info(
+            "pre-upload: staged next image for %s (content_id=%s)",
+            tv_name, staged_images[tv_id]["content_id"],
+        )
+    except Exception as err:
+        _LOGGER.warning("pre-upload: failed for %s: %s", tv_name, err)
+        # Non-fatal — next shuffle will use full path
 
 
 async def async_shuffle_tv(
@@ -617,6 +952,40 @@ async def _async_shuffle_tv_inner(
     current_image = runtime_state.get("current_image") or tv_config.get("current_image")
     tv_name = tv_config.get("name", tv_id)
 
+    # --- Fast path: use pre-uploaded staged image ---
+    staged_images = entry_data.get("staged_images", {})
+    staged = staged_images.get(tv_id)
+    if staged:
+        current_fingerprint = get_tagset_fingerprint(entry, tv_id)
+        if staged.get("tagset_fingerprint") == current_fingerprint:
+            _LOGGER.info(
+                "Fast-path shuffle for %s: using staged content_id=%s",
+                tv_name, staged["content_id"],
+            )
+            fast_ok = await _async_fast_path_shuffle(
+                hass, entry, tv_id, tv_name, staged, entry_data,
+                _notify, screen_on=screen_on, reason=reason,
+                recent_images=recent_images,
+            )
+            if fast_ok:
+                # Clear staged image and kick off background pre-upload for N+2
+                staged_images.pop(tv_id, None)
+                hass.async_create_task(
+                    _async_pre_upload_next(hass, entry, tv_id, entry_data),
+                    f"pre-upload-{tv_id}",
+                )
+                return True
+            else:
+                # Fast path failed (e.g. content_id gone) — fall through to full path
+                _LOGGER.info("Fast-path failed for %s, falling through to full path", tv_name)
+                staged_images.pop(tv_id, None)
+        else:
+            _LOGGER.debug(
+                "Staged image for %s has stale fingerprint (staged=%s, current=%s)",
+                tv_name, staged.get("tagset_fingerprint"), current_fingerprint,
+            )
+            staged_images.pop(tv_id, None)
+
     if skip_if_screen_off:
         status_cache = entry_data.get("tv_status_cache", {})
         screen_state = status_cache.get(tv_id, {}).get("screen_on")
@@ -653,11 +1022,21 @@ async def _async_shuffle_tv_inner(
 
     # Web sources sentinel — call add-on API instead of uploading a library image
     if selected_image.get("_web_sources"):
-        return await _async_fetch_and_display_web_source(
-            hass, entry, tv_id, tv_name, matching_count, selected_tag, entry_data, _notify,
+        ws_result = await _async_web_source_send(
+            hass, entry, tv_id, tv_name, entry_data,
+            select=True,
             screen_on=screen_on,
+            matching_count=matching_count,
+            selected_tag=selected_tag,
+            _notify=_notify,
             virtual_tag_id=selected_image.get("_virtual_tag_id"),
         )
+        if ws_result:
+            hass.async_create_task(
+                _async_pre_upload_next(hass, entry, tv_id, entry_data),
+                f"pre-upload-{tv_id}",
+            )
+        return ws_result
 
     image_filename = selected_image["filename"]
     image_path = metadata_path.parent / "library" / image_filename
@@ -801,6 +1180,12 @@ async def _async_shuffle_tv_inner(
                 _perform_upload,
                 _on_skip,
             )
+            if result:
+                # Full-path succeeded — kick off background pre-upload for N+1
+                hass.async_create_task(
+                    _async_pre_upload_next(hass, entry, tv_id, entry_data),
+                    f"pre-upload-{tv_id}",
+                )
             return bool(result)
         except (FrameArtError, Exception) as err:  # pylint: disable=broad-except
             if attempt < max_attempts:

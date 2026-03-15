@@ -1,7 +1,8 @@
 """Metadata management utilities for Frame Art Shuffler.
 
-This module is responsible for reading and writing the shared
-``metadata.json`` file that lives alongside the Frame Art Manager add-on.
+This module is responsible for reading the ``gallery.json`` file that lives
+alongside the Frame Art Manager add-on. It contains per-image metadata
+(tags, attributes, dimensions) and the global tag library.
 
 All helpers are intentionally synchronous; call them from the Home Assistant
 event loop using ``hass.async_add_executor_job``.
@@ -30,7 +31,6 @@ class TVNotFoundError(MetadataError):
 DEFAULT_METADATA = {
     "version": "1.0",
     "images": {},
-    "tvs": [],
     "tags": [],
 }
 

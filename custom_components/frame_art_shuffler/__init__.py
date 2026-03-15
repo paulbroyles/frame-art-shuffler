@@ -1,7 +1,7 @@
 """Frame Art Shuffler integration base setup.
 
 This integration provides art-focused control for Samsung Frame TVs:
-- Upload and display artwork
+- Upload and select artwork
 - Manage art gallery (delete others, select images)
 - Control art mode brightness
 - Basic power control (screen on/off while staying in art mode)
@@ -21,7 +21,7 @@ from typing import Any, Callable
 
 import voluptuous as vol
 
-from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.dispatcher import async_dispatcher_connect, async_dispatcher_send
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -57,6 +57,7 @@ if ha_spec is not None:  # pragma: no cover - depends on optional dependency
         HomeAssistant = getattr(_core, "HomeAssistant")
         callback = getattr(_core, "callback")
         ServiceCall = getattr(_core, "ServiceCall")
+        SupportsResponse = getattr(_core, "SupportsResponse")
         ServiceValidationError = getattr(_exceptions, "ServiceValidationError")
         dr = _helpers_dr
         er = _helpers_er
@@ -328,6 +329,15 @@ if _HA_AVAILABLE:
         """Set up a config entry for Frame Art Shuffler."""
 
         metadata_path = Path(entry.data[CONF_METADATA_PATH])
+
+        # Migrate metadata path from metadata.json → gallery.json (one-time)
+        if metadata_path.name == "metadata.json":
+            gallery_path = metadata_path.parent / "gallery.json"
+            if gallery_path.exists():
+                new_data = {**entry.data, CONF_METADATA_PATH: str(gallery_path)}
+                hass.config_entries.async_update_entry(entry, data=new_data)
+                metadata_path = gallery_path
+
         token_dir = Path(entry.data[CONF_TOKEN_DIR])
 
         token_dir.mkdir(parents=True, exist_ok=True)
@@ -368,6 +378,7 @@ if _HA_AVAILABLE:
             "auto_brightness_next_times": {},
             "motion_off_times": {},
             "shuffle_cache": {},
+            "staged_images": {},
             "upload_in_progress": set(),
             "auto_shuffle_next_times": {},
             "tv_model_years": {},
@@ -442,224 +453,196 @@ if _HA_AVAILABLE:
             async_track_time_interval(hass, _poll_artwork_changes, _ARTWORK_POLL_INTERVAL)
         )
 
-        async def async_handle_display_image(call: ServiceCall) -> None:
-            """Handle the display_image service."""
-            device_id = call.data.get("device_id")
-            entity_id = call.data.get("entity_id")
+        def _get_image_tags(data: dict, filename: str | None) -> list[str]:
+            """Look up image tags from metadata.json."""
+            if not filename:
+                return []
+            try:
+                metadata_path = data.get("metadata_path")
+                if metadata_path:
+                    store = MetadataStore(metadata_path)
+                    image_meta = store.get_image(filename)
+                    if image_meta:
+                        return list(image_meta.get("tags", []))
+            except Exception:
+                pass
+            return []
+
+        async def async_handle_send_image(call: ServiceCall) -> dict[str, Any] | None:
+            """Handle the send_image service.
+
+            When select=True (default): upload, select as current artwork,
+            clean up old images, update sensors/cache/activity/display log.
+            Uses upload guard to prevent concurrent uploads.
+
+            When select=False: upload only (pre-upload pipeline).
+            No guard, no state updates. Returns {content_id}.
+
+            Always returns {content_id} when called with return_response.
+            """
+            target_entry, tv_id, tv_data = await _resolve_tv_from_call(call)
+            data = hass.data[DOMAIN][target_entry.entry_id]
+
+            select = call.data.get("select", True)
             image_path = call.data.get("image_path")
-            image_url = call.data.get("image_url")
-            filename = call.data.get("filename")
             matte = call.data.get("matte")
-            filter_id = call.data.get("filter")
-            screen_on = call.data.get("screen_on", True)
-            artwork_metadata = call.data.get("artwork_metadata")  # Optional dict from add-on
 
-            # Resolve entity_id to device_id if needed
-            if entity_id and not device_id:
-                ent_reg = er.async_get(hass)
-                entity_entry = ent_reg.async_get(entity_id)
-                if entity_entry:
-                    device_id = entity_entry.device_id
-            
-            if not device_id:
-                raise ValueError("Must provide device_id or entity_id")
-
-            device_registry = dr.async_get(hass)
-            device = device_registry.async_get(device_id)
-            if not device:
-                raise ValueError(f"Device {device_id} not found")
-
-            # Find the config entry for this device
-            target_entry: Any | None = None
-            for eid in device.config_entries:
-                config_entry = hass.config_entries.async_get_entry(eid)
-                if config_entry and config_entry.domain == DOMAIN:
-                    target_entry = config_entry
-                    break
-            
-            if not target_entry:
-                raise ValueError(
-                    f"No config entry found for device {device_id} in domain {DOMAIN}"
-                )
-
-            # Get coordinator
-            data = hass.data.get(DOMAIN, {}).get(target_entry.entry_id)
-            if not data:
-                raise ValueError(
-                    f"Integration data not found for entry {target_entry.entry_id}"
-                )
-
-            coordinator = data["coordinator"]
-            
-            # Resolve image path
-            final_path = None
-            if image_path:
-                final_path = image_path
-            elif image_url:
-                if image_url.startswith("/local/"):
-                    final_path = hass.config.path("www", image_url[7:])
-                else:
-                    raise ValueError("image_url must start with /local/")
-            elif filename:
-                # Use metadata path to find library root
-                metadata_path = data["metadata_path"]
-                # metadata_path is like /config/www/frame_art/metadata.json
-                # so library root is /config/www/frame_art/
-                # Images are stored in the 'library' subdirectory
-                final_path = str(metadata_path.parent / "library" / filename)
-            
-            if not final_path:
-                raise ValueError("Must provide image_path, image_url, or filename")
-
-            # Find TV IP
-            tv_id = None
-            for identifier in device.identifiers:
-                if identifier[0] == DOMAIN:
-                    tv_id = identifier[1]
-                    break
-            
-            if not tv_id:
-                raise ValueError(f"Could not determine TV ID from device {device_id}")
-
-            # Look up TV in coordinator data
-            tv_data = next((tv for tv in coordinator.data if tv["id"] == tv_id), None)
-            if not tv_data:
-                raise ValueError(f"TV {tv_id} not found in coordinator data")
-            
             ip = tv_data["ip"]
             mac = tv_data.get("mac")
-
             tv_name = tv_data.get("name", tv_id)
 
             client = data.get("art_clients", {}).get(tv_id)
             if client is None:
                 raise ValueError(f"No art client found for TV {tv_id}")
 
-            # Determine display filename for logging
-            if filename:
-                display_filename = filename
-            elif final_path:
-                display_filename = Path(final_path).name
-            else:
-                display_filename = "unknown"
+            if select:
+                # --- select=True: full upload + select + cleanup ---
+                image_url = call.data.get("image_url")
+                filename = call.data.get("filename")
+                filter_id = call.data.get("filter")
+                screen_on = call.data.get("screen_on", True)
+                artwork_metadata = call.data.get("artwork_metadata")
 
-            async def _perform_upload() -> bool:
-                from datetime import datetime, timezone as dt_timezone
+                # Resolve image path
+                final_path = None
+                if image_path:
+                    final_path = image_path
+                elif image_url:
+                    if image_url.startswith("/local/"):
+                        final_path = hass.config.path("www", image_url[7:])
+                    else:
+                        raise ValueError("image_url must start with /local/")
+                elif filename:
+                    metadata_path = data["metadata_path"]
+                    final_path = str(metadata_path.parent / "library" / filename)
 
-                log_activity(
+                if not final_path:
+                    raise ValueError("Must provide image_path, image_url, or filename")
+
+                display_filename = filename if filename else Path(final_path).name
+
+                result_content_id: str | None = None
+
+                async def _perform_upload() -> bool:
+                    nonlocal result_content_id
+                    from datetime import datetime, timezone as dt_timezone
+
+                    # Invalidate staged image — gallery state is changing externally
+                    staged = data.get("staged_images", {})
+                    if tv_id in staged:
+                        _LOGGER.debug("send_image: invalidating staged image for %s", tv_id)
+                        del staged[tv_id]
+
+                    log_activity(
+                        hass,
+                        target_entry.entry_id,
+                        tv_id,
+                        "select_image",
+                        f"Selecting custom image ({display_filename}) via service call",
+                    )
+
+                    content_id = await frame_tv.set_art_on_tv_deleteothers(
+                        client,
+                        final_path,
+                        mac_address=mac,
+                        matte=matte,
+                        photo_filter=filter_id,
+                        delete_others=True,
+                        screen_on=screen_on,
+                    )
+                    result_content_id = content_id
+
+                    # Update shuffle_cache
+                    shuffle_cache = data.setdefault("shuffle_cache", {}).setdefault(tv_id, {})
+                    shuffle_cache["current_image"] = display_filename
+                    shuffle_cache["current_matte"] = matte
+                    shuffle_cache["current_filter"] = filter_id
+                    shuffle_cache["matching_image_count"] = 0  # Not a shuffle
+
+                    # Update artwork info sensor
+                    artwork_sensor = data.get("artwork_sensors", {}).get(tv_id)
+                    if artwork_sensor and content_id:
+                        if artwork_metadata:
+                            artwork_sensor.set_artwork(content_id, artwork_metadata, source_type="web_source")
+                        else:
+                            meta: dict = {}
+                            tags = _get_image_tags(data, filename)
+                            if filename:
+                                meta = {"filename": filename, "tags": tags}
+                            if not meta:
+                                meta = {"filename": display_filename}
+                            artwork_sensor.set_artwork(content_id, meta, source_type="local")
+                        artwork_sensor.async_write_ha_state()
+
+                    # Send signal to update sensors
+                    signal = f"{DOMAIN}_shuffle_{target_entry.entry_id}_{tv_id}"
+                    async_dispatcher_send(hass, signal)
+
+                    if filename:
+                        coordinator = data["coordinator"]
+                        await coordinator.async_set_active_image(
+                            tv_id, filename, is_shuffle=False
+                        )
+
+                    # Update display log
+                    display_log = data.get("display_log")
+                    if display_log and filename:
+                        image_tags = _get_image_tags(data, filename)
+                        display_log.note_display_start(
+                            tv_id=tv_id,
+                            tv_name=tv_name,
+                            filename=filename,
+                            tags=image_tags,
+                            source="manual",
+                            shuffle_mode=None,
+                            started_at=datetime.now(dt_timezone.utc),
+                            matte=matte,
+                        )
+
+                    return True
+
+                def _on_skip() -> None:
+                    _LOGGER.info(
+                        "send_image skipped for %s (%s): upload already running",
+                        tv_name,
+                        tv_id,
+                    )
+                    raise ServiceValidationError(
+                        f"Upload skipped for {tv_name}: another upload is already in progress. Please wait a moment and try again."
+                    )
+
+                await async_guarded_upload(
                     hass,
-                    target_entry.entry_id,
+                    target_entry,
                     tv_id,
-                    "display_image",
-                    f"Displaying custom image ({display_filename}) via service call",
+                    "send_image",
+                    _perform_upload,
+                    _on_skip,
                 )
 
-                content_id = await frame_tv.set_art_on_tv_deleteothers(
+                return {"content_id": result_content_id}
+
+            else:
+                # --- select=False: upload only (pre-upload pipeline) ---
+                if not image_path:
+                    raise ValueError("Must provide image_path")
+
+                # No upload guard — pre-upload runs in background and must not
+                # block user-initiated select=True calls which DO use the guard.
+                content_id = await frame_tv.upload_to_tv_only(
                     client,
-                    final_path,
+                    image_path,
                     mac_address=mac,
                     matte=matte,
-                    photo_filter=filter_id,
-                    delete_others=True,
-                    screen_on=screen_on,
                 )
 
-                # Update shuffle_cache with all current state (like shuffle does)
-                # This ensures the dashboard sensors show the correct image/matte/filter
-                shuffle_cache = data.setdefault("shuffle_cache", {}).setdefault(tv_id, {})
-                shuffle_cache["current_image"] = display_filename
-                shuffle_cache["current_matte"] = matte
-                shuffle_cache["current_filter"] = filter_id
-                shuffle_cache["matching_image_count"] = 0  # Not a shuffle
-
-                # Update artwork info sensor
-                artwork_sensor = data.get("artwork_sensors", {}).get(tv_id)
-                if artwork_sensor and content_id:
-                    if artwork_metadata:
-                        # Rich metadata passed by add-on (web source)
-                        artwork_sensor.set_artwork(content_id, artwork_metadata, source_type="web_source")
-                    else:
-                        # Local image — look up tags from metadata.json
-                        meta: dict = {}
-                        try:
-                            from .metadata import MetadataStore
-                            metadata_path = data.get("metadata_path")
-                            if metadata_path and filename:
-                                store = MetadataStore(metadata_path)
-                                image_meta = store.get_image(filename)
-                                if image_meta:
-                                    meta = {
-                                        "filename": filename,
-                                        "tags": image_meta.get("tags", []),
-                                    }
-                                    if not meta["filename"]:
-                                        meta["filename"] = display_filename
-                        except Exception:
-                            pass
-                        if not meta:
-                            meta = {"filename": display_filename}
-                        artwork_sensor.set_artwork(content_id, meta, source_type="local")
-                    artwork_sensor.async_write_ha_state()
-
-                # Send signal to update sensors
-                signal = f"{DOMAIN}_shuffle_{target_entry.entry_id}_{tv_id}"
-                async_dispatcher_send(hass, signal)
-
-                if filename:
-                    await coordinator.async_set_active_image(
-                        tv_id, filename, is_shuffle=False
-                    )
-
-                # Update display log so this manual display is tracked
-                display_log = data.get("display_log")
-                if display_log and filename:
-                    # Try to get image tags from metadata store
-                    image_tags: list[str] = []
-                    try:
-                        from .metadata import MetadataStore
-                        metadata_path = data.get("metadata_path")
-                        if metadata_path:
-                            store = MetadataStore(metadata_path)
-                            image_meta = store.get_image(filename)
-                            if image_meta:
-                                image_tags = list(image_meta.get("tags", []))
-                    except Exception:
-                        pass  # If we can't get tags, just log without them
-
-                    display_log.note_display_start(
-                        tv_id=tv_id,
-                        tv_name=tv_name,
-                        filename=filename,
-                        tags=image_tags,
-                        source="manual",
-                        shuffle_mode=None,
-                        started_at=datetime.now(dt_timezone.utc),
-                        matte=matte,
-                    )
-
-                return True
-
-            def _on_skip() -> None:
-                _LOGGER.info(
-                    "display_image skipped for %s (%s): upload already running",
-                    tv_name,
-                    tv_id,
-                )
-                raise ServiceValidationError(
-                    f"Upload skipped for {tv_name}: another upload is already in progress. Please wait a moment and try again."
-                )
-
-            await async_guarded_upload(
-                hass,
-                target_entry,
-                tv_id,
-                "display_image",
-                _perform_upload,
-                _on_skip,
-            )
+                return {"content_id": content_id}
 
         hass.services.async_register(
-            DOMAIN, "display_image", async_handle_display_image
+            DOMAIN,
+            "send_image",
+            async_handle_send_image,
+            supports_response=SupportsResponse.OPTIONAL,
         )
 
         log_options_schema = vol.Schema(
@@ -1023,6 +1006,58 @@ if _HA_AVAILABLE:
                         _LOGGER.info(f"Cleared expired tagset override for {tv_config.get('name', tv_id)}")
                 except (ValueError, TypeError) as e:
                     _LOGGER.warning(f"Invalid override expiry time for {tv_id}: {e}")
+
+        # --- Staged image invalidation on tagset changes ---
+        # When a tagset definition or TV assignment changes, clear staged images
+        # whose fingerprint no longer matches and kick off a new pre-upload.
+        from .shuffle import _async_pre_upload_next  # noqa: E402 - late import avoids circular
+
+        def _invalidate_staged_for_all_tvs(*_args: Any) -> None:
+            """Global tagset changed — check all TVs."""
+            staged = hass.data[DOMAIN][entry.entry_id].get("staged_images", {})
+            entry_data = hass.data[DOMAIN][entry.entry_id]
+            for tid in list(staged.keys()):
+                from .config_entry import get_tagset_fingerprint  # noqa: E402
+                current_fp = get_tagset_fingerprint(entry, tid)
+                if staged[tid].get("tagset_fingerprint") != current_fp:
+                    _LOGGER.debug("Tagset changed: invalidating staged image for %s", tid)
+                    del staged[tid]
+                    hass.async_create_task(
+                        _async_pre_upload_next(hass, entry, tid, entry_data),
+                        f"pre-upload-restage-{tid}",
+                    )
+
+        def _make_tv_invalidator(tid: str) -> Callable[..., None]:
+            """Per-TV tagset changed — check specific TV."""
+            def _invalidate(*_args: Any) -> None:
+                staged = hass.data[DOMAIN][entry.entry_id].get("staged_images", {})
+                entry_data = hass.data[DOMAIN][entry.entry_id]
+                if tid in staged:
+                    from .config_entry import get_tagset_fingerprint  # noqa: E402
+                    current_fp = get_tagset_fingerprint(entry, tid)
+                    if staged[tid].get("tagset_fingerprint") != current_fp:
+                        _LOGGER.debug("Tagset changed: invalidating staged image for %s", tid)
+                        del staged[tid]
+                        hass.async_create_task(
+                            _async_pre_upload_next(hass, entry, tid, entry_data),
+                            f"pre-upload-restage-{tid}",
+                        )
+            return _invalidate
+
+        # Listen for global tagset definition changes (upsert/delete)
+        async_dispatcher_connect(
+            hass,
+            f"{DOMAIN}_tagset_updated_{entry.entry_id}",
+            _invalidate_staged_for_all_tvs,
+        )
+
+        # Listen for per-TV tagset assignment changes (select/override/clear)
+        for tv_id in list_tv_configs(entry):
+            async_dispatcher_connect(
+                hass,
+                f"{DOMAIN}_tagset_updated_{entry.entry_id}_{tv_id}",
+                _make_tv_invalidator(tv_id),
+            )
 
         async def async_handle_upsert_tagset(call: ServiceCall) -> None:
             """Create or update a global tagset definition.

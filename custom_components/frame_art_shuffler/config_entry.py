@@ -1,5 +1,7 @@
 """Config entry data management helpers."""
 
+import hashlib
+import json
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -393,3 +395,22 @@ def get_tagset_weighting_type(entry: ConfigEntry, tagset_name: str) -> str:
     
     tagset = tagsets[tagset_name]
     return tagset.get("weighting_type", "image")
+
+
+def get_tagset_fingerprint(entry: ConfigEntry, tv_id: str) -> str:
+    """Return a short hash of the effective tagset config for cache invalidation.
+
+    Changes when the active tagset name, include/exclude tags, weights, or
+    weighting type changes.  Used by the pre-upload pipeline to detect when
+    a staged image is no longer valid for the current tagset.
+    """
+    name = get_active_tagset_name(entry, tv_id)
+    include, exclude = get_effective_tags(entry, tv_id)
+    weights = get_tag_weights(entry, tv_id)
+    wtype = get_weighting_type(entry, tv_id)
+    blob = json.dumps(
+        {"name": name, "include": sorted(include), "exclude": sorted(exclude),
+         "weights": weights, "wtype": wtype},
+        sort_keys=True,
+    )
+    return hashlib.md5(blob.encode()).hexdigest()[:12]

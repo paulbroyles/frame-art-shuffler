@@ -10,13 +10,13 @@ remove_tv:
         device:
           integration: frame_art_shuffler
 
-display_image:
-  name: Display Image
-  description: Upload and display a specific image on a Frame TV
+send_image:
+  name: Send Image
+  description: Upload an image to a Frame TV. By default (select=true), the image is selected as the current artwork and old images are cleaned up. With select=false, the image is uploaded only (for pre-upload pipeline). Always returns content_id when called with return_response.
   fields:
     device_id:
       name: Device
-      description: The TV device to display the image on. Required if entity_id is not provided.
+      description: The TV device. Required if entity_id is not provided.
       required: false
       selector:
         device:
@@ -36,28 +36,48 @@ display_image:
         text:
     image_url:
       name: Image URL
-      description: Local URL to the image (e.g. /local/my_art.jpg).
+      description: Local URL to the image (e.g. /local/my_art.jpg). Only used when select=true.
       required: false
       selector:
         text:
     filename:
       name: Filename
-      description: Filename of the image relative to the library folder.
+      description: Filename of the image relative to the library folder. Only used when select=true.
       required: false
       selector:
         text:
+    select:
+      name: Select
+      description: If true (default), select the image as current artwork after upload. If false, upload only.
+      required: false
+      default: true
+      selector:
+        boolean:
+    screen_on:
+      name: Screen On
+      description: Whether to turn the screen on when selecting. Only used when select=true.
+      required: false
+      default: true
+      selector:
+        boolean:
     matte:
       name: Matte
-      description: Matte ID (e.g. modern_matte)
+      description: Matte ID (e.g. modern_matte, shadowbox_polar)
       required: false
       selector:
         text:
     filter:
       name: Filter
-      description: Filter ID
+      description: Filter ID. Only used when select=true.
       required: false
       selector:
         text:
+    artwork_metadata:
+      name: Artwork Metadata
+      description: Optional metadata dict from the add-on (web source artwork info).
+      required: false
+      selector:
+        object:
 
 set_log_options:
   name: Configure Display Logging

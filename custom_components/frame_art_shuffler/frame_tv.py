@@ -1,7 +1,9 @@
 """Helper utilities for interacting with Samsung Frame TVs.
 
 This module provides art-focused functions for Frame TV control:
-- set_art_on_tv_deleteothers: Upload and display artwork, manage gallery
+- set_art_on_tv_deleteothers: Upload and select artwork, manage gallery
+- upload_to_tv_only: Upload artwork without selecting (pre-upload pipeline)
+- select_and_cleanup: Select a pre-uploaded image and clean up old ones
 - set_tv_brightness: Adjust art mode brightness (1-10, or 50 for max)
 - is_art_mode_enabled: Check if TV is in art mode (screen may be on/off)
 - is_screen_on: Check if screen is actually displaying content
@@ -228,6 +230,12 @@ class TVConnectionManager:
     live connection (e.g., at the start of an upload or after a WoL wake).
     """
 
+    # Skip the art-channel probe in ensure_connected if the last successful
+    # art operation was within this window.  Avoids a redundant get_artmode()
+    # round-trip (~1-2 s) on the fast-path shuffle where the pre-upload just
+    # used the connection moments earlier.
+    _PROBE_SKIP_WINDOW = 60  # seconds
+
     def __init__(self, ip: str) -> None:
         self.ip = ip
         self._art = _SamsungTVAsyncArtNoInit(
@@ -238,6 +246,7 @@ class TVConnectionManager:
             name="FrameArtShuffler",
         )
         self._lock = asyncio.Lock()
+        self._last_art_ok: float = 0  # monotonic timestamp of last successful art op
 
     def __repr__(self) -> str:
         return f"TV({self.ip})"
@@ -273,9 +282,16 @@ class TVConnectionManager:
         # Probe the art channel whenever the connection appears alive.
         # A healthy connection responds in well under 100 ms; a stale one times out
         # after 2 s, triggering a reconnect below.
+        # Skip the probe if we had a successful art operation very recently (e.g.
+        # pre-upload just finished) — the connection is known-good.
         if self._art.is_alive():
+            now = asyncio.get_event_loop().time()
+            if now - self._last_art_ok < self._PROBE_SKIP_WINDOW:
+                _LOGGER.debug("Art probe skipped for %s (last ok %.1fs ago)", self, now - self._last_art_ok)
+                return
             try:
-                await self._art.get_artmode()
+                await asyncio.wait_for(self._art.get_artmode(), timeout=2.0)
+                self._last_art_ok = now
                 return  # Art channel is healthy
             except Exception:
                 _LOGGER.debug(
@@ -349,6 +365,50 @@ async def get_tv_model_year(ip: str) -> Optional[int]:
         return int(model.split("_")[0])
     except (ValueError, IndexError):
         return None
+
+
+async def _ensure_tv_reachable(
+    client: TVConnectionManager,
+    *,
+    mac_address: Optional[str] = None,
+    screen_on: bool = True,
+    pre_network_awake: bool = False,
+    connect_timeout: float = 4,
+) -> None:
+    """Ensure TV is reachable, using WoL if needed.
+
+    Tries a fast connectivity check first. If the TV is unreachable and a
+    mac_address is provided, sends Wake-on-LAN:
+    - screen_on=True: full two-packet wake (tv_on) that turns on the screen
+    - screen_on=False: single-packet wake (tv_network_wake) that keeps screen off,
+      but only if pre_network_awake is False (to avoid waking the screen)
+
+    Raises FrameArtConnectionError if the TV cannot be reached.
+    """
+    ip = client.ip
+    try:
+        await client.ensure_connected(timeout=connect_timeout)
+        return
+    except Exception:
+        if not mac_address:
+            raise FrameArtConnectionError(
+                f"TV {ip} is unreachable and no MAC address provided for WoL"
+            )
+
+    # TV unreachable — attempt WoL
+    if screen_on:
+        await tv_on(ip, mac_address, client=client)
+        await client.ensure_connected()
+    else:
+        if pre_network_awake:
+            _LOGGER.debug(
+                "_ensure_tv_reachable: network already awake for %s, skipping WoL", ip,
+            )
+        else:
+            _LOGGER.info(
+                "_ensure_tv_reachable: waking network for %s (screen stays off)", ip,
+            )
+            await tv_network_wake(mac_address, ip, client=client)
 
 
 async def set_art_on_tv_deleteothers(
@@ -540,6 +600,7 @@ async def set_art_on_tv_deleteothers(
                         _log_progress(f"Applying matte: {desired_matte}")
                         await art.change_matte(content_id, desired_matte)
                     _log_progress(f"Upload successful, content_id={content_id}")
+                    client._last_art_ok = asyncio.get_event_loop().time()
                     if debug:
                         _LOGGER.debug("Upload returned content_id=%s", content_id)
                     break  # Success, exit retry loop
@@ -633,7 +694,7 @@ async def set_art_on_tv_deleteothers(
         art = client.art
 
         if screen_on:
-            displayed = await _display_uploaded_art(
+            displayed = await _select_uploaded_art(
                 art,
                 content_id,
                 debug=debug,
@@ -648,7 +709,7 @@ async def set_art_on_tv_deleteothers(
             # - Screen was on  → display the art visibly (it's already showing, no waking needed)
             # - Screen was off → stage silently so it shows on the next screen wake
             if pre_screen_on:
-                displayed = await _display_uploaded_art(
+                displayed = await _select_uploaded_art(
                     art,
                     content_id,
                     debug=debug,
@@ -676,7 +737,7 @@ async def set_art_on_tv_deleteothers(
 
         if delete_others:
             _log_progress("Cleaning up old images from TV memory...")
-            await _delete_other_images(art, content_id, debug=debug)
+            await _delete_other_images(art, {content_id}, debug=debug)
 
         _op_elapsed = asyncio.get_event_loop().time() - _op_start
         _log_progress(f"Upload complete for {ip} (content_id={content_id})")
@@ -687,6 +748,221 @@ async def set_art_on_tv_deleteothers(
         # Upload worked but post-processing failed
         _LOGGER.error("Upload succeeded (content_id=%s) but post-processing failed: %s", content_id, err)
         raise FrameArtUploadError(f"Upload succeeded but failed to display/cleanup: {err}") from err
+
+
+async def upload_to_tv_only(
+    client: TVConnectionManager,
+    artpath: str,
+    *,
+    mac_address: Optional[str] = None,
+    matte: Optional[str] = None,
+    debug: bool = False,
+) -> str:
+    """Upload art to the Frame TV without selecting or displaying it.
+
+    This is the "stage" half of the pre-upload pipeline.  It uploads the image
+    and applies the matte, but does NOT call select_image, does NOT delete other
+    images, and does NOT apply photo filters (filter is applied at select time).
+
+    If the TV is in deep sleep and a mac_address is provided, a single-packet
+    WoL is sent to bring the network interface up (screen stays off).  The
+    function then polls for art channel readiness before uploading.
+
+    Returns the content_id of the uploaded image.
+    Raises FrameArtConnectionError if the TV cannot be reached.
+    Raises FrameArtUploadError if the upload fails after retries.
+    """
+    ip = client.ip
+    _op_start = asyncio.get_event_loop().time()
+    _LOGGER.info("upload_to_tv_only: starting for %s", ip)
+
+    file_path = Path(artpath).expanduser().resolve()
+    if not file_path.exists():
+        raise FrameArtUploadError(f"Art file not found: {file_path}")
+
+    file_size = file_path.stat().st_size
+    if file_size > _MAX_UPLOAD_BYTES:
+        size_mb = file_size / (1024 * 1024)
+        raise FrameArtUploadError(
+            f"Art file {file_path.name} is {size_mb:.2f} MB; maximum supported size is 5.00 MB"
+        )
+
+    # --- Connectivity / Wake ---
+    token_exists = _token_path(ip).exists()
+    if token_exists:
+        pre_network_awake, _ = await _check_rest_state(ip) if mac_address else (False, False)
+        await _ensure_tv_reachable(
+            client,
+            mac_address=mac_address,
+            screen_on=False,
+            pre_network_awake=pre_network_awake,
+        )
+
+    # --- Upload with retries ---
+    content_id: Optional[str] = None
+    last_error: Optional[Exception] = None
+
+    desired_matte = matte
+    upload_matte = _MATTE_PLACEHOLDER if desired_matte and desired_matte != "none" else "none"
+
+    for attempt in range(_UPLOAD_RETRIES):
+        if attempt:
+            _LOGGER.info("upload_to_tv_only: retry %s/%s", attempt + 1, _UPLOAD_RETRIES)
+            await asyncio.sleep(_UPLOAD_RETRY_DELAY)
+        try:
+            await client.ensure_connected()
+            art = client.art
+
+            upload_result = await art.upload(
+                str(file_path),
+                matte=upload_matte,
+                portrait_matte=upload_matte,
+                timeout=120,
+            )
+
+            if upload_result:
+                content_id = upload_result
+                if desired_matte and desired_matte != "none":
+                    await art.change_matte(content_id, desired_matte)
+                _LOGGER.info(
+                    "upload_to_tv_only: uploaded %s to %s (content_id=%s)",
+                    file_path.name, ip, content_id,
+                )
+                client._last_art_ok = asyncio.get_event_loop().time()
+                break
+            else:
+                last_error = FrameArtUploadError(
+                    f"Upload attempt {attempt + 1} returned None (timeout)"
+                )
+        except Exception as err:
+            last_error = err
+            if attempt < _UPLOAD_RETRIES - 1:
+                _LOGGER.warning("upload_to_tv_only: attempt %s failed: %s", attempt + 1, err)
+            else:
+                raise FrameArtUploadError(
+                    f"Upload failed after {_UPLOAD_RETRIES} attempts: {last_error}"
+                ) from err
+
+    if not content_id:
+        raise FrameArtUploadError(
+            f"Upload failed after {_UPLOAD_RETRIES} attempts: {last_error}"
+        )
+
+    elapsed = asyncio.get_event_loop().time() - _op_start
+    _LOGGER.info("upload_to_tv_only: completed in %.1fs for %s", elapsed, ip)
+    return content_id
+
+
+async def select_and_cleanup(
+    client: TVConnectionManager,
+    content_id: str,
+    *,
+    screen_on: bool = True,
+    mac_address: Optional[str] = None,
+    photo_filter: Optional[str] = None,
+    keep_content_ids: Optional[set[str]] = None,
+    blocking_cleanup: bool = False,
+    pre_screen_on: Optional[bool] = None,
+    debug: bool = False,
+) -> bool:
+    """Select a previously uploaded image and clean up old images from the TV.
+
+    This is the "select" half of the pre-upload pipeline.  The image
+    identified by content_id must already exist on the TV (from a prior
+    upload_to_tv_only call).
+
+    When screen_on=False and the TV is in deep sleep, a single-packet WoL is
+    sent to bring the network up (screen stays off), then select_image is
+    called with show=False.
+
+    keep_content_ids specifies which content_ids to keep during cleanup.
+    If not provided, only the selected content_id is kept.
+
+    blocking_cleanup: when True, await the delete instead of backgrounding it.
+    pre_screen_on: if the caller already checked screen state, pass it here
+        to skip the redundant REST check.
+
+    Returns True if the image was successfully selected.
+    """
+    ip = client.ip
+    _op_start = asyncio.get_event_loop().time()
+    _LOGGER.info("select_and_cleanup: selecting %s on %s (screen_on=%s)", content_id, ip, screen_on)
+
+    if keep_content_ids is None:
+        keep_content_ids = {content_id}
+    else:
+        keep_content_ids = keep_content_ids | {content_id}
+
+    # --- Check screen state (before any WoL) ---
+    # When screen_on=False, check actual screen state so we can show the image
+    # if the screen happens to be on, without waking it if it's off.
+    if pre_screen_on is None:
+        pre_screen_on = False
+        if not screen_on:
+            pre_network_awake, pre_screen_on = await _check_rest_state(ip)
+    else:
+        # Caller provided pre_screen_on; derive pre_network_awake from it
+        pre_network_awake = pre_screen_on  # if screen was on, network is awake
+
+    # --- Connectivity / Wake ---
+    await _ensure_tv_reachable(
+        client,
+        mac_address=mac_address,
+        screen_on=screen_on,
+        pre_network_awake=pre_screen_on if not screen_on else False,
+    )
+
+    # --- Select image ---
+    await client.ensure_connected()
+    art = client.art
+
+    # Determine show flag: if caller says screen_on, always show.
+    # If screen_on=False, show only if the screen was already on before we started.
+    show = screen_on or pre_screen_on
+
+    try:
+        await art.select_image(content_id, show=show)
+        client._last_art_ok = asyncio.get_event_loop().time()
+    except Exception as err:
+        _LOGGER.warning("select_and_cleanup: select_image failed for %s: %s", content_id, err)
+        return False
+
+    # Verify selection for screen-on displays
+    if show:
+        verified = await _poll_until(
+            lambda: _verify_current_art(art, content_id, debug=debug),
+            max_wait=_DISPLAY_VERIFY_MAX_WAIT,
+            label="verify staged display",
+        )
+        if not verified:
+            _LOGGER.warning("select_and_cleanup: could not verify %s is displayed", content_id)
+    else:
+        _LOGGER.info("select_and_cleanup: %s selected silently (screen off)", content_id)
+
+    # Apply photo filter if specified
+    if photo_filter is not None and photo_filter.lower() not in ("none", ""):
+        try:
+            await art.set_photo_filter(content_id, photo_filter)
+            if debug:
+                _LOGGER.debug("Applied photo filter '%s' to %s", photo_filter, content_id)
+        except Exception as filter_err:
+            _LOGGER.warning("Failed to apply photo filter '%s': %s", photo_filter, filter_err)
+
+    elapsed = asyncio.get_event_loop().time() - _op_start
+    _LOGGER.info("select_and_cleanup: selected in %.1fs for %s", elapsed, ip)
+
+    # --- Cleanup old images ---
+    if blocking_cleanup:
+        await _delete_other_images(art, keep_content_ids, debug=debug)
+    else:
+        async def _background_cleanup() -> None:
+            try:
+                await _delete_other_images(art, keep_content_ids, debug=debug)
+            except Exception as err:
+                _LOGGER.warning("select_and_cleanup: cleanup failed (non-fatal): %s", err)
+
+        asyncio.get_event_loop().create_task(_background_cleanup())
+    return True
 
 
 async def set_tv_brightness(client: TVConnectionManager, brightness: int) -> None:
@@ -1051,7 +1327,7 @@ def _send_wake_on_lan(mac_address: str) -> None:
         raise FrameArtConnectionError(f"Failed to send Wake-on-LAN packet to {mac_address}: {err}") from err
 
 
-async def _display_uploaded_art(art: SamsungTVAsyncArt, content_id: str, *, debug: bool) -> bool:
+async def _select_uploaded_art(art: SamsungTVAsyncArt, content_id: str, *, debug: bool) -> bool:
     # Method 1: try direct selection with retries
     for attempt, delay in enumerate(_DISPLAY_RETRY_DELAYS):
         if attempt and delay:
@@ -1122,18 +1398,19 @@ async def _verify_current_art(art: SamsungTVAsyncArt, expected_content_id: str, 
         return False
 
 
-async def _delete_other_images(art: SamsungTVAsyncArt, keep_content_id: str, *, debug: bool) -> None:
+async def _delete_other_images(art: SamsungTVAsyncArt, keep_content_ids: set[str], *, debug: bool) -> None:
     try:
         available = await art.available() or []
     except Exception as err:  # pylint: disable=broad-except
         raise FrameArtUploadError(f"Could not enumerate TV gallery: {err}") from err
 
-    deletions = [item.get("content_id") for item in available if item.get("content_id") and item.get("content_id") != keep_content_id]
+    deletions = [item.get("content_id") for item in available if item.get("content_id") and item.get("content_id") not in keep_content_ids]
 
     # Log what we are keeping to help debug duplicate issues
-    kept = [item.get("content_id") for item in available if item.get("content_id") == keep_content_id]
-    if len(kept) > 1:
-        _log_progress(f"Warning: Found {len(kept)} copies of active image {keep_content_id}. Keeping all to avoid accidental deletion.")
+    for keep_id in keep_content_ids:
+        kept = [item.get("content_id") for item in available if item.get("content_id") == keep_id]
+        if len(kept) > 1:
+            _log_progress(f"Warning: Found {len(kept)} copies of image {keep_id}. Keeping all to avoid accidental deletion.")
 
     if not deletions:
         _LOGGER.debug("No other images to delete")
