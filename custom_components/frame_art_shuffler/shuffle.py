@@ -604,6 +604,7 @@ async def _async_fetch_and_upload_web_source(
     return {
         "content_id": data.get("contentId"),
         "metadata": data.get("metadata", {}),
+        "artwork_metadata": data.get("artworkMetadata", {}),
         "source_id": data.get("sourceId"),
         "virtual_tag_id": data.get("virtualTagId"),
         "cache_file": data.get("cacheFile"),
@@ -668,10 +669,13 @@ async def _async_fast_path_shuffle(
         activity_msg = f"Web source displayed (fast): \"{title}\" from {source}"
         log_activity(hass, entry.entry_id, tv_id, "shuffle", activity_msg)
 
-        # Update artwork info sensor with web source metadata
+        # Update artwork info sensor with mapped HA metadata (rich fields)
+        artwork_metadata = staged.get("artwork_metadata", {})
         artwork_sensor = entry_data.get("artwork_sensors", {}).get(tv_id)
         if artwork_sensor and content_id:
-            artwork_sensor.set_artwork(content_id, art_metadata, source_type="web_source")
+            artwork_sensor.set_artwork(
+                content_id, artwork_metadata or art_metadata, source_type="web_source",
+            )
             artwork_sensor.async_write_ha_state()
 
         shuffle_cache[tv_id] = {
@@ -829,6 +833,7 @@ async def _async_pre_upload_next(
                 "tagset_fingerprint": fingerprint,
                 "source_type": "web_source",
                 "metadata": result.get("metadata", {}),
+                "artwork_metadata": result.get("artwork_metadata", {}),
                 "virtual_tag_id": result.get("virtual_tag_id"),
                 "selected_tag": selected_tag,
                 "matte": None,
