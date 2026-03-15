@@ -95,7 +95,7 @@ JSONL format — one JSON object per line, no wrapping array:
 - **`source`**: How the session started:
   - `"shuffle"` - Image was shuffled (auto or manual)
   - `"screen_on"` - Same image resumed after screen turned back on
-  - `"display_image"` - Service call (future)
+  - `"manual"` - Service call (send_image)
 - **`shuffle_mode`**: Reason for shuffle (e.g., `"auto"`, `"manual"`). Only present when `source` is `"shuffle"`.
 - **`matte`**: The matte style applied when displaying the image (e.g., `"flexible_warm"`, `"none"`). May be `null` if unknown or not applicable.
 - **`photo_filter`**: The photo filter applied when displaying the image. May be `null` if no filter was applied or unknown.

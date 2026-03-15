@@ -1750,7 +1750,7 @@ class FrameArtArtworkInfoSensor(SensorEntity, RestoreEntity):
     Attributes carry whatever metadata was provided at display time — title, artist,
     medium, museum, source URL, etc. — with no fixed schema. For locally shuffled
     images the attributes include the filename and tags; for web-source images they
-    include the rich metadata passed through the display_image service call.
+    include the rich metadata passed through the send_image service call.
 
     Source of truth for automations that drive external displays (e.g. eink).
     """

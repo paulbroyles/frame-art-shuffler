@@ -484,122 +484,95 @@ def _select_random_image(
     return selected, eligible_count, selected_tag, fresh_count, used_fallback
 
 
-async def _async_fetch_and_display_web_source(
+async def _async_web_source_send(
     hass: HomeAssistant,
     entry: Any,
     tv_id: str,
     tv_name: str,
-    matching_count: int,
-    selected_tag: str | None,
     entry_data: dict[str, Any],
-    _notify: Callable[[str, str], None],
     *,
+    select: bool = True,
     screen_on: bool = True,
     virtual_tag_id: str | None = None,
-) -> bool:
-    """Call the Frame Art Manager add-on API to fetch and display a web source image."""
-    registry = dr.async_get(hass)
-    device = registry.async_get_device(identifiers={(DOMAIN, tv_id)})
-    if not device:
-        raise FrameArtError(f"Could not find HA device for TV '{tv_name}' (id: {tv_id})")
-
-    frame_art_manager_url = entry.data.get("frame_art_manager_url", "http://localhost:8099")
-    session = async_get_clientsession(hass)
-
-    payload: dict[str, Any] = {"deviceId": device.id, "screenOn": screen_on}
-    if virtual_tag_id:
-        payload["virtualTagId"] = virtual_tag_id
-
-    try:
-        async with asyncio.timeout(65):
-            resp = await session.post(
-                f"{frame_art_manager_url}/api/web-sources/fetch-and-display",
-                json=payload,
-            )
-            data = await resp.json()
-    except Exception as err:
-        raise FrameArtError(f"Web source API call failed for {tv_name}: {err}") from err
-
-    if not data.get("success"):
-        raise FrameArtError(
-            f"Web source fetch failed for {tv_name}: {data.get('error', 'Unknown error')}"
-        )
-
-    art_metadata = data.get("metadata", {})
-    title = art_metadata.get("title") or "Unknown"
-    source = art_metadata.get("source") or "web source"
-    activity_msg = f"Web source displayed: \"{title}\" from {source}"
-
-    log_activity(hass, entry.entry_id, tv_id, "shuffle", activity_msg)
-
-    now = datetime.now(timezone.utc)
-    shuffle_cache = entry_data.setdefault("shuffle_cache", {})
-    shuffle_cache[tv_id] = {
-        "current_image": None,
-        "current_matte": None,
-        "current_filter": None,
-        "matching_image_count": matching_count,
-        "last_shuffle_timestamp": now.isoformat(),
-        "selected_tag": selected_tag,
-        "web_source": True,
-    }
-
-    signal = f"{DOMAIN}_shuffle_{entry.entry_id}_{tv_id}"
-    async_dispatcher_send(hass, signal)
-
-    if coordinator := entry_data.get("coordinator"):
-        await coordinator.async_set_active_image(tv_id, None, is_shuffle=True)
-
-    _notify("success", f"Web source displayed: {title}")
-    return True
-
-
-async def _async_fetch_and_upload_web_source(
-    hass: HomeAssistant,
-    entry: Any,
-    tv_id: str,
-    tv_name: str,
-    entry_data: dict[str, Any],
-    *,
-    virtual_tag_id: str | None = None,
     matte: str | None = None,
+    matching_count: int = 0,
+    selected_tag: str | None = None,
+    _notify: Callable[[str, str], None] | None = None,
 ) -> dict[str, Any] | None:
-    """Call the add-on API to fetch and upload (but not display) a web source image.
+    """Call the Frame Art Manager add-on to fetch and send a web source image.
 
-    Returns a dict with content_id and metadata for staging, or None on failure.
+    When select=True: fetches, uploads, selects on TV, updates activity/cache/signals.
+    When select=False: fetches, uploads only. Returns metadata for staging.
+
+    Returns a dict with response data, or None on failure (select=False only).
+    Raises FrameArtError on failure when select=True.
     """
     registry = dr.async_get(hass)
     device = registry.async_get_device(identifiers={(DOMAIN, tv_id)})
     if not device:
+        if select:
+            raise FrameArtError(f"Could not find HA device for TV '{tv_name}' (id: {tv_id})")
         _LOGGER.warning("pre-upload: no HA device for TV '%s'", tv_name)
         return None
 
     frame_art_manager_url = entry.data.get("frame_art_manager_url", "http://localhost:8099")
     session = async_get_clientsession(hass)
 
-    payload: dict[str, Any] = {"deviceId": device.id}
+    payload: dict[str, Any] = {"deviceId": device.id, "select": select}
+    if select:
+        payload["screenOn"] = screen_on
     if virtual_tag_id:
         payload["virtualTagId"] = virtual_tag_id
     if matte:
         payload["matte"] = matte
 
     try:
-        async with asyncio.timeout(120):
+        async with asyncio.timeout(65 if select else 120):
             resp = await session.post(
-                f"{frame_art_manager_url}/api/web-sources/fetch-and-upload",
+                f"{frame_art_manager_url}/api/web-sources/fetch-and-send",
                 json=payload,
             )
             data = await resp.json()
     except Exception as err:
-        _LOGGER.warning("pre-upload: web source fetch-and-upload failed for %s: %s", tv_name, err)
+        if select:
+            raise FrameArtError(f"Web source API call failed for {tv_name}: {err}") from err
+        _LOGGER.warning("pre-upload: web source fetch-and-send failed for %s: %s", tv_name, err)
         return None
 
     if not data.get("success"):
-        _LOGGER.warning(
-            "pre-upload: web source fetch-and-upload returned error for %s: %s",
-            tv_name, data.get("error", "Unknown"),
-        )
+        error_msg = data.get("error", "Unknown error")
+        if select:
+            raise FrameArtError(f"Web source fetch failed for {tv_name}: {error_msg}")
+        _LOGGER.warning("pre-upload: web source fetch-and-send returned error for %s: %s", tv_name, error_msg)
         return None
+
+    if select:
+        # Update activity, cache, signals
+        art_metadata = data.get("metadata", {})
+        title = art_metadata.get("title") or "Unknown"
+        source = art_metadata.get("source") or "web source"
+        log_activity(hass, entry.entry_id, tv_id, "shuffle", f"Web source selected: \"{title}\" from {source}")
+
+        now = datetime.now(timezone.utc)
+        shuffle_cache = entry_data.setdefault("shuffle_cache", {})
+        shuffle_cache[tv_id] = {
+            "current_image": None,
+            "current_matte": None,
+            "current_filter": None,
+            "matching_image_count": matching_count,
+            "last_shuffle_timestamp": now.isoformat(),
+            "selected_tag": selected_tag,
+            "web_source": True,
+        }
+
+        signal = f"{DOMAIN}_shuffle_{entry.entry_id}_{tv_id}"
+        async_dispatcher_send(hass, signal)
+
+        if coordinator := entry_data.get("coordinator"):
+            await coordinator.async_set_active_image(tv_id, None, is_shuffle=True)
+
+        if _notify:
+            _notify("success", f"Web source selected: {title}")
 
     return {
         "content_id": data.get("contentId"),
@@ -820,8 +793,9 @@ async def _async_pre_upload_next(
     try:
         if selected_image.get("_web_sources"):
             # Web source pre-upload
-            result = await _async_fetch_and_upload_web_source(
+            result = await _async_web_source_send(
                 hass, entry, tv_id, tv_name, entry_data,
+                select=False,
                 virtual_tag_id=selected_image.get("_virtual_tag_id"),
             )
             if not result or not result.get("content_id"):
@@ -1031,9 +1005,13 @@ async def _async_shuffle_tv_inner(
 
     # Web sources sentinel — call add-on API instead of uploading a library image
     if selected_image.get("_web_sources"):
-        ws_result = await _async_fetch_and_display_web_source(
-            hass, entry, tv_id, tv_name, matching_count, selected_tag, entry_data, _notify,
+        ws_result = await _async_web_source_send(
+            hass, entry, tv_id, tv_name, entry_data,
+            select=True,
             screen_on=screen_on,
+            matching_count=matching_count,
+            selected_tag=selected_tag,
+            _notify=_notify,
             virtual_tag_id=selected_image.get("_virtual_tag_id"),
         )
         if ws_result:

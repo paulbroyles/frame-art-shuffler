@@ -1,7 +1,7 @@
 """Helper utilities for interacting with Samsung Frame TVs.
 
 This module provides art-focused functions for Frame TV control:
-- set_art_on_tv_deleteothers: Upload and display artwork, manage gallery
+- set_art_on_tv_deleteothers: Upload and select artwork, manage gallery
 - upload_to_tv_only: Upload artwork without selecting (pre-upload pipeline)
 - select_and_cleanup: Select a pre-uploaded image and clean up old ones
 - set_tv_brightness: Adjust art mode brightness (1-10, or 50 for max)
@@ -367,6 +367,50 @@ async def get_tv_model_year(ip: str) -> Optional[int]:
         return None
 
 
+async def _ensure_tv_reachable(
+    client: TVConnectionManager,
+    *,
+    mac_address: Optional[str] = None,
+    screen_on: bool = True,
+    pre_network_awake: bool = False,
+    connect_timeout: float = 4,
+) -> None:
+    """Ensure TV is reachable, using WoL if needed.
+
+    Tries a fast connectivity check first. If the TV is unreachable and a
+    mac_address is provided, sends Wake-on-LAN:
+    - screen_on=True: full two-packet wake (tv_on) that turns on the screen
+    - screen_on=False: single-packet wake (tv_network_wake) that keeps screen off,
+      but only if pre_network_awake is False (to avoid waking the screen)
+
+    Raises FrameArtConnectionError if the TV cannot be reached.
+    """
+    ip = client.ip
+    try:
+        await client.ensure_connected(timeout=connect_timeout)
+        return
+    except Exception:
+        if not mac_address:
+            raise FrameArtConnectionError(
+                f"TV {ip} is unreachable and no MAC address provided for WoL"
+            )
+
+    # TV unreachable — attempt WoL
+    if screen_on:
+        await tv_on(ip, mac_address, client=client)
+        await client.ensure_connected()
+    else:
+        if pre_network_awake:
+            _LOGGER.debug(
+                "_ensure_tv_reachable: network already awake for %s, skipping WoL", ip,
+            )
+        else:
+            _LOGGER.info(
+                "_ensure_tv_reachable: waking network for %s (screen stays off)", ip,
+            )
+            await tv_network_wake(mac_address, ip, client=client)
+
+
 async def set_art_on_tv_deleteothers(
     client: TVConnectionManager,
     artpath: str,
@@ -650,7 +694,7 @@ async def set_art_on_tv_deleteothers(
         art = client.art
 
         if screen_on:
-            displayed = await _display_uploaded_art(
+            displayed = await _select_uploaded_art(
                 art,
                 content_id,
                 debug=debug,
@@ -665,7 +709,7 @@ async def set_art_on_tv_deleteothers(
             # - Screen was on  → display the art visibly (it's already showing, no waking needed)
             # - Screen was off → stage silently so it shows on the next screen wake
             if pre_screen_on:
-                displayed = await _display_uploaded_art(
+                displayed = await _select_uploaded_art(
                     art,
                     content_id,
                     debug=debug,
@@ -744,28 +788,15 @@ async def upload_to_tv_only(
         )
 
     # --- Connectivity / Wake ---
-    # Try connecting first; if it fails, attempt single-packet WoL (screen stays off).
     token_exists = _token_path(ip).exists()
     if token_exists:
-        try:
-            await client.ensure_connected(timeout=4)
-        except Exception:
-            if mac_address:
-                # Check REST state to decide whether WoL is safe
-                pre_network_awake, _ = await _check_rest_state(ip)
-                if pre_network_awake:
-                    _LOGGER.debug(
-                        "upload_to_tv_only: network already awake for %s, skipping WoL", ip
-                    )
-                else:
-                    _LOGGER.info(
-                        "upload_to_tv_only: waking network interface for %s (screen stays off)", ip
-                    )
-                    await tv_network_wake(mac_address, ip, client=client)
-            else:
-                raise FrameArtConnectionError(
-                    f"TV {ip} is unreachable and no MAC address provided for WoL"
-                )
+        pre_network_awake, _ = await _check_rest_state(ip) if mac_address else (False, False)
+        await _ensure_tv_reachable(
+            client,
+            mac_address=mac_address,
+            screen_on=False,
+            pre_network_awake=pre_network_awake,
+        )
 
     # --- Upload with retries ---
     content_id: Optional[str] = None
@@ -830,11 +861,13 @@ async def select_and_cleanup(
     mac_address: Optional[str] = None,
     photo_filter: Optional[str] = None,
     keep_content_ids: Optional[set[str]] = None,
+    blocking_cleanup: bool = False,
+    pre_screen_on: Optional[bool] = None,
     debug: bool = False,
 ) -> bool:
     """Select a previously uploaded image and clean up old images from the TV.
 
-    This is the "display" half of the pre-upload pipeline.  The image
+    This is the "select" half of the pre-upload pipeline.  The image
     identified by content_id must already exist on the TV (from a prior
     upload_to_tv_only call).
 
@@ -844,6 +877,10 @@ async def select_and_cleanup(
 
     keep_content_ids specifies which content_ids to keep during cleanup.
     If not provided, only the selected content_id is kept.
+
+    blocking_cleanup: when True, await the delete instead of backgrounding it.
+    pre_screen_on: if the caller already checked screen state, pass it here
+        to skip the redundant REST check.
 
     Returns True if the image was successfully selected.
     """
@@ -859,29 +896,21 @@ async def select_and_cleanup(
     # --- Check screen state (before any WoL) ---
     # When screen_on=False, check actual screen state so we can show the image
     # if the screen happens to be on, without waking it if it's off.
-    pre_screen_on = False
-    if not screen_on:
-        _, pre_screen_on = await _check_rest_state(ip)
+    if pre_screen_on is None:
+        pre_screen_on = False
+        if not screen_on:
+            pre_network_awake, pre_screen_on = await _check_rest_state(ip)
+    else:
+        # Caller provided pre_screen_on; derive pre_network_awake from it
+        pre_network_awake = pre_screen_on  # if screen was on, network is awake
 
     # --- Connectivity / Wake ---
-    try:
-        await client.ensure_connected(timeout=4)
-    except Exception:
-        if mac_address:
-            if screen_on:
-                await tv_on(ip, mac_address, client=client)
-                await client.ensure_connected()
-            else:
-                pre_network_awake = pre_screen_on  # REST responded above
-                if not pre_network_awake:
-                    _LOGGER.info("select_and_cleanup: waking network for %s (screen stays off)", ip)
-                    await tv_network_wake(mac_address, ip, client=client)
-                else:
-                    _LOGGER.debug("select_and_cleanup: network already awake for %s", ip)
-        else:
-            raise FrameArtConnectionError(
-                f"TV {ip} is unreachable and no MAC address provided for WoL"
-            )
+    await _ensure_tv_reachable(
+        client,
+        mac_address=mac_address,
+        screen_on=screen_on,
+        pre_network_awake=pre_screen_on if not screen_on else False,
+    )
 
     # --- Select image ---
     await client.ensure_connected()
@@ -922,14 +951,17 @@ async def select_and_cleanup(
     elapsed = asyncio.get_event_loop().time() - _op_start
     _LOGGER.info("select_and_cleanup: selected in %.1fs for %s", elapsed, ip)
 
-    # --- Cleanup old images (background, non-blocking) ---
-    async def _background_cleanup() -> None:
-        try:
-            await _delete_other_images(art, keep_content_ids, debug=debug)
-        except Exception as err:
-            _LOGGER.warning("select_and_cleanup: cleanup failed (non-fatal): %s", err)
+    # --- Cleanup old images ---
+    if blocking_cleanup:
+        await _delete_other_images(art, keep_content_ids, debug=debug)
+    else:
+        async def _background_cleanup() -> None:
+            try:
+                await _delete_other_images(art, keep_content_ids, debug=debug)
+            except Exception as err:
+                _LOGGER.warning("select_and_cleanup: cleanup failed (non-fatal): %s", err)
 
-    asyncio.get_event_loop().create_task(_background_cleanup())
+        asyncio.get_event_loop().create_task(_background_cleanup())
     return True
 
 
@@ -1295,7 +1327,7 @@ def _send_wake_on_lan(mac_address: str) -> None:
         raise FrameArtConnectionError(f"Failed to send Wake-on-LAN packet to {mac_address}: {err}") from err
 
 
-async def _display_uploaded_art(art: SamsungTVAsyncArt, content_id: str, *, debug: bool) -> bool:
+async def _select_uploaded_art(art: SamsungTVAsyncArt, content_id: str, *, debug: bool) -> bool:
     # Method 1: try direct selection with retries
     for attempt, delay in enumerate(_DISPLAY_RETRY_DELAYS):
         if attempt and delay:

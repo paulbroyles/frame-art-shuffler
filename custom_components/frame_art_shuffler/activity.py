@@ -80,7 +80,7 @@ EVENT_TYPES = {
     "auto_shuffle_enabled": ("mdi:shuffle-variant", "Auto-shuffle enabled"),
     "auto_shuffle_disabled": ("mdi:shuffle-disabled", "Auto-shuffle disabled"),
     "auto_shuffle_error": ("mdi:alert", "Auto-shuffle error"),
-    "display_image": ("mdi:image", "Image displayed"),
+    "select_image": ("mdi:image", "Image selected"),
     "integration_start": ("mdi:play-circle", "Integration started"),
     "error": ("mdi:alert-circle", "Error occurred"),
 }

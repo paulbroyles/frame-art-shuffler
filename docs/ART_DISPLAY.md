@@ -26,7 +26,7 @@ When the "Auto-Shuffle Enable" switch is turned on for a TV (or the option is en
 
 1. **Frequency** comes from the `Shuffle Frequency` number entity (minutes). Changing the number immediately restarts the timer.
 2. **Power-aware**: the scheduler relies on the existing `tv_status_cache`. If the screen is off *or* the power state is unknown, the shuffle is skipped, logged, and the next run is scheduled without waking the panel.
-3. **Guarded uploads**: every scheduled shuffle calls `async_shuffle_tv(..., skip_if_screen_off=True)` so it reuses the same per-TV upload lock as the manual button and the `display_image` service.
+3. **Guarded uploads**: every scheduled shuffle calls `async_shuffle_tv(..., skip_if_screen_off=True)` so it reuses the same per-TV upload lock as the manual button and the `send_image` service.
 4. **Health checks**: timers should always stay in the future. If the next scheduled time ever drifts into the past, the integration logs an `auto_shuffle_error`, records it in Recent Activity, and immediately reschedules.
 5. **Next run + persistence**: the `auto_shuffle_next` sensor (see below) exposes the upcoming timestamp, and the same value is persisted in the config entry so it survives Home Assistant restarts. On startup the timer restarts from the saved timestamp instead of starting over.
 
@@ -130,8 +130,8 @@ The primary source of truth for what is currently displayed on the TV.
 
 **How it gets updated:**
 
-- **Integration-set art**: Updated immediately after every shuffle or `display_image` service call, with full metadata.
-- **Web sources**: The Frame Art Manager add-on passes `artwork_metadata` (the `attributeSnapshot` from the user's field mapping) through the `display_image` service call; the sensor stores it directly.
+- **Integration-set art**: Updated immediately after every shuffle or `send_image` service call, with full metadata.
+- **Web sources**: The Frame Art Manager add-on passes `artwork_metadata` (the `attributeSnapshot` from the user's field mapping) through the `send_image` service call; the sensor stores it directly.
 - **External changes** (Samsung app, Art Store): Detected two ways — WebSocket `art_mode_changed`/`wakeup` events trigger an immediate `get_current_artwork` query; a 2-minute periodic poll catches mid-session changes. When an external change is detected, only `content_id` is known, so the sensor records `source_type: "external"` with no other metadata.
 
 The sensor uses `RestoreEntity` to survive HA restarts, preserving the last known `content_id` and attributes.
@@ -240,7 +240,7 @@ Image evaluation:
 
 ## Upload Guard & Power Awareness
 
-- Manual button presses and the `display_image` service both route through `async_guarded_upload`, guaranteeing only one upload per TV at a time.
+- Manual button presses and the `send_image` service both route through `async_guarded_upload`, guaranteeing only one upload per TV at a time.
 - Auto shuffle uses the same helper *and* performs a cached power-state check. If the cached state is off/unknown, the scheduler logs a skip and never attempts to wake the panel.
 - Because we rely on cached state instead of fresh REST polls, the TVs never receive extra wake pings just to see if a shuffle is needed.
 
