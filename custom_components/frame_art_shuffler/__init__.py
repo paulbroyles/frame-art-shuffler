@@ -329,6 +329,15 @@ if _HA_AVAILABLE:
         """Set up a config entry for Frame Art Shuffler."""
 
         metadata_path = Path(entry.data[CONF_METADATA_PATH])
+
+        # Migrate metadata path from metadata.json → gallery.json (one-time)
+        if metadata_path.name == "metadata.json":
+            gallery_path = metadata_path.parent / "gallery.json"
+            if gallery_path.exists():
+                new_data = {**entry.data, CONF_METADATA_PATH: str(gallery_path)}
+                hass.config_entries.async_update_entry(entry, data=new_data)
+                metadata_path = gallery_path
+
         token_dir = Path(entry.data[CONF_TOKEN_DIR])
 
         token_dir.mkdir(parents=True, exist_ok=True)
