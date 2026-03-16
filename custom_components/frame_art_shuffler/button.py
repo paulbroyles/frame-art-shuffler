@@ -7,15 +7,15 @@ import logging
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
-from homeassistant.helpers.dispatcher import async_dispatcher_send
+
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers import device_registry as dr
 
 from .config_entry import get_tv_config, update_tv_config
-from .const import DOMAIN, CONF_ENABLE_AUTO_SHUFFLE
-from .frame_tv import tv_on, tv_off, set_art_on_tv_deleteothers, set_art_mode, delete_token, toggle_tv_orientation, get_tv_model_year, FrameArtError
+from .const import DOMAIN, CONF_ENABLE_AUTO_SHUFFLE, CONF_LIGHT_SENSOR
+from .frame_tv import tv_on, tv_off, set_art_mode, delete_token, toggle_tv_orientation, get_tv_model_year, FrameArtError
 from .shuffle import async_shuffle_tv
 from .activity import log_activity
 
@@ -36,18 +36,25 @@ async def async_setup_entry(
         if not tv_id:
             continue
 
+        # Always-created buttons
         entities.extend([
             FrameArtArtModeButton(hass, entry, tv_id),
-            FrameArtOnArtModeButton(hass, entry, tv_id),
             FrameArtShuffleButton(hass, entry, tv_id),
-            FrameArtShuffleSilentButton(hass, entry, tv_id),
             FrameArtToggleOrientationButton(hass, entry, tv_id),
             FrameArtClearTokenButton(hass, entry, tv_id),
-            FrameArtCalibrateDarkButton(hass, entry, tv_id),
-            FrameArtCalibrateBrightButton(hass, entry, tv_id),
-            FrameArtTriggerBrightnessButton(hass, entry, tv_id),
-            FrameArtTriggerMotionOffButton(hass, entry, tv_id),
         ])
+
+        # Auto-brightness buttons (only if light sensor configured)
+        if tv.get(CONF_LIGHT_SENSOR):
+            entities.extend([
+                FrameArtCalibrateDarkButton(hass, entry, tv_id),
+                FrameArtCalibrateBrightButton(hass, entry, tv_id),
+                FrameArtTriggerBrightnessButton(hass, entry, tv_id),
+            ])
+
+        # Auto-motion buttons (only if motion sensors configured)
+        if tv.get("motion_sensors"):
+            entities.append(FrameArtTriggerMotionOffButton(hass, entry, tv_id))
 
     if entities:
         async_add_entities(entities)
@@ -116,63 +123,15 @@ class FrameArtRemoveTVButton(ButtonEntity):
 
 
 class FrameArtArtModeButton(ButtonEntity):
-    """Button entity to switch TV to art mode."""
+    """Button entity to switch TV to art mode.
+
+    Smart button: if the TV is reachable, sends art mode command directly.
+    If unreachable and MAC is available, sends WoL first then art mode.
+    """
 
     _attr_has_entity_name = True
     _attr_name = "Art Mode"
     _attr_icon = "mdi:palette"
-
-    def __init__(
-        self,
-        hass: HomeAssistant,
-        entry: ConfigEntry,
-        tv_id: str,
-    ) -> None:
-        """Initialize the button entity."""
-        self._hass = hass
-        self._tv_id = tv_id
-        self._entry = entry
-
-        # Get TV config
-        tv_config = get_tv_config(entry, tv_id)
-        if tv_config:
-            self._tv_name = tv_config.get("name", tv_id)
-            self._tv_ip = tv_config.get("ip")
-        else:
-            self._tv_name = tv_id
-            self._tv_ip = None
-
-        self._attr_unique_id = f"{tv_id}_art_mode"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, tv_id)},
-            name=self._tv_name,
-            manufacturer="Samsung",
-            model="Frame TV",
-        )
-
-    async def async_press(self) -> None:
-        """Handle the button press - switch TV to art mode."""
-        if not self._tv_ip:
-            _LOGGER.error(f"Cannot switch {self._tv_name} to art mode: missing IP address in config")
-            return
-
-        try:
-            data = self.hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
-            client = data.get("art_clients", {}).get(self._tv_id)
-            if client is None:
-                raise FrameArtError(f"No art client for {self._tv_name}")
-            await set_art_mode(client)
-            _LOGGER.info(f"Switched {self._tv_name} to art mode")
-        except FrameArtError as err:
-            _LOGGER.error(f"Failed to switch {self._tv_name} to art mode: {err}")
-
-
-class FrameArtOnArtModeButton(ButtonEntity):
-    """Button entity to turn TV on and then switch to art mode."""
-
-    _attr_has_entity_name = True
-    _attr_name = "On+Art Mode (~12s)"
-    _attr_icon = "mdi:television-ambient-light"
 
     def __init__(
         self,
@@ -196,7 +155,7 @@ class FrameArtOnArtModeButton(ButtonEntity):
             self._tv_ip = None
             self._tv_mac = None
 
-        self._attr_unique_id = f"{tv_id}_on_art_mode"
+        self._attr_unique_id = f"{tv_id}_art_mode"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, tv_id)},
             name=self._tv_name,
@@ -205,9 +164,9 @@ class FrameArtOnArtModeButton(ButtonEntity):
         )
 
     async def async_press(self) -> None:
-        """Handle the button press - turn TV on and switch to art mode."""
-        if not self._tv_ip or not self._tv_mac:
-            _LOGGER.error(f"Cannot turn on {self._tv_name}: missing IP or MAC address in config")
+        """Handle the button press - switch TV to art mode, waking if needed."""
+        if not self._tv_ip:
+            _LOGGER.error(f"Cannot switch {self._tv_name} to art mode: missing IP address in config")
             return
 
         try:
@@ -216,27 +175,31 @@ class FrameArtOnArtModeButton(ButtonEntity):
             if client is None:
                 raise FrameArtError(f"No art client for {self._tv_name}")
 
-            # First turn on the TV
-            await tv_on(self._tv_ip, self._tv_mac, client=client)
-            _LOGGER.info(f"Sent Wake-on-LAN to {self._tv_name}, waiting for TV to be ready...")
+            # Try connecting directly first (fast path if TV is awake)
+            try:
+                await client.ensure_connected(timeout=4)
+            except Exception:
+                # TV unreachable — try WoL if MAC is available
+                if not self._tv_mac:
+                    raise FrameArtError(
+                        f"{self._tv_name} is unreachable and no MAC address available for WoL"
+                    )
+                _LOGGER.info(f"{self._tv_name} unreachable, sending WoL...")
+                await tv_on(self._tv_ip, self._tv_mac, client=client)
 
-            # tv_on already includes the ~12 second wait for the TV to be ready
-            # Now switch to art mode
             await set_art_mode(client)
             _LOGGER.info(f"Switched {self._tv_name} to art mode")
-            
-            # Log activity
             log_activity(
                 self.hass, self._entry.entry_id, self._tv_id,
                 "screen_on",
-                f"Turned on + Art Mode",
+                "Art Mode",
             )
         except FrameArtError as err:
-            _LOGGER.error(f"Failed to turn on and switch {self._tv_name} to art mode: {err}")
+            _LOGGER.error(f"Failed to switch {self._tv_name} to art mode: {err}")
 
 
 class FrameArtShuffleButton(ButtonEntity):
-    """Button entity to shuffle to a random image."""
+    """Button entity to shuffle to a random image without waking the screen."""
 
     _attr_has_entity_name = False
     _attr_icon = "mdi:shuffle-variant"
@@ -261,7 +224,7 @@ class FrameArtShuffleButton(ButtonEntity):
             self._tv_name = tv_id
             self._tv_ip = None
 
-        self._attr_name = f"{self._tv_name} Auto-Shuffle Now"
+        self._attr_name = f"{self._tv_name} Shuffle"
         self._attr_unique_id = f"{tv_id}_shuffle"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, tv_id)},
@@ -271,74 +234,24 @@ class FrameArtShuffleButton(ButtonEntity):
         )
 
     async def async_press(self) -> None:
-        """Handle the button press - shuffle to a random image.
-        
-        If auto-shuffle is enabled for this TV, we run the full auto-shuffle
-        sequence (which updates timers and status). Otherwise we just do a
-        simple shuffle.
+        """Handle the button press - shuffle without waking the screen.
+
+        Always silent (screen_on=False). If auto-shuffle is enabled,
+        restarts the timer so next auto-shuffle is a full interval from now.
         """
-        log_activity(self.hass, self._entry.entry_id, self._tv_id, f"Manual shuffle button pressed for {self._tv_name}")
-        _LOGGER.info(f"Manual shuffle button pressed for {self._tv_name}")
-        
+        log_activity(self.hass, self._entry.entry_id, self._tv_id, f"Shuffle button pressed for {self._tv_name}")
+        _LOGGER.info(f"Shuffle button pressed for {self._tv_name}")
+
+        await async_shuffle_tv(self.hass, self._entry, self._tv_id, reason="button", screen_on=False)
+
+        # Restart auto-shuffle timer if enabled (so next auto-shuffle is a full interval away)
         tv_config = get_tv_config(self._entry, self._tv_id)
-        auto_shuffle_enabled = tv_config.get(CONF_ENABLE_AUTO_SHUFFLE, False) if tv_config else False
-        
-        if auto_shuffle_enabled:
-            # Use the full auto-shuffle path so timers and status get updated
+        if tv_config and tv_config.get(CONF_ENABLE_AUTO_SHUFFLE, False):
             data = self.hass.data.get(DOMAIN, {}).get(self._entry.entry_id)
             if data:
-                async_run_auto_shuffle = data.get("async_run_auto_shuffle")
                 start_auto_shuffle_timer = data.get("start_auto_shuffle_timer")
-                if async_run_auto_shuffle and start_auto_shuffle_timer:
-                    # Run the shuffle (updates status)
-                    await async_run_auto_shuffle(self._tv_id)
-                    # Restart timer so next shuffle is frequency minutes from now
+                if start_auto_shuffle_timer:
                     start_auto_shuffle_timer(self._tv_id)
-                    return
-        
-        # Fallback: auto-shuffle disabled or data not available
-        await async_shuffle_tv(self.hass, self._entry, self._tv_id, reason="button")
-
-
-class FrameArtShuffleSilentButton(ButtonEntity):
-    """Button entity to shuffle to a random image without waking the screen."""
-
-    _attr_has_entity_name = False
-    _attr_icon = "mdi:shuffle-variant"
-
-    def __init__(
-        self,
-        hass: HomeAssistant,
-        entry: ConfigEntry,
-        tv_id: str,
-    ) -> None:
-        """Initialize the silent shuffle button entity."""
-        self._hass = hass
-        self._tv_id = tv_id
-        self._entry = entry
-
-        tv_config = get_tv_config(entry, tv_id)
-        if tv_config:
-            self._tv_name = tv_config.get("name", tv_id)
-            self._tv_ip = tv_config.get("ip")
-        else:
-            self._tv_name = tv_id
-            self._tv_ip = None
-
-        self._attr_name = f"{self._tv_name} Shuffle Silently"
-        self._attr_unique_id = f"{tv_id}_shuffle_silent"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, tv_id)},
-            name=self._tv_name,
-            manufacturer="Samsung",
-            model="Frame TV",
-        )
-
-    async def async_press(self) -> None:
-        """Handle the button press - shuffle to a random image without waking the screen."""
-        log_activity(self.hass, self._entry.entry_id, self._tv_id, f"Silent shuffle button pressed for {self._tv_name}")
-        _LOGGER.info(f"Silent shuffle button pressed for {self._tv_name}")
-        await async_shuffle_tv(self.hass, self._entry, self._tv_id, reason="button", screen_on=False)
 
 
 class FrameArtClearTokenButton(ButtonEntity):
@@ -642,6 +555,7 @@ class FrameArtToggleOrientationButton(ButtonEntity):
     _attr_has_entity_name = True
     _attr_name = "Toggle Orientation"
     _attr_icon = "mdi:screen-rotation"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     def __init__(
         self,

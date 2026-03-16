@@ -24,12 +24,10 @@ from .config_entry import (
 )
 from .const import (
     CONF_ENABLE_AUTO_SHUFFLE,
+    CONF_LIGHT_SENSOR,
     CONF_OVERRIDE_EXPIRY_TIME,
     CONF_OVERRIDE_TAGSET,
     CONF_SELECTED_TAGSET,
-    CONF_SHUFFLE_FREQUENCY,
-    CONF_LIGHT_SENSOR,
-    CONF_TAGSETS,
     DOMAIN,
     SIGNAL_SHUFFLE,
     SIGNAL_AUTO_SHUFFLE_NEXT,
@@ -56,6 +54,7 @@ TV_DESCRIPTION = SensorEntityDescription(
 LAST_SHUFFLE_IMAGE_DESCRIPTION = SensorEntityDescription(
     key="last_shuffle_image",
     icon="mdi:image-multiple",
+    entity_category=EntityCategory.DIAGNOSTIC,
     translation_key="last_shuffle_image",
 )
 
@@ -63,6 +62,7 @@ LAST_SHUFFLE_TIMESTAMP_DESCRIPTION = SensorEntityDescription(
     key="last_shuffle_timestamp",
     icon="mdi:clock-outline",
     device_class=SensorDeviceClass.TIMESTAMP,
+    entity_category=EntityCategory.DIAGNOSTIC,
     translation_key="last_shuffle_timestamp",
 )
 
@@ -153,24 +153,28 @@ AUTO_MOTION_OFF_AT_DESCRIPTION = SensorEntityDescription(
 CURRENT_MATTE_DESCRIPTION = SensorEntityDescription(
     key="current_matte",
     icon="mdi:image-filter-frames",
+    entity_category=EntityCategory.DIAGNOSTIC,
     translation_key="current_matte",
 )
 
 CURRENT_FILTER_DESCRIPTION = SensorEntityDescription(
     key="current_filter",
     icon="mdi:image-filter-vintage",
+    entity_category=EntityCategory.DIAGNOSTIC,
     translation_key="current_filter",
 )
 
 MATTE_FILTER_DESCRIPTION = SensorEntityDescription(
     key="matte_filter",
     icon="mdi:image-filter-frames",
+    entity_category=EntityCategory.CONFIG,
     translation_key="matte_filter",
 )
 
 TAGS_COMBINED_DESCRIPTION = SensorEntityDescription(
     key="tags_combined",
     icon="mdi:tag-multiple",
+    entity_category=EntityCategory.DIAGNOSTIC,
     translation_key="tags_combined",
 )
 
@@ -183,12 +187,14 @@ SELECTED_TAGSET_DESCRIPTION = SensorEntityDescription(
 SELECTED_TAGSET_WEIGHTING_DESCRIPTION = SensorEntityDescription(
     key="selected_tagset_weighting",
     icon="mdi:scale-balance",
+    entity_category=EntityCategory.DIAGNOSTIC,
     translation_key="selected_tagset_weighting",
 )
 
 OVERRIDE_TAGSET_DESCRIPTION = SensorEntityDescription(
     key="override_tagset",
     icon="mdi:tag-arrow-right",
+    entity_category=EntityCategory.DIAGNOSTIC,
     translation_key="override_tagset",
 )
 
@@ -196,6 +202,7 @@ OVERRIDE_EXPIRY_DESCRIPTION = SensorEntityDescription(
     key="override_expiry",
     icon="mdi:clock-end",
     device_class=SensorDeviceClass.TIMESTAMP,
+    entity_category=EntityCategory.DIAGNOSTIC,
     translation_key="override_expiry",
 )
 
@@ -232,47 +239,51 @@ async def async_setup_entry(
             if not tv_id or tv_id in tracked:
                 continue
             
-            # Create all sensors per TV
-            current_artwork_entity = FrameArtTVEntity(hass, entry, tv_id)
-            last_image_entity = FrameArtLastShuffleImageEntity(hass, entry, tv_id)
-            last_timestamp_entity = FrameArtLastShuffleTimestampEntity(hass, entry, tv_id)
-            auto_shuffle_next_entity = FrameArtAutoShuffleNextEntity(hass, entry, tv_id)
-            ip_entity = FrameArtIPEntity(entry, tv_id)
-            mac_entity = FrameArtMACEntity(entry, tv_id)
-            motion_entity = FrameArtMotionSensorEntity(entry, tv_id)
-            light_entity = FrameArtLightSensorEntity(entry, tv_id)
-            # Auto brightness sensors
-            auto_bright_last_entity = FrameArtAutoBrightLastAdjustEntity(hass, entry, tv_id)
-            auto_bright_next_entity = FrameArtAutoBrightNextAdjustEntity(hass, entry, tv_id)
-            auto_bright_target_entity = FrameArtAutoBrightTargetEntity(hass, entry, tv_id)
-            auto_bright_lux_entity = FrameArtAutoBrightSensorLuxEntity(hass, entry, tv_id)
-            # Auto motion sensors
-            auto_motion_last_entity = FrameArtAutoMotionLastMotionEntity(hass, entry, tv_id)
-            auto_motion_off_at_entity = FrameArtAutoMotionOffAtEntity(hass, entry, tv_id)
-            # Current matte and filter sensors
-            current_matte_entity = FrameArtCurrentMatteEntity(hass, entry, tv_id)
-            current_filter_entity = FrameArtCurrentFilterEntity(hass, entry, tv_id)
-            # Combined display sensors for dashboard
-            matte_filter_entity = FrameArtMatteFilterEntity(hass, entry, tv_id)
-            tags_combined_entity = FrameArtTagsCombinedEntity(hass, entry, tv_id)
-            # Tagset sensors
-            selected_tagset_entity = FrameArtSelectedTagsetEntity(hass, entry, tv_id)
-            selected_tagset_weighting_entity = FrameArtSelectedTagsetWeightingEntity(hass, entry, tv_id)
-            override_tagset_entity = FrameArtOverrideTagsetEntity(hass, entry, tv_id)
-            override_expiry_entity = FrameArtOverrideExpiryEntity(hass, entry, tv_id)
-            # Matching count sensor
-            matching_count_entity = FrameArtMatchingImageCountEntity(hass, entry, tv_id)
-            # Activity history sensor
-            activity_entity = FrameArtActivitySensor(hass, entry, tv_id)
-            # Orientation sensor
-            orientation_entity = FrameArtOrientationEntity(hass, entry, tv_id)
-            # Artwork info sensor (for automations driving external displays)
+            # Always-created sensors
             artwork_info_entity = FrameArtArtworkInfoSensor(hass, entry, tv_id)
-            # Store reference so __init__.py and shuffle.py can update it
             hass.data[DOMAIN][entry.entry_id].setdefault("artwork_sensors", {})[tv_id] = artwork_info_entity
 
-            tracked[tv_id] = (current_artwork_entity, last_image_entity, last_timestamp_entity, auto_shuffle_next_entity, ip_entity, mac_entity, motion_entity, light_entity, auto_bright_last_entity, auto_bright_next_entity, auto_bright_target_entity, auto_bright_lux_entity, auto_motion_last_entity, auto_motion_off_at_entity, current_matte_entity, current_filter_entity, matte_filter_entity, tags_combined_entity, selected_tagset_entity, selected_tagset_weighting_entity, override_tagset_entity, override_expiry_entity, matching_count_entity, activity_entity, orientation_entity, artwork_info_entity)
-            new_entities.extend([current_artwork_entity, last_image_entity, last_timestamp_entity, auto_shuffle_next_entity, ip_entity, mac_entity, motion_entity, light_entity, auto_bright_last_entity, auto_bright_next_entity, auto_bright_target_entity, auto_bright_lux_entity, auto_motion_last_entity, auto_motion_off_at_entity, current_matte_entity, current_filter_entity, matte_filter_entity, tags_combined_entity, selected_tagset_entity, selected_tagset_weighting_entity, override_tagset_entity, override_expiry_entity, matching_count_entity, activity_entity, orientation_entity, artwork_info_entity])
+            tv_entities: list[SensorEntity] = [
+                FrameArtTVEntity(hass, entry, tv_id),
+                FrameArtLastShuffleImageEntity(hass, entry, tv_id),
+                FrameArtLastShuffleTimestampEntity(hass, entry, tv_id),
+                FrameArtAutoShuffleNextEntity(hass, entry, tv_id),
+                FrameArtIPEntity(entry, tv_id),
+                FrameArtMACEntity(entry, tv_id),
+                FrameArtMotionSensorEntity(entry, tv_id),
+                FrameArtLightSensorEntity(entry, tv_id),
+                FrameArtCurrentMatteEntity(hass, entry, tv_id),
+                FrameArtCurrentFilterEntity(hass, entry, tv_id),
+                FrameArtMatteFilterEntity(hass, entry, tv_id),
+                FrameArtTagsCombinedEntity(hass, entry, tv_id),
+                FrameArtSelectedTagsetEntity(hass, entry, tv_id),
+                FrameArtSelectedTagsetWeightingEntity(hass, entry, tv_id),
+                FrameArtOverrideTagsetEntity(hass, entry, tv_id),
+                FrameArtOverrideExpiryEntity(hass, entry, tv_id),
+                FrameArtMatchingImageCountEntity(hass, entry, tv_id),
+                FrameArtActivitySensor(hass, entry, tv_id),
+                FrameArtOrientationEntity(hass, entry, tv_id),
+                artwork_info_entity,
+            ]
+
+            # Auto-brightness sensors (only if light sensor configured)
+            if tv.get(CONF_LIGHT_SENSOR):
+                tv_entities.extend([
+                    FrameArtAutoBrightLastAdjustEntity(hass, entry, tv_id),
+                    FrameArtAutoBrightNextAdjustEntity(hass, entry, tv_id),
+                    FrameArtAutoBrightTargetEntity(hass, entry, tv_id),
+                    FrameArtAutoBrightSensorLuxEntity(hass, entry, tv_id),
+                ])
+
+            # Auto-motion sensors (only if motion sensors configured)
+            if tv.get("motion_sensors"):
+                tv_entities.extend([
+                    FrameArtAutoMotionLastMotionEntity(hass, entry, tv_id),
+                    FrameArtAutoMotionOffAtEntity(hass, entry, tv_id),
+                ])
+
+            tracked[tv_id] = tuple(tv_entities)
+            new_entities.extend(tv_entities)
             
         if new_entities:
             async_add_entities(new_entities)
@@ -290,7 +301,7 @@ async def async_setup_entry(
 
 
 class FrameArtTVEntity(SensorEntity):
-    """Representation of a Frame TV current artwork sensor."""
+    """Sensor showing current artwork filename with entity_picture for dashboard cards."""
 
     entity_description = TV_DESCRIPTION
     _attr_has_entity_name = True
@@ -302,8 +313,6 @@ class FrameArtTVEntity(SensorEntity):
         self._tv_id = tv_id
         self._attr_unique_id = f"{entry.entry_id}_{tv_id}"
         self._unsubscribe_shuffle: Callable[[], None] | None = None
-        self._unsubscribe_tagset_global: Callable[[], None] | None = None
-        self._unsubscribe_tagset_tv: Callable[[], None] | None = None
 
         tv_config = get_tv_config(entry, tv_id)
         tv_name = tv_config.get("name", tv_id) if tv_config else tv_id
@@ -316,39 +325,14 @@ class FrameArtTVEntity(SensorEntity):
         )
 
     async def async_added_to_hass(self) -> None:
-        """Subscribe to shuffle and tagset signals for updates."""
+        """Subscribe to shuffle signal for updates."""
         @callback
         def _shuffle_updated() -> None:
-            """Handle shuffle signal."""
             self.async_write_ha_state()
-        
-        @callback
-        def _tagset_updated() -> None:
-            """Handle tagset update signal."""
-            self.async_write_ha_state()
-        
-        # Subscribe to shuffle signal
+
         signal = f"{SIGNAL_SHUFFLE}_{self._entry.entry_id}_{self._tv_id}"
         self._unsubscribe_shuffle = async_dispatcher_connect(
-            self._hass,
-            signal,
-            _shuffle_updated,
-        )
-        
-        # Subscribe to global tagset changes (definitions changed)
-        global_signal = f"{DOMAIN}_tagset_updated_{self._entry.entry_id}"
-        self._unsubscribe_tagset_global = async_dispatcher_connect(
-            self._hass,
-            global_signal,
-            _tagset_updated,
-        )
-        
-        # Subscribe to TV-specific tagset changes (selected/override changed)
-        tv_signal = f"{DOMAIN}_tagset_updated_{self._entry.entry_id}_{self._tv_id}"
-        self._unsubscribe_tagset_tv = async_dispatcher_connect(
-            self._hass,
-            tv_signal,
-            _tagset_updated,
+            self._hass, signal, _shuffle_updated,
         )
 
     async def async_will_remove_from_hass(self) -> None:
@@ -356,29 +340,22 @@ class FrameArtTVEntity(SensorEntity):
         if self._unsubscribe_shuffle:
             self._unsubscribe_shuffle()
             self._unsubscribe_shuffle = None
-        if self._unsubscribe_tagset_global:
-            self._unsubscribe_tagset_global()
-            self._unsubscribe_tagset_global = None
-        if self._unsubscribe_tagset_tv:
-            self._unsubscribe_tagset_tv()
-            self._unsubscribe_tagset_tv = None
 
     @property
     def native_value(self) -> str | None:  # type: ignore[override]
-        """Return the current artwork."""
+        """Return the current artwork filename."""
         # Check runtime cache first (set by button.py shuffle)
         data = self._hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
         shuffle_cache = data.get("shuffle_cache", {}).get(self._tv_id, {})
         cached_image = shuffle_cache.get("current_image")
         if cached_image:
             return str(cached_image)
-        
+
         # Fall back to config entry (for initial value after restart)
         tv_config = get_tv_config(self._entry, self._tv_id)
         if not tv_config:
             return None
-        
-        # Check top-level current_image first (set by button.py)
+
         current = tv_config.get("current_image")
         if current:
             return str(current)
@@ -388,7 +365,6 @@ class FrameArtTVEntity(SensorEntity):
         if isinstance(shuffle, dict):
             current = shuffle.get("currentImage") or shuffle.get("current")
             if current:
-                # Extract filename from path if it's a full path
                 if isinstance(current, str) and "/" in current:
                     return current.split("/")[-1]
                 return str(current)
@@ -400,60 +376,11 @@ class FrameArtTVEntity(SensorEntity):
         return get_tv_config(self._entry, self._tv_id) is not None
 
     @property
-    def extra_state_attributes(self) -> dict[str, Any] | None:  # type: ignore[override]
-        """Return extra state attributes."""
-        tv_config = get_tv_config(self._entry, self._tv_id)
-        if not tv_config:
-            return None
-        
-        # Read tagsets from cache (manager owns definitions; HA owns per-TV assignments)
-        entry_data = self._hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
-        tagset_cache = entry_data.get("tagset_cache")
-        tagsets = (tagset_cache.get_all() or None) if tagset_cache else None
-
-        # Get effective tags for the active tagset
-        include_tags, exclude_tags = get_effective_tags(self._entry, self._tv_id, tagsets=tagsets)
-
-        data = {
-            "ip": tv_config.get("ip"),
-            "mac": tv_config.get("mac"),
-            "tags": include_tags,
-            "exclude_tags": exclude_tags,
-            "motion_sensors": tv_config.get("motion_sensors", []),
-            "light_sensor": tv_config.get(CONF_LIGHT_SENSOR),
-            "entity_picture": self.entity_picture,
-        }
-
-        # Add per-TV tagset assignment state
-        data["selected_tagset"] = tv_config.get(CONF_SELECTED_TAGSET)
-        data["override_tagset"] = tv_config.get(CONF_OVERRIDE_TAGSET)
-        data["override_expiry_time"] = tv_config.get(CONF_OVERRIDE_EXPIRY_TIME)
-        data["active_tagset"] = get_active_tagset_name(self._entry, self._tv_id, tagsets=tagsets)
-
-        # Add weighting type and tag weights for the active tagset
-        data["weighting_type"] = get_weighting_type(self._entry, self._tv_id, tagsets=tagsets)
-        tag_weights = get_tag_weights(self._entry, self._tv_id, tagsets=tagsets)
-        if tag_weights:
-            data["tagset_weights"] = tag_weights
-        if include_tags:
-            data["tagset_percentages"] = calculate_tag_percentages(include_tags, tag_weights)
-        
-        shuffle = tv_config.get("shuffle") or {}
-        if isinstance(shuffle, dict):
-            data["shuffle_frequency"] = shuffle.get(CONF_SHUFFLE_FREQUENCY)
-        return data
-
-    @property
     def entity_picture(self) -> str:
-        """Return the URL to the current artwork image for picture-entity card.
-        
-        Always returns a valid URL - uses black placeholder if no image available.
-        This ensures picture-entity card never fails due to missing image.
-        """
+        """Return the URL to the current artwork image for picture-entity card."""
         current = self.native_value
         if current and current != "Unknown":
             return f"/local/frame_art/library/{current}"
-        # Return black placeholder so picture-entity card doesn't error
         return "/local/frame_art/library/_black_placeholder.jpg"
 
 
@@ -1760,7 +1687,7 @@ class FrameArtArtworkInfoSensor(SensorEntity, RestoreEntity):
 
     entity_description = ARTWORK_INFO_DESCRIPTION
     _attr_has_entity_name = True
-    _attr_name = "Artwork Info"
+    _attr_name = "Displayed Artwork"
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry, tv_id: str) -> None:
         self._hass = hass

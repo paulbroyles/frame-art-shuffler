@@ -424,9 +424,7 @@ def _get_tv_entities(
         "auto_shuffle_switch": f"{tv_id}_auto_shuffle",
         # Buttons
         "art_mode_button": f"{tv_id}_art_mode",
-        "on_art_mode": f"{tv_id}_on_art_mode",
         "shuffle": f"{tv_id}_shuffle",
-        "shuffle_silent": f"{tv_id}_shuffle_silent",
         "clear_token": f"{tv_id}_clear_token",
         "calibrate_dark": f"{tv_id}_calibrate_dark",
         "calibrate_bright": f"{tv_id}_calibrate_bright",
@@ -466,7 +464,7 @@ def _get_platform_for_key(key: str) -> str:
     }
     switches = {"power", "dynamic_brightness", "motion_control", "verbose_motion_logging", "auto_shuffle_switch"}
     buttons = {
-        "tv_on", "tv_off", "art_mode_button", "on_art_mode", "shuffle", "shuffle_silent",
+        "tv_on", "tv_off", "art_mode_button", "shuffle",
         "clear_token", "calibrate_dark", "calibrate_bright",
         "trigger_brightness", "trigger_motion_off",
     }
@@ -498,12 +496,6 @@ def _build_power_controls_section(entities: dict[str, str]) -> dict[str, Any] | 
             "entity": entities["art_mode_button"],
             "name": "Art Mode",
         })
-    if "on_art_mode" in entities:
-        button_entities.append({
-            "entity": entities["on_art_mode"],
-            "name": "On + Art Mode",
-        })
-    
     # Brightness level at the bottom
     if "brightness" in entities:
         button_entities.append({
@@ -613,12 +605,6 @@ def _build_artwork_section(entities: dict[str, str]) -> dict[str, Any] | None:
         control_entities.append({
             "entity": entities["shuffle"],
             "name": "Shuffle Image",
-        })
-
-    if "shuffle_silent" in entities:
-        control_entities.append({
-            "entity": entities["shuffle_silent"],
-            "name": "Shuffle Silently",
         })
 
     if "shuffle_frequency" in entities:

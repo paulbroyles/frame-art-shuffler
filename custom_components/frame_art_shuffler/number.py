@@ -15,7 +15,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .config_entry import get_tv_config, update_tv_config
-from .const import DOMAIN
+from .const import DOMAIN, CONF_LIGHT_SENSOR
 from .frame_tv import FrameArtError, set_tv_brightness
 from .activity import log_activity
 
@@ -36,15 +36,24 @@ async def async_setup_entry(
         if not tv_id:
             continue
 
+        # Always-created numbers
         entities.extend([
             FrameArtShuffleFrequencyEntity(hass, entry, tv_id),
             FrameArtBrightnessEntity(hass, entry, tv_id),
-            FrameArtMinLuxEntity(hass, entry, tv_id),
-            FrameArtMaxLuxEntity(hass, entry, tv_id),
-            FrameArtMinBrightnessEntity(hass, entry, tv_id),
-            FrameArtMaxBrightnessEntity(hass, entry, tv_id),
-            FrameArtMotionOffDelayEntity(hass, entry, tv_id),
         ])
+
+        # Auto-brightness numbers (only if light sensor configured)
+        if tv.get(CONF_LIGHT_SENSOR):
+            entities.extend([
+                FrameArtMinLuxEntity(hass, entry, tv_id),
+                FrameArtMaxLuxEntity(hass, entry, tv_id),
+                FrameArtMinBrightnessEntity(hass, entry, tv_id),
+                FrameArtMaxBrightnessEntity(hass, entry, tv_id),
+            ])
+
+        # Auto-motion numbers (only if motion sensors configured)
+        if tv.get("motion_sensors"):
+            entities.append(FrameArtMotionOffDelayEntity(hass, entry, tv_id))
 
     if entities:
         async_add_entities(entities)

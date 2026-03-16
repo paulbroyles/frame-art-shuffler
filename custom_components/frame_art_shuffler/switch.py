@@ -16,7 +16,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 
 from .config_entry import get_tv_config, update_tv_config
-from .const import DOMAIN, CONF_ENABLE_AUTO_SHUFFLE
+from .const import DOMAIN, CONF_ENABLE_AUTO_SHUFFLE, CONF_LIGHT_SENSOR
 from .frame_tv import tv_on, tv_off, set_art_mode, is_screen_on, FrameArtError
 from .activity import log_activity
 
@@ -44,13 +44,22 @@ async def async_setup_entry(
         if not tv_id:
             continue
 
+        # Always-created switches
         entities.extend([
             FrameArtPowerSwitch(hass, entry, tv_id),
-            FrameArtDynamicBrightnessSwitch(hass, entry, tv_id),
-            FrameArtMotionControlSwitch(hass, entry, tv_id),
             FrameArtAutoShuffleSwitch(hass, entry, tv_id),
-            FrameArtVerboseMotionLoggingSwitch(hass, entry, tv_id),
         ])
+
+        # Auto-brightness switches (only if light sensor configured)
+        if tv.get(CONF_LIGHT_SENSOR):
+            entities.append(FrameArtDynamicBrightnessSwitch(hass, entry, tv_id))
+
+        # Auto-motion switches (only if motion sensors configured)
+        if tv.get("motion_sensors"):
+            entities.extend([
+                FrameArtMotionControlSwitch(hass, entry, tv_id),
+                FrameArtVerboseMotionLoggingSwitch(hass, entry, tv_id),
+            ])
 
     if entities:
         async_add_entities(entities)
