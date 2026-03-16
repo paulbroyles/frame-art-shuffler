@@ -23,10 +23,8 @@ from .activity import log_activity
 from .config_entry import (
     get_active_tagset_name,
     get_effective_tags,
-    get_tag_weights,
     get_tagset_fingerprint,
     get_tv_config,
-    get_weighting_type,
 )
 from .const import DOMAIN
 from .frame_tv import (
@@ -78,10 +76,7 @@ async def async_guarded_upload(
 async def _async_select_image(
     hass: HomeAssistant,
     manager_url: str,
-    include_tags: list[str],
-    exclude_tags: list[str],
-    tag_weights: dict[str, float],
-    weighting_type: str,
+    tagset_name: str | None,
     current_image: str | None,
     tv_name: str,
     recent_images: set[str] | None = None,
@@ -95,10 +90,7 @@ async def _async_select_image(
     """
     session = async_get_clientsession(hass)
     payload: dict[str, Any] = {
-        "includeTags": include_tags,
-        "excludeTags": exclude_tags,
-        "tagWeights": tag_weights,
-        "weightingType": weighting_type,
+        "tagsetName": tagset_name,
         "currentImage": current_image,
         "recentImages": list(recent_images) if recent_images else [],
     }
@@ -288,7 +280,9 @@ async def _async_fast_path_shuffle(
     # --- Update sensors, cache, activity (mirrors full-path _perform_upload) ---
     now = datetime.now(timezone.utc)
     shuffle_cache = entry_data.setdefault("shuffle_cache", {})
-    include_tags, _ = get_effective_tags(entry, tv_id)
+    tagset_cache = entry_data.get("tagset_cache")
+    tagsets = tagset_cache.get_all() if tagset_cache else {}
+    include_tags, _ = get_effective_tags(entry, tv_id, tagsets=tagsets)
 
     if staged.get("source_type") == "web_source":
         # Promote staged cache → display cache on the add-on so the artwork
@@ -380,7 +374,7 @@ async def _async_fast_path_shuffle(
 
         display_log = entry_data.get("display_log")
         if display_log:
-            tagset_name = get_active_tagset_name(entry, tv_id)
+            tagset_name = get_active_tagset_name(entry, tv_id, tagsets=tagsets)
             display_log.note_display_start(
                 tv_id=tv_id,
                 tv_name=tv_name,
@@ -428,12 +422,13 @@ async def _async_pre_upload_next(
 
     _LOGGER.debug("pre-upload: starting for %s", tv_name)
 
-    # Compute current tagset fingerprint
-    fingerprint = get_tagset_fingerprint(entry, tv_id)
+    # Read tagsets from cache for fingerprint/tagset resolution
+    tagset_cache = entry_data.get("tagset_cache")
+    tagsets = tagset_cache.get_all() if tagset_cache else {}
 
-    include_tags, exclude_tags = get_effective_tags(entry, tv_id)
-    tag_weights = get_tag_weights(entry, tv_id)
-    weighting_type = get_weighting_type(entry, tv_id)
+    # Compute current tagset fingerprint
+    fingerprint = get_tagset_fingerprint(entry, tv_id, tagsets=tagsets)
+    tagset_name = get_active_tagset_name(entry, tv_id, tagsets=tagsets)
 
     library_path = Path(entry.data.get("metadata_path", "")).parent / "library"
 
@@ -446,10 +441,7 @@ async def _async_pre_upload_next(
         selected_image, _count, selected_tag, _fresh, _fallback = await _async_select_image(
             hass,
             manager_url,
-            include_tags,
-            exclude_tags,
-            tag_weights,
-            weighting_type,
+            tagset_name,
             current_image,
             tv_name,
             None,  # No recency filtering for pre-upload
@@ -597,12 +589,14 @@ async def _async_shuffle_tv_inner(
     library_path = Path(entry.data.get("metadata_path", "")).parent / "library"
     manager_url = entry.data.get("frame_art_manager_url", "http://localhost:8099")
 
-    # Use effective tags (resolves tagsets from global tagsets)
-    include_tags, exclude_tags = get_effective_tags(entry, tv_id)
-    tag_weights = get_tag_weights(entry, tv_id)
-    weighting_type = get_weighting_type(entry, tv_id)
-
     entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+
+    # Read tagsets from cache for tagset resolution / fingerprinting
+    tagset_cache = entry_data.get("tagset_cache")
+    tagsets = tagset_cache.get_all() if tagset_cache else {}
+    tagset_name = get_active_tagset_name(entry, tv_id, tagsets=tagsets)
+    include_tags, _ = get_effective_tags(entry, tv_id, tagsets=tagsets)
+
     shuffle_cache = entry_data.setdefault("shuffle_cache", {})
     runtime_state = shuffle_cache.get(tv_id, {})
     current_image = runtime_state.get("current_image") or tv_config.get("current_image")
@@ -612,7 +606,7 @@ async def _async_shuffle_tv_inner(
     staged_images = entry_data.get("staged_images", {})
     staged = staged_images.get(tv_id)
     if staged:
-        current_fingerprint = get_tagset_fingerprint(entry, tv_id)
+        current_fingerprint = get_tagset_fingerprint(entry, tv_id, tagsets=tagsets)
         if staged.get("tagset_fingerprint") == current_fingerprint:
             _LOGGER.info(
                 "Fast-path shuffle for %s: using staged content_id=%s",
@@ -663,10 +657,7 @@ async def _async_shuffle_tv_inner(
     selected_image, matching_count, selected_tag, fresh_count, used_fallback = await _async_select_image(
         hass,
         manager_url,
-        include_tags,
-        exclude_tags,
-        tag_weights,
-        weighting_type,
+        tagset_name,
         current_image,
         tv_name,
         recent_images,
@@ -775,7 +766,6 @@ async def _async_shuffle_tv_inner(
 
         display_log = entry_data.get("display_log")
         if display_log:
-            tagset_name = get_active_tagset_name(entry, tv_id)
             # Pass pool stats for sparkline history (only for auto-shuffle with recency enabled)
             # Skip recording when recent_images is None (e.g., during tagset overrides)
             pool_size_arg = matching_count if reason == "auto" and recent_images is not None else None

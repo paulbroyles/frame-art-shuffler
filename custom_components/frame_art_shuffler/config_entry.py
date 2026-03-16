@@ -131,21 +131,27 @@ def get_global_tagsets(entry: ConfigEntry) -> dict[str, Any]:
     return entry.data.get("tagsets", {})
 
 
-def get_effective_tags(entry: ConfigEntry, tv_id: str) -> tuple[list[str], list[str]]:
+def get_effective_tags(
+    entry: ConfigEntry,
+    tv_id: str,
+    tagsets: dict[str, Any] | None = None,
+) -> tuple[list[str], list[str]]:
     """Get the effective include/exclude tags for a TV.
-    
+
     Resolves tagsets from GLOBAL tagsets using TV's selected/override tagset name.
     Returns empty lists if no tagsets are configured.
-    
+
     Args:
         entry: Config entry (contains global tagsets)
         tv_id: TV identifier
-        
+        tagsets: Optional tagsets dict from TagsetCache; falls back to entry.data.
+
     Returns:
         Tuple of (include_tags, exclude_tags)
     """
-    # Read global tagsets from root of config entry data
-    tagsets = entry.data.get("tagsets", {})
+    # Use provided tagsets or fall back to entry.data
+    if tagsets is None:
+        tagsets = entry.data.get("tagsets", {})
     
     if not tagsets:
         return ([], [])
@@ -170,17 +176,23 @@ def get_effective_tags(entry: ConfigEntry, tv_id: str) -> tuple[list[str], list[
     )
 
 
-def get_active_tagset_name(entry: ConfigEntry, tv_id: str) -> str | None:
+def get_active_tagset_name(
+    entry: ConfigEntry,
+    tv_id: str,
+    tagsets: dict[str, Any] | None = None,
+) -> str | None:
     """Get the name of the currently active tagset for a TV.
-    
+
     Args:
         entry: Config entry (contains global tagsets)
         tv_id: TV identifier
-        
+        tagsets: Optional tagsets dict from TagsetCache; falls back to entry.data.
+
     Returns:
         Name of active tagset, or None if no tagsets configured
     """
-    tagsets = entry.data.get("tagsets", {})
+    if tagsets is None:
+        tagsets = entry.data.get("tagsets", {})
     if not tagsets:
         return None
     
@@ -238,20 +250,26 @@ def generate_unique_tagset_name(entry: ConfigEntry, base_name: str) -> str:
     return f"{base_name}_{suffix}"
 
 
-def get_tag_weights(entry: ConfigEntry, tv_id: str) -> dict[str, float]:
+def get_tag_weights(
+    entry: ConfigEntry,
+    tv_id: str,
+    tagsets: dict[str, Any] | None = None,
+) -> dict[str, float]:
     """Get tag weights for the active tagset.
-    
+
     Returns dict of tag -> weight. Missing tags default to 1.
     Weights are clamped to 0.1-10 range.
-    
+
     Args:
         entry: Config entry (contains global tagsets)
         tv_id: TV identifier
-        
+        tagsets: Optional tagsets dict from TagsetCache; falls back to entry.data.
+
     Returns:
         Dict of tag name -> weight (float)
     """
-    tagsets = entry.data.get("tagsets", {})
+    if tagsets is None:
+        tagsets = entry.data.get("tagsets", {})
     if not tagsets:
         return {}
     
@@ -350,17 +368,23 @@ def format_weight_display(weight: float) -> str:
     return f"{weight:.1f}"
 
 
-def get_weighting_type(entry: ConfigEntry, tv_id: str) -> str:
+def get_weighting_type(
+    entry: ConfigEntry,
+    tv_id: str,
+    tagsets: dict[str, Any] | None = None,
+) -> str:
     """Get the weighting type for the active tagset.
-    
+
     Args:
         entry: Config entry (contains global tagsets)
         tv_id: TV identifier
-        
+        tagsets: Optional tagsets dict from TagsetCache; falls back to entry.data.
+
     Returns:
         "image" or "tag". Defaults to "image" if not set.
     """
-    tagsets = entry.data.get("tagsets", {})
+    if tagsets is None:
+        tagsets = entry.data.get("tagsets", {})
     if not tagsets:
         return "image"
     
@@ -397,17 +421,26 @@ def get_tagset_weighting_type(entry: ConfigEntry, tagset_name: str) -> str:
     return tagset.get("weighting_type", "image")
 
 
-def get_tagset_fingerprint(entry: ConfigEntry, tv_id: str) -> str:
+def get_tagset_fingerprint(
+    entry: ConfigEntry,
+    tv_id: str,
+    tagsets: dict[str, Any] | None = None,
+) -> str:
     """Return a short hash of the effective tagset config for cache invalidation.
 
     Changes when the active tagset name, include/exclude tags, weights, or
     weighting type changes.  Used by the pre-upload pipeline to detect when
     a staged image is no longer valid for the current tagset.
+
+    Args:
+        entry: Config entry
+        tv_id: TV identifier
+        tagsets: Optional tagsets dict from TagsetCache; falls back to entry.data.
     """
-    name = get_active_tagset_name(entry, tv_id)
-    include, exclude = get_effective_tags(entry, tv_id)
-    weights = get_tag_weights(entry, tv_id)
-    wtype = get_weighting_type(entry, tv_id)
+    name = get_active_tagset_name(entry, tv_id, tagsets=tagsets)
+    include, exclude = get_effective_tags(entry, tv_id, tagsets=tagsets)
+    weights = get_tag_weights(entry, tv_id, tagsets=tagsets)
+    wtype = get_weighting_type(entry, tv_id, tagsets=tagsets)
     blob = json.dumps(
         {"name": name, "include": sorted(include), "exclude": sorted(exclude),
          "weights": weights, "wtype": wtype},

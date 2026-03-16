@@ -166,63 +166,7 @@ turn_off_tv:
       selector:
         text:
 
-# Tagset Services
-upsert_tagset:
-  name: Create/Update Tagset
-  description: Create a new global tagset or update an existing one. Tagsets are shared across all TVs. To rename, provide original_name with the old name.
-  fields:
-    name:
-      name: Tagset Name
-      description: Name for the tagset (e.g., "everyday", "holidays", "billybirthday").
-      required: true
-      selector:
-        text:
-    original_name:
-      name: Original Name (for rename)
-      description: If renaming, provide the original tagset name here. TVs using the old name will be updated.
-      required: false
-      selector:
-        text:
-    tags:
-      name: Include Tags
-      description: List of tags to include when this tagset is active.
-      required: true
-      selector:
-        object:
-    exclude_tags:
-      name: Exclude Tags
-      description: List of tags to exclude when this tagset is active.
-      required: false
-      selector:
-        object:
-    weighting_type:
-      name: Weighting Type
-      description: "How images are weighted during shuffle. 'image' = all images equally likely (default). 'tag' = tags weighted equally (or by tag_weights), then random image from selected tag."
-      required: false
-      default: "image"
-      selector:
-        select:
-          options:
-            - "image"
-            - "tag"
-    tag_weights:
-      name: Tag Weights
-      description: "Optional weights for tags (only used when weighting_type is 'tag'). Object mapping tag names to weights (0.1-10). Missing tags default to 1."
-      required: false
-      selector:
-        object:
-
-delete_tagset:
-  name: Delete Tagset
-  description: Delete a global tagset. Cannot delete a tagset that is selected or has an active override on any TV.
-  fields:
-    name:
-      name: Tagset Name
-      description: Name of the tagset to delete.
-      required: true
-      selector:
-        text:
-
+# Tagset Assignment Services (tagset definitions are managed via the Frame Art Manager add-on)
 select_tagset:
   name: Select Tagset
   description: Permanently switch which tagset a TV uses for shuffling.

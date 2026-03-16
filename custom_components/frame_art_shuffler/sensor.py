@@ -17,7 +17,6 @@ from homeassistant.helpers.restore_state import RestoreEntity
 from .config_entry import (
     get_active_tagset_name,
     get_effective_tags,
-    get_global_tagsets,
     get_tag_weights,
     get_tv_config,
     get_weighting_type,
@@ -407,9 +406,14 @@ class FrameArtTVEntity(SensorEntity):
         if not tv_config:
             return None
         
-        # Get effective tags (resolves tagsets from global tagsets)
-        include_tags, exclude_tags = get_effective_tags(self._entry, self._tv_id)
-        
+        # Read tagsets from cache (manager owns definitions; HA owns per-TV assignments)
+        entry_data = self._hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
+        tagset_cache = entry_data.get("tagset_cache")
+        tagsets = tagset_cache.get_all() if tagset_cache else {}
+
+        # Get effective tags for the active tagset
+        include_tags, exclude_tags = get_effective_tags(self._entry, self._tv_id, tagsets=tagsets)
+
         data = {
             "ip": tv_config.get("ip"),
             "mac": tv_config.get("mac"),
@@ -419,27 +423,20 @@ class FrameArtTVEntity(SensorEntity):
             "light_sensor": tv_config.get(CONF_LIGHT_SENSOR),
             "entity_picture": self.entity_picture,
         }
-        
-        # Add tagset information from GLOBAL tagsets
-        # Expose full tagset definitions so add-on can display/edit them
-        tagsets = get_global_tagsets(self._entry)
-        if tagsets:
-            # Full definitions for the UI
-            data["tagsets"] = tagsets
-            data["selected_tagset"] = tv_config.get(CONF_SELECTED_TAGSET)
-            data["override_tagset"] = tv_config.get(CONF_OVERRIDE_TAGSET)
-            data["override_expiry_time"] = tv_config.get(CONF_OVERRIDE_EXPIRY_TIME)
-            data["active_tagset"] = get_active_tagset_name(self._entry, self._tv_id)
-            
-            # Add weighting type for active tagset
-            data["weighting_type"] = get_weighting_type(self._entry, self._tv_id)
-            
-            # Add tag weights and percentages for active tagset (only relevant for tag-weighted mode)
-            tag_weights = get_tag_weights(self._entry, self._tv_id)
-            if tag_weights:
-                data["tagset_weights"] = tag_weights
-            if include_tags:
-                data["tagset_percentages"] = calculate_tag_percentages(include_tags, tag_weights)
+
+        # Add per-TV tagset assignment state
+        data["selected_tagset"] = tv_config.get(CONF_SELECTED_TAGSET)
+        data["override_tagset"] = tv_config.get(CONF_OVERRIDE_TAGSET)
+        data["override_expiry_time"] = tv_config.get(CONF_OVERRIDE_EXPIRY_TIME)
+        data["active_tagset"] = get_active_tagset_name(self._entry, self._tv_id, tagsets=tagsets)
+
+        # Add weighting type and tag weights for the active tagset
+        data["weighting_type"] = get_weighting_type(self._entry, self._tv_id, tagsets=tagsets)
+        tag_weights = get_tag_weights(self._entry, self._tv_id, tagsets=tagsets)
+        if tag_weights:
+            data["tagset_weights"] = tag_weights
+        if include_tags:
+            data["tagset_percentages"] = calculate_tag_percentages(include_tags, tag_weights)
         
         shuffle = tv_config.get("shuffle") or {}
         if isinstance(shuffle, dict):
@@ -1432,9 +1429,12 @@ class FrameArtTagsCombinedEntity(SensorEntity):
         if not tv_config:
             return None
         
-        # Use effective tags (resolves tagsets from global tagsets)
-        include_tags, exclude_tags = get_effective_tags(self._entry, self._tv_id)
-        tag_weights = get_tag_weights(self._entry, self._tv_id)
+        # Use effective tags (resolved from tagset cache)
+        entry_data = self._hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
+        tagset_cache = entry_data.get("tagset_cache")
+        tagsets = tagset_cache.get_all() if tagset_cache else {}
+        include_tags, exclude_tags = get_effective_tags(self._entry, self._tv_id, tagsets=tagsets)
+        tag_weights = get_tag_weights(self._entry, self._tv_id, tagsets=tagsets)
         
         # Check if any weight is non-default (not 1.0)
         has_custom_weights = any(
@@ -1529,7 +1529,10 @@ class FrameArtSelectedTagsetWeightingEntity(SensorEntity):
     @property
     def native_value(self) -> str | None:  # type: ignore[override]
         """Return the weighting type of the selected tagset (image or tag)."""
-        return get_weighting_type(self._entry, self._tv_id)
+        entry_data = self._hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
+        tagset_cache = entry_data.get("tagset_cache")
+        tagsets = tagset_cache.get_all() if tagset_cache else {}
+        return get_weighting_type(self._entry, self._tv_id, tagsets=tagsets)
 
     @property
     def available(self) -> bool:  # type: ignore[override]

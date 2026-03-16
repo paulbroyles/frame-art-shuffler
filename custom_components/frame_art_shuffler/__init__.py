@@ -89,6 +89,7 @@ if _HA_AVAILABLE:
     from . import frame_tv
     from .frame_tv import TOKEN_DIR as DEFAULT_TOKEN_DIR, TVConnectionManager, set_token_directory, tv_on, tv_off, set_art_mode, is_screen_on, get_tv_model_year
     from .image_cache import ImageMetadataCache
+    from .tagset_cache import TagsetCache
     from .dashboard import async_generate_dashboard
     from .activity import log_activity
     from .shuffle import async_guarded_upload, async_shuffle_tv
@@ -282,8 +283,10 @@ if _HA_AVAILABLE:
                 # Get shuffle frequency for this TV (default 60 minutes)
                 shuffle_frequency = int(tv_config.get(CONF_SHUFFLE_FREQUENCY, 60) or 60)
 
-                # Get effective tags for this TV (resolves tagset)
-                include_tags, exclude_tags = get_effective_tags(self._entry, tv_id)
+                # Get effective tags for this TV (resolves tagset from cache)
+                tagset_cache = data.get("tagset_cache")
+                tagsets = tagset_cache.get_all() if tagset_cache else {}
+                include_tags, exclude_tags = get_effective_tags(self._entry, tv_id, tagsets=tagsets)
 
                 # Calculate pool filenames
                 pool_filenames = await _async_get_pool_filenames(
@@ -355,6 +358,9 @@ if _HA_AVAILABLE:
 
         manager_url = entry.data.get("frame_art_manager_url", "http://localhost:8099")
         image_cache = ImageMetadataCache(hass, manager_url)
+        tagset_cache = TagsetCache(hass, manager_url)
+        # Non-fatal if manager unreachable at startup; sensors fall back to entry.data
+        await tagset_cache.async_refresh()
 
         art_clients = {
             tv_id: TVConnectionManager(tv_cfg["ip"])
@@ -367,6 +373,7 @@ if _HA_AVAILABLE:
             "metadata_path": metadata_path,
             "manager_url": manager_url,
             "image_cache": image_cache,
+            "tagset_cache": tagset_cache,
             "token_dir": token_dir,
             "config_snapshot": _get_structural_config(entry.data),
             "art_clients": art_clients,
@@ -380,6 +387,15 @@ if _HA_AVAILABLE:
             "auto_shuffle_next_times": {},
             "tv_model_years": {},
         }
+
+        # Migrate tagset definitions from config entry to manager (one-time).
+        # If entry.data["tagsets"] is non-empty, push each to POST /api/tagsets,
+        # then clear from config entry. Non-fatal if manager is unreachable.
+        existing_tagsets = entry.data.get("tagsets", {})
+        if existing_tagsets:
+            hass.async_create_task(
+                _async_migrate_tagsets_to_manager(hass, entry, manager_url, existing_tagsets)
+            )
 
         async def _fetch_model_years() -> None:
             """Fetch and cache model year for each TV in the background."""
@@ -1044,163 +1060,6 @@ if _HA_AVAILABLE:
                 _make_tv_invalidator(tv_id),
             )
 
-        async def async_handle_upsert_tagset(call: ServiceCall) -> None:
-            """Create or update a global tagset definition.
-            
-            Tagsets are global (not per-TV). Any TV can be assigned to use any tagset.
-            No device_id is required for this service.
-            
-            If original_name is provided and differs from name, the tagset is renamed.
-            Any TVs referencing the old name will be updated to the new name.
-            """
-            name = call.data.get("name", "").strip()
-            original_name = call.data.get("original_name", "").strip()
-            tags = call.data.get("tags", [])
-            exclude_tags = call.data.get("exclude_tags", [])
-            tag_weights = call.data.get("tag_weights", {})
-            weighting_type = call.data.get("weighting_type", "image")
-            
-            if not name:
-                raise ServiceValidationError("Tagset name is required")
-            if not tags:
-                raise ServiceValidationError("Tagset must have at least one tag")
-            if weighting_type not in ("image", "tag"):
-                raise ServiceValidationError("weighting_type must be 'image' or 'tag'")
-            
-            # Validate and clamp weights (only relevant if weighting_type is "tag")
-            validated_weights = {}
-            for tag, weight in tag_weights.items():
-                try:
-                    w = float(weight)
-                    if w < 0.1 or w > 10:
-                        _LOGGER.warning(
-                            "Weight %.2f for tag '%s' out of range, clamping to 0.1-10",
-                            w, tag
-                        )
-                        w = max(0.1, min(10.0, w))
-                    validated_weights[tag] = w
-                except (ValueError, TypeError):
-                    _LOGGER.warning(
-                        "Invalid weight '%s' for tag '%s', ignoring",
-                        weight, tag
-                    )
-            
-            # Warn about weights for tags not in the include list
-            for tag in validated_weights:
-                if tag not in tags:
-                    _LOGGER.warning(
-                        "Weight specified for tag '%s' which is not in include tags, ignoring",
-                        tag
-                    )
-            
-            # Only keep weights for tags that are in the include list
-            validated_weights = {t: w for t, w in validated_weights.items() if t in tags}
-            
-            # Get global tagsets from config entry root
-            tagsets = get_global_tagsets(entry).copy()
-            
-            # Handle rename case
-            is_rename = original_name and original_name != name and original_name in tagsets
-            if is_rename:
-                # Check if new name already exists
-                if name in tagsets:
-                    raise ServiceValidationError(f"Cannot rename: tagset '{name}' already exists")
-                
-                # Remove old tagset
-                del tagsets[original_name]
-                
-                # Update any TVs that reference the old name
-                tvs = list_tv_configs(entry)
-                for tv_id, tv_config in tvs.items():
-                    updates = {}
-                    if tv_config.get(CONF_SELECTED_TAGSET) == original_name:
-                        updates[CONF_SELECTED_TAGSET] = name
-                    if tv_config.get(CONF_OVERRIDE_TAGSET) == original_name:
-                        updates[CONF_OVERRIDE_TAGSET] = name
-                    if updates:
-                        update_tv_config(hass, entry, tv_id, updates)
-                
-                _LOGGER.info(f"Renamed tagset '{original_name}' to '{name}'")
-            
-            is_new = name not in tagsets and not is_rename
-            tagset_data = {
-                "tags": tags,
-                "exclude_tags": exclude_tags,
-                "weighting_type": weighting_type,
-            }
-            # Only store tag_weights if there are any non-default weights
-            # (tag_weights are only used when weighting_type is "tag")
-            if validated_weights:
-                tagset_data["tag_weights"] = validated_weights
-            
-            tagsets[name] = tagset_data
-            
-            update_global_tagsets(hass, entry, tagsets)
-            
-            if is_rename:
-                action = "renamed"
-                msg = f"Global tagset '{original_name}' renamed to '{name}'"
-            elif is_new:
-                action = "created"
-                msg = f"Global tagset '{name}' created"
-            else:
-                action = "updated"
-                msg = f"Global tagset '{name}' updated"
-            
-            _LOGGER.info(msg)
-            log_activity(
-                hass, entry.entry_id, None,
-                f"tagset_{action}",
-                msg,
-            )
-            # Signal all TVs to refresh since tagset content may have changed
-            async_dispatcher_send(hass, f"{DOMAIN}_tagset_updated_{entry.entry_id}")
-
-        async def async_handle_delete_tagset(call: ServiceCall) -> None:
-            """Delete a global tagset definition.
-            
-            Cannot delete a tagset that is currently selected or overridden by any TV.
-            """
-            name = call.data.get("name", "").strip()
-            if not name:
-                raise ServiceValidationError("Tagset name is required")
-            
-            tagsets = get_global_tagsets(entry).copy()
-            
-            if name not in tagsets:
-                raise ServiceValidationError(f"Tagset '{name}' not found")
-            
-            if len(tagsets) <= 1:
-                raise ServiceValidationError("Cannot delete the only tagset")
-            
-            # Check if any TV is using this tagset
-            for tv_id, tv_config in list_tv_configs(entry).items():
-                tv_name = tv_config.get("name", tv_id)
-                selected = tv_config.get(CONF_SELECTED_TAGSET)
-                if name == selected:
-                    raise ServiceValidationError(
-                        f"Cannot delete tagset '{name}': selected by {tv_name}. "
-                        "Select a different tagset for that TV first."
-                    )
-                
-                override = tv_config.get(CONF_OVERRIDE_TAGSET)
-                if name == override:
-                    raise ServiceValidationError(
-                        f"Cannot delete tagset '{name}': active override on {tv_name}. "
-                        "Clear the override first."
-                    )
-            
-            del tagsets[name]
-            update_global_tagsets(hass, entry, tagsets)
-            
-            _LOGGER.info(f"Global tagset '{name}' deleted")
-            log_activity(
-                hass, entry.entry_id, None,
-                "tagset_deleted",
-                f"Global tagset '{name}' deleted",
-            )
-            async_dispatcher_send(hass, f"{DOMAIN}_tagset_updated_{entry.entry_id}")
-
         async def async_handle_select_tagset(call: ServiceCall) -> None:
             """Permanently switch which tagset a TV uses.
             
@@ -1213,12 +1072,13 @@ if _HA_AVAILABLE:
                 raise ServiceValidationError("Tagset name is required")
             
             tv_name = tv_data.get("name", tv_id)
-            
-            # Check global tagsets
-            tagsets = get_global_tagsets(target_entry)
+
+            # Validate tagset exists in cache (manager owns definitions)
+            tagset_cache = hass.data.get(DOMAIN, {}).get(target_entry.entry_id, {}).get("tagset_cache")
+            tagsets = tagset_cache.get_all() if tagset_cache else get_global_tagsets(target_entry)
             if name not in tagsets:
                 raise ServiceValidationError(f"Tagset '{name}' not found")
-            
+
             update_tv_config(hass, target_entry, tv_id, {CONF_SELECTED_TAGSET: name})
             
             _LOGGER.info(f"Selected tagset '{name}' for {tv_name}")
@@ -1227,6 +1087,8 @@ if _HA_AVAILABLE:
                 "tagset_selected",
                 f"Selected tagset '{name}'",
             )
+            if tagset_cache:
+                await tagset_cache.async_refresh()
             async_dispatcher_send(hass, f"{DOMAIN}_tagset_updated_{target_entry.entry_id}_{tv_id}")
 
         async def async_handle_override_tagset(call: ServiceCall) -> None:
@@ -1245,12 +1107,13 @@ if _HA_AVAILABLE:
                 raise ServiceValidationError("duration_minutes is required and must be > 0")
             
             tv_name = tv_data.get("name", tv_id)
-            
-            # Check global tagsets
-            tagsets = get_global_tagsets(target_entry)
+
+            # Validate tagset exists in cache (manager owns definitions)
+            tagset_cache = hass.data.get(DOMAIN, {}).get(target_entry.entry_id, {}).get("tagset_cache")
+            tagsets = tagset_cache.get_all() if tagset_cache else get_global_tagsets(target_entry)
             if name not in tagsets:
                 raise ServiceValidationError(f"Tagset '{name}' not found")
-            
+
             expiry_time = datetime.now(timezone.utc) + timedelta(minutes=duration_minutes)
             
             update_tv_config(hass, target_entry, tv_id, {
@@ -1296,19 +1159,7 @@ if _HA_AVAILABLE:
                 )
             async_dispatcher_send(hass, f"{DOMAIN}_tagset_updated_{target_entry.entry_id}_{tv_id}")
 
-        # Register tagset services
-        hass.services.async_register(
-            DOMAIN,
-            "upsert_tagset",
-            async_handle_upsert_tagset,
-        )
-
-        hass.services.async_register(
-            DOMAIN,
-            "delete_tagset",
-            async_handle_delete_tagset,
-        )
-
+        # Register tagset assignment services
         hass.services.async_register(
             DOMAIN,
             "select_tagset",
@@ -2419,6 +2270,58 @@ if _HA_AVAILABLE:
             len(global_tagsets)
         )
 
+
+    async def _async_migrate_tagsets_to_manager(
+        hass: Any,
+        entry: Any,
+        manager_url: str,
+        tagsets: dict[str, Any],
+    ) -> None:
+        """Push existing tagset definitions to the manager add-on, then clear from config entry.
+
+        Runs once at startup when entry.data["tagsets"] is non-empty.
+        Non-fatal: if the manager is unreachable, tagsets stay in config entry
+        and the migration retries on next HA restart.
+        """
+        from homeassistant.helpers.aiohttp_client import async_get_clientsession
+        import aiohttp
+
+        session = async_get_clientsession(hass)
+        url = f"{manager_url.rstrip('/')}/api/tagsets"
+        pushed = []
+
+        for name, defn in tagsets.items():
+            payload = {
+                "name": name,
+                "tags": defn.get("tags", []),
+                "exclude_tags": defn.get("exclude_tags", []),
+                "weighting_type": defn.get("weighting_type", "image"),
+                "tag_weights": defn.get("tag_weights", {}),
+            }
+            try:
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status in (200, 201, 409):
+                        # 409 = already exists, that's fine
+                        pushed.append(name)
+                    else:
+                        _LOGGER.warning(
+                            "tagset migration: failed to push '%s' (status %s)", name, resp.status
+                        )
+            except Exception as err:
+                _LOGGER.warning("tagset migration: error pushing '%s': %s", name, err)
+
+        if len(pushed) == len(tagsets):
+            _LOGGER.info(
+                "tagset migration: pushed %d tagset(s) to manager, clearing from config entry",
+                len(pushed),
+            )
+            update_global_tagsets(hass, entry, {})
+        else:
+            _LOGGER.warning(
+                "tagset migration: only pushed %d/%d tagsets — will retry on next restart",
+                len(pushed),
+                len(tagsets),
+            )
 
     @callback
     def _register_device_removal_listener(
