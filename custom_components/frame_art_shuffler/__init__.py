@@ -413,11 +413,17 @@ if _HA_AVAILABLE:
             tv_name = tv_config.get("name", tv_id)
             tv_slug = re.sub(r'[^a-z0-9]+', '-', tv_name.lower()).strip('-')
 
-            relative_path = f"/api/hassio/app/local_frame_art_manager/artwork/{tv_slug}"
+            # Use the stable HA device ID (UUID) for the URL, not the mutable slug
+            from homeassistant.helpers import device_registry as dr
+            registry = dr.async_get(self._hass)
+            device = registry.async_get_device(identifiers={(DOMAIN, tv_id)})
+            ha_device_id = device.id if device else tv_slug
+
+            relative_path = f"/api/hassio/app/local_frame_art_manager/artwork/{ha_device_id}"
             internal_url = self._hass.config.internal_url
             full_url = f"{internal_url.rstrip('/')}{relative_path}" if internal_url else relative_path
 
-            qr_url = f"{manager_url.rstrip('/')}/artwork/{tv_slug}/qr?url={quote(full_url, safe='')}"
+            qr_url = f"{manager_url.rstrip('/')}/artwork/{ha_device_id}/qr?url={quote(full_url, safe='')}"
 
             session = async_get_clientsession(self._hass)
             try:

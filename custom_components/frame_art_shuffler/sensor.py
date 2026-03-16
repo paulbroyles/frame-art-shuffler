@@ -11,6 +11,7 @@ from homeassistant.components.sensor import SensorEntity, SensorEntityDescriptio
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_NAME, EntityCategory
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.restore_state import RestoreEntity
@@ -1715,8 +1716,15 @@ class FrameArtArtworkPageUrlSensor(SensorEntity):
 
     @property
     def native_value(self) -> str:
-        """Relative Ingress path to this TV's artwork page in the manager."""
-        return f"/api/hassio/app/local_frame_art_manager/artwork/{self._tv_slug}"
+        """Relative Ingress path to this TV's artwork page in the manager.
+
+        Uses the HA device registry ID (stable UUID) so the URL remains valid
+        even if the TV is renamed.
+        """
+        registry = dr.async_get(self._hass)
+        device = registry.async_get_device(identifiers={(DOMAIN, self._tv_id)})
+        device_id = device.id if device else self._tv_slug
+        return f"/api/hassio/app/local_frame_art_manager/artwork/{device_id}"
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
