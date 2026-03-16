@@ -99,7 +99,7 @@ action:
         {% if creator_name %}
           {% set ns.items = ns.items + [
             {"type": "text", "x": margin, "y": 12,
-             "text": creator_name | upper, "size": 3, "color": "black"}
+             "value": creator_name | upper, "size": 3, "color": "black"}
           ] %}
         {% endif %}
 
@@ -112,7 +112,7 @@ action:
         {% if bio %}
           {% set ns.items = ns.items + [
             {"type": "text", "x": margin, "y": 38,
-             "text": bio, "size": 2, "color": "black"}
+             "value": bio, "size": 2, "color": "black"}
           ] %}
         {% endif %}
 
@@ -124,7 +124,7 @@ action:
         {% if title_line %}
           {% set ns.items = ns.items + [
             {"type": "text", "x": margin, "y": 62,
-             "text": title_line, "size": 2, "color": "red"}
+             "value": title_line, "size": 2, "color": "red"}
           ] %}
         {% endif %}
 
@@ -132,7 +132,7 @@ action:
         {% if medium %}
           {% set ns.items = ns.items + [
             {"type": "text", "x": margin, "y": 84,
-             "text": medium, "size": 2, "color": "black"}
+             "value": medium, "size": 2, "color": "black"}
           ] %}
         {% endif %}
 
@@ -140,7 +140,7 @@ action:
         {% if museum %}
           {% set ns.items = ns.items + [
             {"type": "text", "x": margin, "y": 106,
-             "text": museum, "size": 2, "color": "black"}
+             "value": museum, "size": 2, "color": "black"}
           ] %}
         {% endif %}
 
@@ -149,7 +149,7 @@ action:
         {% if description %}
           {% set ns.items = ns.items + [
             {"type": "multiline", "x": margin, "y": qr_y,
-             "text": description, "size": 1,
+             "value": description, "size": 1,
              "width": (qr_x - margin * 2) | int, "color": "black"}
           ] %}
         {% endif %}
