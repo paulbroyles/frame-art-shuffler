@@ -330,7 +330,7 @@ if _HA_AVAILABLE:
 
         url = "/api/frame_art_shuffler/image/{filename}"
         name = "api:frame_art_shuffler:image"
-        requires_auth = True
+        requires_auth = False  # img src requests don't carry auth headers; images are non-sensitive
 
         def __init__(self, hass: Any, entry: Any) -> None:
             self._hass = hass
