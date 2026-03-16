@@ -27,15 +27,12 @@ blueprint:
       selector:
         entity:
           domain: sensor
-    oel_entity:
-      name: OpenEpaperLink Display Entity
-      description: >
-        Any sensor entity belonging to the e-paper display (e.g.
-        sensor.*_battery or sensor.*_temperature). Used to target the
-        drawcustom service call.
+    oel_device:
+      name: OpenEpaperLink Display
+      description: The e-paper display device to update.
       selector:
-        entity:
-          domain: sensor
+        device:
+          integration: open_epaper_link
     display_width:
       name: Display Width (px)
       description: Pixel width of your display. Default 400 for 4.2".
@@ -87,7 +84,7 @@ action:
 
   - service: open_epaper_link.drawcustom
     target:
-      entity_id: !input oel_entity
+      device_id: !input oel_device
     data:
       background: white
       rotate: 0
