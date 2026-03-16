@@ -169,7 +169,7 @@ action:
               background: white
               rotate: 0
               refresh_type: "{{ {'Full': 0, 'Fast': 1, 'Partial': 2, 'Partial2': 3}[refresh_type] | default(0) }}"
-              payload: "{{ oel_response.payload | to_json }}"
+              payload: "{{ oel_response.payload }}"
           - stop: "Server-side layout rendered successfully"
 
   # ── Jinja2 fallback layout ────────────────────────────────────────────────
