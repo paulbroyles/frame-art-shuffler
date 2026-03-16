@@ -2106,6 +2106,81 @@ if _HA_AVAILABLE:
             if tv_config.get("enable_motion_control", False):
                 start_motion_listener(tv_id)
 
+        # ── generate_oel_payload service ────────────────────────────────────
+        # Calls the Frame Art Manager's /api/oel endpoint to produce a
+        # pixel-accurate OEL drawcustom payload using real font metrics.
+        # Returns {"payload": [...], "debug": {...}} for use with response_variable.
+
+        async def async_handle_generate_oel_payload(call: ServiceCall) -> dict[str, Any]:
+            """Call the manager's layout engine and return an OEL payload."""
+            from homeassistant.helpers.aiohttp_client import async_get_clientsession
+            import aiohttp as _aiohttp
+
+            manager_url: str = call.data.get("manager_url", "").rstrip("/")
+            if not manager_url:
+                # Fall back to integration-stored manager URL
+                manager_url = (
+                    hass.data[DOMAIN][entry.entry_id].get("manager_url", "")
+                    .rstrip("/")
+                )
+            if not manager_url:
+                raise ServiceValidationError(
+                    "No manager URL available. Set manager_url in the service call "
+                    "or configure Frame Art Manager URL in the integration settings."
+                )
+
+            sensor_entity_id: str = call.data.get("sensor_entity_id", "")
+            state = hass.states.get(sensor_entity_id) if sensor_entity_id else None
+            attrs: dict[str, Any] = dict(state.attributes) if state else {}
+
+            metadata = {
+                "creator_name":        attrs.get("creator_name", ""),
+                "creator_nationality": attrs.get("creator_nationality", ""),
+                "creator_lifespan":    attrs.get("creator_lifespan", ""),
+                "title":               attrs.get("title", ""),
+                "date":                attrs.get("date", ""),
+                "medium":              attrs.get("medium", ""),
+                "dimensions":          attrs.get("dimensions", ""),
+                "museum":              attrs.get("museum", ""),
+                "description":         attrs.get("description", ""),
+                "artwork_url":         call.data.get("artwork_url", ""),
+            }
+
+            body = {
+                "metadata":     metadata,
+                "display":      {
+                    "width":  call.data.get("display_width",  400),
+                    "height": call.data.get("display_height", 300),
+                },
+                "refresh_type": call.data.get("refresh_type", "Full"),
+                "template":     call.data.get("template", "museum_placard"),
+            }
+
+            session = async_get_clientsession(hass)
+            try:
+                async with session.post(
+                    f"{manager_url}/api/oel",
+                    json=body,
+                    timeout=_aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        raise ServiceValidationError(
+                            f"Manager returned HTTP {resp.status}: {text[:200]}"
+                        )
+                    return await resp.json()
+            except _aiohttp.ClientError as err:
+                raise ServiceValidationError(
+                    f"Could not reach Frame Art Manager at {manager_url}: {err}"
+                ) from err
+
+        hass.services.async_register(
+            DOMAIN,
+            "generate_oel_payload",
+            async_handle_generate_oel_payload,
+            supports_response=SupportsResponse.ONLY,
+        )
+
         # Generate and register the Lovelace dashboard
         await _async_setup_dashboard(hass, entry)
 

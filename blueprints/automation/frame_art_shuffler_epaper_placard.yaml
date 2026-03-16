@@ -7,7 +7,12 @@ blueprint:
     and a QR code linking to the full artwork info page.
 
     Tuned for a 4.2" 400×300 three-color (black/white/red) display.
-    Adjust font sizes and y-positions in the payload for other display sizes.
+
+    Server-side layout (recommended): Set the Frame Art Manager URL to enable
+    pixel-accurate text measurement using real font metrics (Playfair Display,
+    Roboto). Fonts are automatically installed to /config/www/fonts/ on first
+    use. If the manager URL is left empty the blueprint falls back to a static
+    Jinja2 layout.
 
     After updating this blueprint, reload automations in HA
     (Developer Tools → YAML → Reload Automations) for changes to take effect.
@@ -37,6 +42,16 @@ blueprint:
         Internal URL of your HA instance (e.g. http://homeassistant.local:8123
         or http://192.168.1.x:8123). Only needed if the Artwork Page URL sensor
         does not have a full_url attribute. Leave blank if full_url is present.
+      default: ""
+      selector:
+        text:
+    manager_url:
+      name: Frame Art Manager URL (for server-side layout)
+      description: >
+        Base URL of the Frame Art Manager add-on API. When set, uses
+        server-side font metrics for accurate text layout with nicer fonts.
+        Typically http://homeassistant.local:8099 or http://localhost:8099.
+        Leave empty to use the built-in Jinja2 layout instead.
       default: ""
       selector:
         text:
@@ -85,6 +100,7 @@ variables:
   artwork_sensor: !input artwork_sensor
   page_url_sensor: !input page_url_sensor
   ha_base_url: !input ha_base_url
+  manager_url: !input manager_url
   display_width: !input display_width
   display_height: !input display_height
   refresh_type: !input refresh_type
@@ -122,7 +138,45 @@ action:
           {{ '' }}
         {% endif %}
 
-  - service: open_epaper_link.drawcustom
+  # ── Server-side layout (when manager_url is configured) ──────────────────
+  # Calls the manager's layout engine for pixel-accurate font measurement.
+  # If this succeeds, the response payload is used directly.
+  # If it fails or manager_url is empty, the Jinja2 fallback below is used.
+
+  - if:
+      - condition: template
+        value_template: "{{ manager_url | default('') | trim != '' }}"
+    then:
+      - action: frame_art_shuffler.generate_oel_payload
+        data:
+          sensor_entity_id: !input artwork_sensor
+          artwork_url: "{{ artwork_url }}"
+          display_width: !input display_width
+          display_height: !input display_height
+          refresh_type: !input refresh_type
+          manager_url: !input manager_url
+        response_variable: oel_response
+        continue_on_error: true
+
+      - if:
+          - condition: template
+            value_template: "{{ oel_response is defined and oel_response.payload is defined }}"
+        then:
+          - action: open_epaper_link.drawcustom
+            target:
+              device_id: !input oel_device
+            data:
+              background: white
+              rotate: 0
+              refresh_type: "{{ {'Full': 0, 'Fast': 1, 'Partial': 2, 'Partial2': 3}[refresh_type] | default(0) }}"
+              payload: "{{ oel_response.payload | to_json }}"
+          - stop: "Server-side layout rendered successfully"
+
+  # ── Jinja2 fallback layout ────────────────────────────────────────────────
+  # Used when manager_url is empty or the server-side call failed.
+  # Uses a char-count heuristic for text wrapping (approximate).
+
+  - action: open_epaper_link.drawcustom
     target:
       device_id: !input oel_device
     data:
@@ -167,15 +221,15 @@ action:
           ] %}
         {% endif %}
 
-        {# ── Title (multiline for long titles; red on Full refresh) ─────── #}
+        {# ── Title (wrapped; red on Full refresh) ─────────────────────── #}
         {# Estimate lines at size 22 (~13 px/char) to position year below. #}
         {% if title %}
           {% set cpl = (content_width / 13) | int %}
           {% set ns.t_lines = [((title | length) / cpl) | round(0, 'ceil') | int, 1] | max %}
           {% set ns.items = ns.items + [
-            {"type": "multiline", "x": margin, "y": 84,
-             "value": title, "size": 22, "offset_y": 26,
-             "delimiter": " ", "width": content_width | int,
+            {"type": "text", "x": margin, "y": 84,
+             "value": title, "size": 22,
+             "max_width": content_width | int, "spacing": 4,
              "color": title_color}
           ] %}
         {% endif %}
@@ -213,22 +267,22 @@ action:
           ] %}
         {% endif %}
 
-        {# ── Description (bottom-left, beside QR, truncated to ~2 lines) ─ #}
+        {# ── Description (bottom-left, beside QR) ─────────────────────── #}
         {% if description %}
           {% set desc_text = description | truncate(180, True, '...') %}
           {% set ns.items = ns.items + [
-            {"type": "multiline", "x": margin, "y": qr_y,
-             "value": desc_text, "size": 13, "offset_y": 15,
-             "delimiter": " ", "width": (qr_x - margin * 2) | int,
+            {"type": "text", "x": margin, "y": qr_y,
+             "value": desc_text, "size": 13,
+             "max_width": (qr_x - margin * 2) | int, "spacing": 2,
              "color": "black"}
           ] %}
         {% endif %}
 
-        {# ── QR code (bottom-right corner, native OEL qrcode type) ─────── #}
+        {# ── QR code (bottom-right corner) ────────────────────────────── #}
         {% if artwork_url %}
           {% set ns.items = ns.items + [
             {"type": "qrcode", "x": qr_x, "y": qr_y,
-             "data": artwork_url, "size": qr_size, "color": "black"}
+             "data": artwork_url, "boxsize": 2, "border": 1, "color": "black"}
           ] %}
         {% endif %}
 
