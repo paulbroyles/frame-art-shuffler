@@ -2113,7 +2113,9 @@ if _HA_AVAILABLE:
 
         async def async_handle_generate_oel_payload(call: ServiceCall) -> dict[str, Any]:
             """Call the manager's layout engine and return an OEL payload."""
+            import html as _html
             from homeassistant.helpers.aiohttp_client import async_get_clientsession
+            from homeassistant.helpers import entity_registry as er
             import aiohttp as _aiohttp
 
             manager_url: str = call.data.get("manager_url", "").rstrip("/")
@@ -2133,17 +2135,29 @@ if _HA_AVAILABLE:
             state = hass.states.get(sensor_entity_id) if sensor_entity_id else None
             attrs: dict[str, Any] = dict(state.attributes) if state else {}
 
+            # Build the artwork URL using the manager's direct port (no HA auth
+            # required), so QR codes can be scanned without being logged into HA.
+            artwork_url = call.data.get("artwork_url", "")
+            ent_reg = er.async_get(hass)
+            ent_entry = ent_reg.async_get(sensor_entity_id) if sensor_entity_id else None
+            if ent_entry and ent_entry.device_id and manager_url:
+                artwork_url = f"{manager_url}/artwork/{ent_entry.device_id}"
+
+            def _clean(val: Any) -> str:
+                """Strip HTML entities from a metadata string value."""
+                return _html.unescape(str(val)) if val else ""
+
             metadata = {
-                "creator_name":        attrs.get("creator_name", ""),
-                "creator_nationality": attrs.get("creator_nationality", ""),
-                "creator_lifespan":    attrs.get("creator_lifespan", ""),
-                "title":               attrs.get("title", ""),
-                "date":                attrs.get("date", ""),
-                "medium":              attrs.get("medium", ""),
-                "dimensions":          attrs.get("dimensions", ""),
-                "museum":              attrs.get("museum", ""),
-                "description":         attrs.get("description", ""),
-                "artwork_url":         call.data.get("artwork_url", ""),
+                "creator_name":        _clean(attrs.get("creator_name", "")),
+                "creator_nationality": _clean(attrs.get("creator_nationality", "")),
+                "creator_lifespan":    _clean(attrs.get("creator_lifespan", "")),
+                "title":               _clean(attrs.get("title", "")),
+                "date":                _clean(attrs.get("date", "")),
+                "medium":              _clean(attrs.get("medium", "")),
+                "dimensions":          _clean(attrs.get("dimensions", "")),
+                "museum":              _clean(attrs.get("museum", "")),
+                "description":         _clean(attrs.get("description", "")),
+                "artwork_url":         artwork_url,
             }
 
             body = {
