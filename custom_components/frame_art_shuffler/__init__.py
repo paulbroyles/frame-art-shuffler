@@ -414,6 +414,9 @@ if _HA_AVAILABLE:
         await display_log.async_setup()
         hass.data[DOMAIN][entry.entry_id]["display_log"] = display_log
 
+        # Remove stale entities that were merged/removed in prior versions
+        _async_remove_stale_entities(hass, entry)
+
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
         entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
 
@@ -2160,6 +2163,24 @@ if _HA_AVAILABLE:
             data = {**entry.data, "tvs": tvs}
             hass.config_entries.async_update_entry(entry, data=data)
 
+
+    def _async_remove_stale_entities(hass: Any, entry: Any) -> None:
+        """Remove entity registry entries for entities removed in prior versions.
+
+        Called once at setup; idempotent — silently skips entries that don't exist.
+        """
+        entity_registry = er.async_get(hass)
+        tv_ids = list(entry.data.get("tvs", {}).keys())
+        # Entities removed in v1.x entity audit (merged into single buttons)
+        stale_unique_ids = (
+            [(tv_id, "button", f"{tv_id}_on_art_mode") for tv_id in tv_ids]
+            + [(tv_id, "button", f"{tv_id}_shuffle_silent") for tv_id in tv_ids]
+        )
+        for _tv_id, platform, unique_id in stale_unique_ids:
+            entity_id = entity_registry.async_get_entity_id(platform, DOMAIN, unique_id)
+            if entity_id:
+                _LOGGER.debug("Removing stale entity %s (unique_id: %s)", entity_id, unique_id)
+                entity_registry.async_remove(entity_id)
 
     async def _async_migrate_motion_sensors(hass: Any, entry: Any) -> None:
         """Migrate motion_sensor (singular string) to motion_sensors (list).
