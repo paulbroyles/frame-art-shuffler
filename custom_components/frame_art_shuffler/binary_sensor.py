@@ -171,14 +171,11 @@ async def async_setup_entry(
                                 current_image = tv_config.get("current_image")
                             
                             if current_image:
-                                # Try to get image tags from metadata
-                                metadata_path = data.get("metadata_path")
                                 image_tags: list[str] = []
-                                if metadata_path:
+                                image_cache = data.get("image_cache")
+                                if image_cache:
                                     try:
-                                        from .metadata import MetadataStore
-                                        store = MetadataStore(metadata_path)
-                                        image_meta = store.get_image(current_image)
+                                        image_meta = await image_cache.get_image(current_image)
                                         if image_meta:
                                             image_tags = list(image_meta.get("tags", []))
                                     except Exception:

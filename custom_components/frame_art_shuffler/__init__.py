@@ -88,7 +88,7 @@ if _HA_AVAILABLE:
     from .config_entry import get_tv_config, get_global_tagsets, list_tv_configs, remove_tv_config, update_tv_config, update_global_tagsets, get_effective_tags
     from . import frame_tv
     from .frame_tv import TOKEN_DIR as DEFAULT_TOKEN_DIR, TVConnectionManager, set_token_directory, tv_on, tv_off, set_art_mode, is_screen_on, get_tv_model_year
-    from .metadata import MetadataStore
+    from .image_cache import ImageMetadataCache
     from .dashboard import async_generate_dashboard
     from .activity import log_activity
     from .shuffle import async_guarded_upload, async_shuffle_tv
@@ -157,47 +157,39 @@ if _HA_AVAILABLE:
         return structural
 
 
-    def _calculate_pool_filenames(
-        metadata_path: Path,
+    async def _async_get_pool_filenames(
+        hass: Any,
+        manager_url: str,
         include_tags: list[str],
         exclude_tags: list[str],
     ) -> set[str]:
-        """Calculate the set of filenames in a TV's eligible pool based on tags.
+        """Fetch the set of eligible pool filenames from the manager add-on.
 
-        Args:
-            metadata_path: Path to metadata.json
-            include_tags: Tags that images must have at least one of
-            exclude_tags: Tags that images must not have any of
-
-        Returns:
-            Set of eligible filenames
+        Calls GET /api/shuffle/pool-filenames with tag filters.
+        Returns an empty set on failure.
         """
-        import json
+        from homeassistant.helpers.aiohttp_client import async_get_clientsession
+        import asyncio
 
         try:
-            with open(metadata_path, "r", encoding="utf-8") as f:
-                metadata = json.load(f)
-        except (OSError, json.JSONDecodeError) as err:
-            _LOGGER.warning(f"Failed to read metadata for pool calculation: {err}")
-            return set()
-
-        images = metadata.get("images", {})
-        pool: set[str] = set()
-
-        for filename, image_data in images.items():
-            image_tags = set(image_data.get("tags", []))
-
-            # Must have at least one include tag (if include_tags is specified)
-            if include_tags and not any(tag in image_tags for tag in include_tags):
-                continue
-
-            # Must not have any exclude tag
-            if exclude_tags and any(tag in image_tags for tag in exclude_tags):
-                continue
-
-            pool.add(filename)
-
-        return pool
+            session = async_get_clientsession(hass)
+            params: dict[str, str] = {}
+            if include_tags:
+                params["includeTags"] = ",".join(include_tags)
+            if exclude_tags:
+                params["excludeTags"] = ",".join(exclude_tags)
+            url = f"{manager_url.rstrip('/')}/api/shuffle/pool-filenames"
+            async with asyncio.timeout(10):
+                async with session.get(url, params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return set(data.get("filenames", []))
+                    _LOGGER.warning(
+                        "pool-filenames: unexpected status %s", resp.status
+                    )
+        except Exception as err:
+            _LOGGER.warning("pool-filenames: API error: %s", err)
+        return set()
 
 
     # Default recency window settings (in hours)
@@ -249,11 +241,11 @@ if _HA_AVAILABLE:
                 )
 
             display_log = data.get("display_log")
-            metadata_path = data.get("metadata_path")
+            manager_url = data.get("manager_url")
 
-            if not display_log or not metadata_path:
+            if not display_log or not manager_url:
                 return web.json_response(
-                    {"error": "Display log or metadata not available"},
+                    {"error": "Display log or manager URL not available"},
                     status=500,
                 )
 
@@ -294,9 +286,9 @@ if _HA_AVAILABLE:
                 include_tags, exclude_tags = get_effective_tags(self._entry, tv_id)
 
                 # Calculate pool filenames
-                pool_filenames = await self._hass.async_add_executor_job(
-                    _calculate_pool_filenames,
-                    metadata_path,
+                pool_filenames = await _async_get_pool_filenames(
+                    self._hass,
+                    manager_url,
                     include_tags,
                     exclude_tags,
                 )
@@ -358,8 +350,11 @@ if _HA_AVAILABLE:
             data = {**entry.data, "tagsets": {}}
             hass.config_entries.async_update_entry(entry, data=data)
 
-        coordinator = FrameArtCoordinator(hass, entry, metadata_path)
+        coordinator = FrameArtCoordinator(hass, entry)
         await coordinator.async_config_entry_first_refresh()
+
+        manager_url = entry.data.get("frame_art_manager_url", "http://localhost:8099")
+        image_cache = ImageMetadataCache(hass, manager_url)
 
         art_clients = {
             tv_id: TVConnectionManager(tv_cfg["ip"])
@@ -370,6 +365,8 @@ if _HA_AVAILABLE:
         hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
             "coordinator": coordinator,
             "metadata_path": metadata_path,
+            "manager_url": manager_url,
+            "image_cache": image_cache,
             "token_dir": token_dir,
             "config_snapshot": _get_structural_config(entry.data),
             "art_clients": art_clients,
@@ -453,15 +450,14 @@ if _HA_AVAILABLE:
             async_track_time_interval(hass, _poll_artwork_changes, _ARTWORK_POLL_INTERVAL)
         )
 
-        def _get_image_tags(data: dict, filename: str | None) -> list[str]:
-            """Look up image tags from metadata.json."""
+        async def _async_get_image_tags(data: dict, filename: str | None) -> list[str]:
+            """Look up image tags from the manager add-on."""
             if not filename:
                 return []
             try:
-                metadata_path = data.get("metadata_path")
-                if metadata_path:
-                    store = MetadataStore(metadata_path)
-                    image_meta = store.get_image(filename)
+                cache: ImageMetadataCache = data.get("image_cache")
+                if cache:
+                    image_meta = await cache.get_image(filename)
                     if image_meta:
                         return list(image_meta.get("tags", []))
             except Exception:
@@ -566,7 +562,7 @@ if _HA_AVAILABLE:
                             artwork_sensor.set_artwork(content_id, artwork_metadata, source_type="web_source")
                         else:
                             meta: dict = {}
-                            tags = _get_image_tags(data, filename)
+                            tags = await _async_get_image_tags(data, filename)
                             if filename:
                                 meta = {"filename": filename, "tags": tags}
                             if not meta:
@@ -587,7 +583,7 @@ if _HA_AVAILABLE:
                     # Update display log
                     display_log = data.get("display_log")
                     if display_log and filename:
-                        image_tags = _get_image_tags(data, filename)
+                        image_tags = await _async_get_image_tags(data, filename)
                         display_log.note_display_start(
                             tv_id=tv_id,
                             tv_name=tv_name,
@@ -843,18 +839,7 @@ if _HA_AVAILABLE:
                         current_image = tv_config.get("current_image") if tv_config else None
                     
                     if current_image:
-                        # Try to get image tags from metadata
-                        metadata_path = data.get("metadata_path")
-                        image_tags: list[str] = []
-                        if metadata_path:
-                            try:
-                                from .metadata import MetadataStore
-                                store = MetadataStore(metadata_path)
-                                image_meta = store.get_image(current_image)
-                                if image_meta:
-                                    image_tags = list(image_meta.get("tags", []))
-                            except Exception:
-                                pass
+                        image_tags = await _async_get_image_tags(data, current_image)
                         
                         # Get TV's configured tags for matched_tags computation
                         tv_tags = tv_config.get("include_tags") if tv_config else None
@@ -2281,10 +2266,17 @@ if _HA_AVAILABLE:
         metadata_path: Path,
     ) -> None:
         """One-time migration: import TV data from metadata.json into config entry."""
-        store = MetadataStore(metadata_path)
+        import json
+
+        def _read_tvs() -> list:
+            try:
+                with open(metadata_path, "r", encoding="utf-8") as f:
+                    return json.load(f).get("tvs", [])
+            except Exception:
+                return []
 
         try:
-            metadata_tvs = await hass.async_add_executor_job(store.list_tvs)
+            metadata_tvs = await hass.async_add_executor_job(_read_tvs)
         except Exception:
             # metadata.json might not exist yet or be empty
             return
@@ -2463,12 +2455,11 @@ if _HA_AVAILABLE:
 
             # Remove from metadata
             async def _remove_tv():
-                store = MetadataStore(metadata_path)
                 token_dir = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("token_dir")
                 try:
-                    # Get TV data before removing to find token file
-                    tv_data = await hass.async_add_executor_job(store.get_tv, tv_id)
-                    tv_ip = tv_data.get("ip") if tv_data else None
+                    # Get TV IP from config entry for token file deletion
+                    tv_cfg = get_tv_config(entry, tv_id)
+                    tv_ip = tv_cfg.get("ip") if tv_cfg else None
 
                     # Remove from config entry
                     remove_tv_config(hass, entry, tv_id)

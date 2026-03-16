@@ -9,9 +9,7 @@ run overlapping transfers for the same device.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import random
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -39,27 +37,6 @@ from .frame_tv import (
 )
 
 _LOGGER = logging.getLogger(__name__)
-
-# Virtual tag representing web sources in the shuffle system.
-# Images never carry this tag; it is injected into tagsets at the UI level.
-# When selected during shuffle, the add-on API is called to display a web image.
-WEB_SOURCES_VIRTUAL_TAG = "web_sources"
-
-# Prefix for specific virtual web source tags (e.g. "ws:paintings").
-# The part after the prefix is the add-on's virtual tag ID.
-WS_TAG_PREFIX = "ws:"
-
-
-def is_virtual_web_tag(tag: str) -> bool:
-    """Return True if tag is any virtual web source tag (umbrella or specific)."""
-    return tag == WEB_SOURCES_VIRTUAL_TAG or tag.startswith(WS_TAG_PREFIX)
-
-
-def get_virtual_tag_id(tag: str) -> str | None:
-    """Extract the add-on virtual tag ID from a ws: prefixed tag, or None for umbrella."""
-    if tag.startswith(WS_TAG_PREFIX):
-        return tag[len(WS_TAG_PREFIX):]
-    return None
 
 UploadWork = Callable[[], Awaitable[Any]]
 SkipCallback = Callable[[], None]
@@ -98,49 +75,9 @@ async def async_guarded_upload(
         upload_flags.discard(tv_id)
 
 
-def _build_tag_pools(
-    images: dict[str, dict[str, Any]],
-    include_tags: list[str],
-    exclude_tags: list[str],
-    tag_weights: dict[str, float],
-) -> dict[str, list[dict[str, Any]]]:
-    """Build per-tag image pools, assigning multi-tag images to highest-weight tag.
-    
-    Args:
-        images: Dict of filename -> image data from metadata
-        include_tags: Tags to include (from tagset)
-        exclude_tags: Tags to exclude (from tagset)
-        tag_weights: Dict of tag -> weight (missing = 1.0)
-        
-    Returns:
-        Dict of tag -> list of eligible images for that tag
-    """
-    tag_pools: dict[str, list[dict[str, Any]]] = {tag: [] for tag in include_tags}
-    
-    for filename, image_data in images.items():
-        image_tags = set(image_data.get("tags", []))
-        
-        # Skip if image has any exclude tag
-        if exclude_tags and any(tag in image_tags for tag in exclude_tags):
-            continue
-        
-        # Find which include tags this image matches
-        matching_tags = [tag for tag in include_tags if tag in image_tags]
-        
-        if not matching_tags:
-            continue
-        
-        # Assign to highest-weight tag (ties: first in tagset order, which is include_tags order)
-        best_tag = max(matching_tags, key=lambda t: (tag_weights.get(t, 1.0), -include_tags.index(t)))
-        
-        image_with_name = {**image_data, "filename": filename}
-        tag_pools[best_tag].append(image_with_name)
-    
-    return tag_pools
-
-
-def _select_random_image(
-    metadata_path: Path,
+async def _async_select_image(
+    hass: HomeAssistant,
+    manager_url: str,
     include_tags: list[str],
     exclude_tags: list[str],
     tag_weights: dict[str, float],
@@ -149,339 +86,57 @@ def _select_random_image(
     tv_name: str,
     recent_images: set[str] | None = None,
 ) -> tuple[dict[str, Any] | None, int, str | None, int, bool]:
-    """Select a random eligible image.
+    """Call the manager add-on to select a random image.
 
-    Two modes based on weighting_type:
-    - "image": All eligible images weighted equally (original behavior)
-    - "tag": Tags weighted (equal by default), then random image from selected tag
-
-    Recency preference: If recent_images is provided, prefers images not in that set.
-    Falls back to full candidate pool if all candidates are recent.
-
-    Args:
-        metadata_path: Path to metadata.json
-        include_tags: Tags to include (from tagset)
-        exclude_tags: Tags to exclude (from tagset)
-        tag_weights: Dict of tag -> weight (only used when weighting_type="tag")
-        weighting_type: "image" or "tag"
-        current_image: Currently displayed image filename (to exclude)
-        tv_name: TV name for logging
-        recent_images: Set of filenames recently shown (for recency preference)
-
-    Returns:
-        Tuple of (selected_image_dict, eligible_count, selected_tag_name, fresh_count, used_fallback)
-        - selected_image_dict: The chosen image, or None if no eligible images
-        - eligible_count: Total number of eligible images
-        - selected_tag_name: Only populated in "tag" weighting mode
-        - fresh_count: Number of non-recent candidates (0 if recency not applied)
-        - used_fallback: True if recency preference couldn't be applied (all recent)
+    Returns the same 5-tuple as the old _select_random_image:
+        (image_dict, eligible_count, selected_tag, fresh_count, used_fallback)
+    image_dict is None when no eligible images exist.
+    image_dict has {"_web_sources": True, "_virtual_tag_id": ...} for web sources.
     """
-    with open(metadata_path, "r", encoding="utf-8") as file:
-        metadata = json.load(file)
-
-    images = metadata.get("images", {})
-    if not images:
-        _LOGGER.warning("No images found in metadata for %s", tv_name)
-        return None, 0, None, 0, False
-
-    # Separate virtual web source tags from real library tags.
-    # No image in the library carries these tags; they must be handled specially.
-    virtual_web_tags = [t for t in include_tags if is_virtual_web_tag(t)]
-    has_web_sources = len(virtual_web_tags) > 0
-    library_include_tags = [t for t in include_tags if not is_virtual_web_tag(t)]
-
-    # If tagset includes only virtual web tags with no library tags, pick one and return sentinel.
-    if has_web_sources and not library_include_tags:
-        chosen_tag = random.choices(
-            virtual_web_tags,
-            weights=[tag_weights.get(t, 1.0) for t in virtual_web_tags],
-        )[0]
-        vtag_id = get_virtual_tag_id(chosen_tag)
-        _LOGGER.info(
-            "Virtual web tag '%s' is the only include for %s; returning sentinel%s",
-            chosen_tag, tv_name, f" (virtualTagId={vtag_id})" if vtag_id else "",
-        )
-        return {"_web_sources": True, "_virtual_tag_id": vtag_id}, 1, chosen_tag, 0, False
-
-    # Handle case where no include tags means "all images" (image-weighted flat selection)
-    if not library_include_tags:
-        eligible_images: list[dict[str, Any]] = []
-        for filename, image_data in images.items():
-            image_tags = set(image_data.get("tags", []))
-            if exclude_tags and any(tag in image_tags for tag in exclude_tags):
-                continue
-            image_data_with_name = {**image_data, "filename": filename}
-            eligible_images.append(image_data_with_name)
-
-        eligible_count = len(eligible_images)
-        if not eligible_images:
-            _LOGGER.warning(
-                "No images matching tag criteria for %s (include: %s, exclude: %s)",
-                tv_name,
-                include_tags,
-                exclude_tags,
+    session = async_get_clientsession(hass)
+    payload: dict[str, Any] = {
+        "includeTags": include_tags,
+        "excludeTags": exclude_tags,
+        "tagWeights": tag_weights,
+        "weightingType": weighting_type,
+        "currentImage": current_image,
+        "recentImages": list(recent_images) if recent_images else [],
+    }
+    try:
+        async with asyncio.timeout(10):
+            resp = await session.post(
+                f"{manager_url}/api/shuffle/select", json=payload
             )
-            return None, 0, None, 0, False
+            data = await resp.json()
+    except Exception as err:
+        raise FrameArtError(f"Shuffle select API call failed for {tv_name}: {err}") from err
 
-        candidates = [img for img in eligible_images if img["filename"] != current_image]
-        if not candidates:
-            if eligible_count == 1:
-                _LOGGER.info(
-                    "Only one image (%s) matches criteria for %s and it's already displayed."
-                    " No shuffle performed.",
-                    eligible_images[0]["filename"],
-                    tv_name,
-                )
-                return None, eligible_count, None, 0, False
-            _LOGGER.warning("No candidate images for %s after removing current image", tv_name)
-            return None, eligible_count, None, 0, False
+    result_type = data.get("type")
+    eligible_count = data.get("eligibleCount", 0)
 
-        # Apply recency preference
-        if recent_images:
-            fresh_candidates = [img for img in candidates if img["filename"] not in recent_images]
-        else:
-            fresh_candidates = []
-
-        fresh_count = len(fresh_candidates)
-        if fresh_candidates:
-            selected = random.choice(fresh_candidates)
-            used_fallback = False
-        else:
-            selected = random.choice(candidates)
-            used_fallback = bool(recent_images)  # Only true fallback if recency was attempted
-
-        _LOGGER.info(
-            "%s selected for TV %s from %d eligible images (no tag filtering, %d fresh)",
-            selected["filename"],
-            tv_name,
-            eligible_count,
-            fresh_count,
-        )
-        return selected, eligible_count, None, fresh_count, used_fallback
-
-    # IMAGE-WEIGHTED MODE: All eligible images have equal probability
-    if weighting_type == "image":
-        eligible_images = []
-        for filename, image_data in images.items():
-            image_tags = set(image_data.get("tags", []))
-
-            # Must have at least one include tag (library tags only)
-            if not any(tag in image_tags for tag in library_include_tags):
-                continue
-
-            # Must not have any exclude tag
-            if exclude_tags and any(tag in image_tags for tag in exclude_tags):
-                continue
-
-            image_data_with_name = {**image_data, "filename": filename}
-            eligible_images.append(image_data_with_name)
-
-        library_count = len(eligible_images)
-
-        # Each virtual web tag gets effective count = avg images per library tag, so it
-        # behaves like one equally-weighted library tag regardless of library size.
-        per_vtag_effective = (
-            max(1, library_count // max(1, len(library_include_tags)))
-            if has_web_sources and library_include_tags
-            else 1 if has_web_sources
-            else 0
-        )
-        web_effective = per_vtag_effective * len(virtual_web_tags)
-        eligible_count = library_count + web_effective
-
-        if eligible_count == 0:
-            _LOGGER.warning(
-                "No images matching tag criteria for %s (include: %s, exclude: %s)",
-                tv_name,
-                include_tags,
-                exclude_tags,
-            )
-            return None, 0, None, 0, False
-
-        # Roll for virtual web tags first (proportional to their effective share)
-        if has_web_sources and random.random() < web_effective / eligible_count:
-            # Pick which virtual web tag, weighted
-            chosen_tag = random.choices(
-                virtual_web_tags,
-                weights=[tag_weights.get(t, 1.0) for t in virtual_web_tags],
-            )[0]
-            vtag_id = get_virtual_tag_id(chosen_tag)
-            _LOGGER.info(
-                "Virtual web tag '%s' selected for TV %s (image-weighted, effective=%d of %d total)",
-                chosen_tag, tv_name, web_effective, eligible_count,
-            )
-            return {"_web_sources": True, "_virtual_tag_id": vtag_id}, eligible_count, chosen_tag, 0, False
-
-        if not eligible_images:
-            _LOGGER.warning("No library images matching tag criteria for %s", tv_name)
-            return None, 0, None, 0, False
-
-        candidates = [img for img in eligible_images if img["filename"] != current_image]
-        if not candidates:
-            if has_web_sources:
-                # No library candidates but virtual web tags are available — pick one
-                chosen_tag = random.choices(
-                    virtual_web_tags,
-                    weights=[tag_weights.get(t, 1.0) for t in virtual_web_tags],
-                )[0]
-                vtag_id = get_virtual_tag_id(chosen_tag)
-                return {"_web_sources": True, "_virtual_tag_id": vtag_id}, eligible_count, chosen_tag, 0, False
-            if library_count == 1:
-                _LOGGER.info(
-                    "Only one image (%s) matches criteria for %s and it's already displayed."
-                    " No shuffle performed.",
-                    eligible_images[0]["filename"],
-                    tv_name,
-                )
-                return None, eligible_count, None, 0, False
-            _LOGGER.warning("No candidate images for %s after removing current image", tv_name)
-            return None, eligible_count, None, 0, False
-
-        # Apply recency preference
-        if recent_images:
-            fresh_candidates = [img for img in candidates if img["filename"] not in recent_images]
-        else:
-            fresh_candidates = []
-
-        fresh_count = len(fresh_candidates)
-        if fresh_candidates:
-            selected = random.choice(fresh_candidates)
-            used_fallback = False
-        else:
-            selected = random.choice(candidates)
-            used_fallback = bool(recent_images)  # Only true fallback if recency was attempted
-
-        _LOGGER.info(
-            "%s selected for TV %s from %d eligible images (image-weighted, %d fresh)",
-            selected["filename"],
-            tv_name,
-            eligible_count,
-            fresh_count,
-        )
-        return selected, eligible_count, None, fresh_count, used_fallback
-
-    # TAG-WEIGHTED MODE: Select tag first (by weight), then random image from that tag
-    # Build per-tag pools using only library tags (web_sources has no library images)
-    tag_pools = _build_tag_pools(images, library_include_tags, exclude_tags, tag_weights)
-
-    # Calculate total eligible count (unique library images across all pools)
-    all_eligible = set()
-    for pool in tag_pools.values():
-        for img in pool:
-            all_eligible.add(img["filename"])
-    eligible_count = len(all_eligible)
-
-    # Virtual web tags are always "eligible" (add 1 per tag to count for display purposes)
-    if has_web_sources:
-        eligible_count += len(virtual_web_tags)
-
-    if eligible_count == 0:
-        _LOGGER.warning(
-            "No images matching tag criteria for %s (include: %s, exclude: %s)",
-            tv_name,
-            include_tags,
-            exclude_tags,
-        )
-        return None, 0, None, 0, False
-
-    # Weighted tag selection with re-roll on empty.
-    # include_tags (with web_sources if present) drives the weighted draw.
-    remaining_tags = list(include_tags)  # Copy to avoid modifying original
-    selected_tag: str | None = None
-    candidates: list[dict[str, Any]] = []
-
-    while remaining_tags and not candidates:
-        # Calculate weights for remaining tags
-        weights = [tag_weights.get(tag, 1.0) for tag in remaining_tags]
-        total_weight = sum(weights)
-
-        if total_weight <= 0:
-            break
-
-        # Weighted random selection
-        roll = random.random() * total_weight
-        cumulative = 0.0
-        selected_tag = remaining_tags[0]  # Default fallback
-
-        for tag, weight in zip(remaining_tags, weights):
-            cumulative += weight
-            if roll <= cumulative:
-                selected_tag = tag
-                break
-
-        # Virtual web tags are always available — return sentinel immediately when selected
-        if is_virtual_web_tag(selected_tag):
-            total_weight_all = sum(tag_weights.get(t, 1.0) for t in include_tags)
-            ws_weight = tag_weights.get(selected_tag, 1.0)
-            ws_pct = round((ws_weight / total_weight_all) * 100) if total_weight_all > 0 else 0
-            vtag_id = get_virtual_tag_id(selected_tag)
-            _LOGGER.info(
-                "Virtual web tag '%s' selected for TV %s (tag-weighted, %d%% weight)",
-                selected_tag, tv_name, ws_pct,
-            )
-            return {"_web_sources": True, "_virtual_tag_id": vtag_id}, eligible_count, selected_tag, 0, False
-
-        # Get candidates from selected tag's pool (excluding current image)
-        pool = tag_pools.get(selected_tag, [])
-        candidates = [img for img in pool if img["filename"] != current_image]
-
-        if not candidates:
-            if pool:
-                # Pool has images but all are current_image
-                _LOGGER.info(
-                    "Tag '%s' rolled for %s but only contains current image, re-rolling",
-                    selected_tag,
-                    tv_name,
-                )
-            else:
-                # Pool is empty
-                _LOGGER.info(
-                    "Tag '%s' rolled for %s but has 0 eligible images, re-rolling",
-                    selected_tag,
-                    tv_name,
-                )
-            remaining_tags.remove(selected_tag)
-            selected_tag = None
-
-    if not candidates:
-        if eligible_count == 1:
-            _LOGGER.info(
-                "Only one image matches criteria for %s and it's already displayed."
-                " No shuffle performed.",
-                tv_name,
-            )
-            return None, eligible_count, None, 0, False
-        _LOGGER.warning("No candidate images for %s after weighted selection", tv_name)
+    if result_type == "none":
+        _LOGGER.warning("No eligible images for %s (eligibleCount=0)", tv_name)
         return None, eligible_count, None, 0, False
 
-    # Apply recency preference within the selected tag's candidates
-    if recent_images:
-        fresh_candidates = [img for img in candidates if img["filename"] not in recent_images]
-    else:
-        fresh_candidates = []
+    if result_type == "web_source":
+        return (
+            {"_web_sources": True, "_virtual_tag_id": data.get("virtualTagId")},
+            eligible_count,
+            data.get("selectedTag"),
+            0,
+            False,
+        )
 
-    fresh_count = len(fresh_candidates)
-    if fresh_candidates:
-        selected = random.choice(fresh_candidates)
-        used_fallback = False
-    else:
-        selected = random.choice(candidates)
-        used_fallback = bool(recent_images)  # Only true fallback if recency was attempted
-
-    # Calculate percentage for logging
-    total_weight = sum(tag_weights.get(t, 1.0) for t in include_tags)
-    tag_pct = round((tag_weights.get(selected_tag, 1.0) / total_weight) * 100) if total_weight > 0 else 0
-
-    _LOGGER.info(
-        "%s selected for TV %s (tag: %s, %d%%) from %d eligible, %d fresh in tag",
-        selected["filename"],
-        tv_name,
-        selected_tag,
-        tag_pct,
+    # Library image
+    return (
+        data,
         eligible_count,
-        fresh_count,
+        data.get("selectedTag"),
+        data.get("freshCount", 0),
+        data.get("usedFallback", False),
     )
-    return selected, eligible_count, selected_tag, fresh_count, used_fallback
+
+
 
 
 async def _async_web_source_send(
@@ -780,26 +435,28 @@ async def _async_pre_upload_next(
     tag_weights = get_tag_weights(entry, tv_id)
     weighting_type = get_weighting_type(entry, tv_id)
 
-    metadata_path = Path(entry.data.get("metadata_path", ""))
-    if not metadata_path.exists():
-        _LOGGER.debug("pre-upload: metadata not found for %s", tv_name)
-        return
+    library_path = Path(entry.data.get("metadata_path", "")).parent / "library"
 
     shuffle_cache = entry_data.setdefault("shuffle_cache", {})
     runtime_state = shuffle_cache.get(tv_id, {})
     current_image = runtime_state.get("current_image")
 
-    selected_image, _count, selected_tag, _fresh, _fallback = await hass.async_add_executor_job(
-        _select_random_image,
-        metadata_path,
-        include_tags,
-        exclude_tags,
-        tag_weights,
-        weighting_type,
-        current_image,
-        tv_name,
-        None,  # No recency filtering for pre-upload
-    )
+    manager_url = entry.data.get("frame_art_manager_url", "http://localhost:8099")
+    try:
+        selected_image, _count, selected_tag, _fresh, _fallback = await _async_select_image(
+            hass,
+            manager_url,
+            include_tags,
+            exclude_tags,
+            tag_weights,
+            weighting_type,
+            current_image,
+            tv_name,
+            None,  # No recency filtering for pre-upload
+        )
+    except Exception as err:
+        _LOGGER.debug("pre-upload: image selection failed for %s: %s", tv_name, err)
+        return
 
     if not selected_image:
         _LOGGER.debug("pre-upload: no eligible image for %s", tv_name)
@@ -834,7 +491,7 @@ async def _async_pre_upload_next(
         else:
             # Local library image pre-upload
             image_filename = selected_image["filename"]
-            image_path = metadata_path.parent / "library" / image_filename
+            image_path = library_path / image_filename
             if not image_path.exists():
                 _LOGGER.debug("pre-upload: image file missing: %s", image_filename)
                 return
@@ -937,9 +594,8 @@ async def _async_shuffle_tv_inner(
         raise FrameArtError(f"Missing IP address in config for {tv_name}")
     tv_mac = tv_config.get("mac")
 
-    metadata_path = Path(entry.data.get("metadata_path", ""))
-    if not metadata_path.exists():
-        raise FrameArtError(f"Metadata file not found at {metadata_path}")
+    library_path = Path(entry.data.get("metadata_path", "")).parent / "library"
+    manager_url = entry.data.get("frame_art_manager_url", "http://localhost:8099")
 
     # Use effective tags (resolves tagsets from global tagsets)
     include_tags, exclude_tags = get_effective_tags(entry, tv_id)
@@ -1004,9 +660,9 @@ async def _async_shuffle_tv_inner(
             _notify("skipped", message)
             return False
 
-    selected_image, matching_count, selected_tag, fresh_count, used_fallback = await hass.async_add_executor_job(
-        _select_random_image,
-        metadata_path,
+    selected_image, matching_count, selected_tag, fresh_count, used_fallback = await _async_select_image(
+        hass,
+        manager_url,
         include_tags,
         exclude_tags,
         tag_weights,
@@ -1039,7 +695,7 @@ async def _async_shuffle_tv_inner(
         return ws_result
 
     image_filename = selected_image["filename"]
-    image_path = metadata_path.parent / "library" / image_filename
+    image_path = library_path / image_filename
     if not image_path.exists():
         raise FrameArtError(f"Image file missing: {image_filename}")
 

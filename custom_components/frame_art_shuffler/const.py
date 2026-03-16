@@ -4,7 +4,6 @@ DOMAIN = "frame_art_shuffler"
 DEFAULT_PORT = 8002
 DEFAULT_TIMEOUT = 30
 
-DEFAULT_METADATA_RELATIVE_PATH = "www/frame_art/gallery.json"
 TOKEN_DIR_NAME = "frame_art_shuffler/tokens"
 LOG_STORAGE_RELATIVE_PATH = "frame_art/logs"
 LOG_EVENTS_FILENAME = "events.json"

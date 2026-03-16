@@ -45,16 +45,11 @@ from .const import (
     DEFAULT_LOGGING_ENABLED,
     DEFAULT_LOG_FLUSH_MINUTES,
     DEFAULT_LOG_RETENTION_MONTHS,
-    DEFAULT_METADATA_RELATIVE_PATH,
     DOMAIN,
     TOKEN_DIR_NAME,
 )
 from .flow_utils import parse_tag_string, pair_tv, safe_token_filename, validate_host
-from .metadata import (
-    MetadataStore,
-    TVNotFoundError,
-    normalize_mac,
-)
+from .metadata import normalize_mac
 
 CONF_SKIP_PAIRING = "skip_pairing"
 CONF_REPAIR = "re_pair"
@@ -66,7 +61,7 @@ LOG_FLUSH_MAX = 60
 
 
 def _default_metadata_path(hass: HomeAssistant) -> Path:
-    return Path(hass.config.path(DEFAULT_METADATA_RELATIVE_PATH))
+    return Path(hass.config.path("www/frame_art/gallery.json"))
 
 
 def _default_token_dir(hass: HomeAssistant) -> Path:
@@ -132,14 +127,10 @@ class FrameArtConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if entry is None or tv_id is None:
             return self.async_abort(reason="reauth_failed")
 
-        store = MetadataStore(Path(entry.data[CONF_METADATA_PATH]))
-
-        try:
-            tv = await self.hass.async_add_executor_job(store.get_tv, tv_id)
-        except TVNotFoundError:
+        from .config_entry import get_tv_config
+        tv = get_tv_config(entry, tv_id)
+        if tv is None:
             return self.async_abort(reason="unknown_tv")
-        except Exception:  # pragma: no cover - unexpected file errors
-            return self.async_abort(reason="metadata_error")
 
         errors: Dict[str, str] = {}
 
@@ -192,16 +183,6 @@ class FrameArtConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 class FrameArtOptionsFlowHandler(config_entries.OptionsFlow):
     """Options flow for adding TVs."""
-
-    @property
-    def _metadata_path(self) -> Path:
-        return Path(self.config_entry.data[CONF_METADATA_PATH])
-
-    def _store(self) -> MetadataStore:
-        return MetadataStore(self._metadata_path)
-
-    async def _list_tvs(self) -> list[dict[str, Any]]:
-        return await self.hass.async_add_executor_job(self._store().list_tvs)
 
     def _logging_option_defaults(self) -> dict[str, Any]:
         options = dict(self.config_entry.options or {})
