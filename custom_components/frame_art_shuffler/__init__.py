@@ -371,6 +371,66 @@ if _HA_AVAILABLE:
             return web.Response(status=404)
 
 
+    class FrameArtPlacardQRView(HomeAssistantView):
+        """Proxy endpoint that generates a QR code for a TV's artwork page URL.
+
+        Fetches a QR code PNG from the manager's /artwork/:tvSlug/qr endpoint,
+        passing the full absolute URL (constructed from hass.config.internal_url)
+        so the QR code encodes a scannable URL.  Used as entity_picture on
+        FrameArtArtworkPageUrlSensor so HA cards and epaper placards can display
+        the QR code.
+        """
+
+        url = "/api/frame_art_shuffler/placard_qr/{tv_id}"
+        name = "api:frame_art_shuffler:placard_qr"
+        requires_auth = False  # entity_picture img src requests don't carry auth tokens
+
+        def __init__(self, hass: Any, entry: Any) -> None:
+            self._hass = hass
+            self._entry = entry
+
+        async def get(self, request: Any, tv_id: str) -> Any:
+            """Proxy a QR code image from the manager for the given tv_id."""
+            import re
+            import aiohttp
+            from aiohttp import web
+            from urllib.parse import quote
+            from homeassistant.helpers.aiohttp_client import async_get_clientsession
+            from .config_entry import get_tv_config
+
+            if "/" in tv_id or "\\" in tv_id or ".." in tv_id:
+                return web.Response(status=400)
+
+            data = self._hass.data.get(DOMAIN, {}).get(self._entry.entry_id)
+            manager_url = data.get("manager_url") if data else None
+            if not manager_url:
+                return web.Response(status=503)
+
+            tv_config = get_tv_config(self._entry, tv_id)
+            if not tv_config:
+                return web.Response(status=404)
+
+            tv_name = tv_config.get("name", tv_id)
+            tv_slug = re.sub(r'[^a-z0-9]+', '-', tv_name.lower()).strip('-')
+
+            relative_path = f"/api/hassio/app/local_frame_art_manager/artwork/{tv_slug}"
+            internal_url = self._hass.config.internal_url
+            full_url = f"{internal_url.rstrip('/')}{relative_path}" if internal_url else relative_path
+
+            qr_url = f"{manager_url.rstrip('/')}/artwork/{tv_slug}/qr?url={quote(full_url, safe='')}"
+
+            session = async_get_clientsession(self._hass)
+            try:
+                async with session.get(qr_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        body = await resp.read()
+                        return web.Response(body=body, content_type="image/png")
+            except Exception:  # noqa: BLE001
+                pass
+
+            return web.Response(status=502)
+
+
     async def async_setup_entry(hass: Any, entry: Any) -> bool:
         """Set up a config entry for Frame Art Shuffler."""
 
@@ -2118,6 +2178,7 @@ if _HA_AVAILABLE:
         # Register API endpoints
         hass.http.register_view(PoolHealthView(hass, entry))
         hass.http.register_view(FrameArtImageView(hass, entry))
+        hass.http.register_view(FrameArtPlacardQRView(hass, entry))
 
         return True
 

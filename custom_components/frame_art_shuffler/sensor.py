@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable
 
@@ -274,6 +275,10 @@ async def async_setup_entry(
                     FrameArtAutoMotionLastMotionEntity(hass, entry, tv_id),
                     FrameArtAutoMotionOffAtEntity(hass, entry, tv_id),
                 ])
+
+            # Artwork page URL + QR sensor (only if manager add-on is configured)
+            if data.get("manager_url"):
+                tv_entities.append(FrameArtArtworkPageUrlSensor(hass, entry, tv_id))
 
             tracked[tv_id] = tuple(tv_entities)
             new_entities.extend(tv_entities)
@@ -1663,3 +1668,64 @@ class FrameArtArtworkInfoSensor(SensorEntity, RestoreEntity):
         """Update when an externally-set artwork is detected (no metadata available)."""
         self._content_id = content_id
         self._artwork_attrs = {"source_type": "external"}
+
+
+def _slugify(s: str) -> str:
+    """Convert a string to a URL-safe slug (matches manager's slugify function)."""
+    return re.sub(r'[^a-z0-9]+', '-', s.lower()).strip('-')
+
+
+ARTWORK_PAGE_URL_DESCRIPTION = SensorEntityDescription(
+    key="artwork_page_url",
+    icon="mdi:qrcode",
+    entity_category=EntityCategory.DIAGNOSTIC,
+    translation_key="artwork_page_url",
+)
+
+
+class FrameArtArtworkPageUrlSensor(SensorEntity):
+    """DIAGNOSTIC sensor exposing the manager artwork page URL and QR code for this TV.
+
+    State is the relative Ingress path to the artwork page (e.g.
+    /api/hassio/app/local_frame_art_manager/artwork/bedroom-frame).
+    entity_picture points to a QR code image of the full URL, suitable for
+    rendering on epaper placards.
+    """
+
+    entity_description = ARTWORK_PAGE_URL_DESCRIPTION
+    _attr_has_entity_name = True
+    _attr_name = "Artwork Page URL"
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, tv_id: str) -> None:
+        self._hass = hass
+        self._entry = entry
+        self._tv_id = tv_id
+        self._attr_unique_id = f"{entry.entry_id}_{tv_id}_artwork_page_url"
+
+        tv_config = get_tv_config(entry, tv_id)
+        tv_name = tv_config.get("name", tv_id) if tv_config else tv_id
+        self._tv_slug = _slugify(tv_name)
+
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, tv_id)},
+            name=tv_name,
+            manufacturer="Samsung",
+            model="Frame TV",
+        )
+
+    @property
+    def native_value(self) -> str:
+        """Relative Ingress path to this TV's artwork page in the manager."""
+        return f"/api/hassio/app/local_frame_art_manager/artwork/{self._tv_slug}"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        internal_url = self._hass.config.internal_url
+        if internal_url:
+            return {"full_url": f"{internal_url.rstrip('/')}{self.native_value}"}
+        return {}
+
+    @property
+    def entity_picture(self) -> str:
+        """QR code image for the artwork page URL (proxied via HA)."""
+        return f"/api/frame_art_shuffler/placard_qr/{self._tv_id}"
