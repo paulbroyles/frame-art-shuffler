@@ -281,7 +281,7 @@ async def _async_fast_path_shuffle(
     now = datetime.now(timezone.utc)
     shuffle_cache = entry_data.setdefault("shuffle_cache", {})
     tagset_cache = entry_data.get("tagset_cache")
-    tagsets = tagset_cache.get_all() if tagset_cache else {}
+    tagsets = (tagset_cache.get_all() or None) if tagset_cache else None
     include_tags, _ = get_effective_tags(entry, tv_id, tagsets=tagsets)
 
     if staged.get("source_type") == "web_source":
@@ -424,7 +424,7 @@ async def _async_pre_upload_next(
 
     # Read tagsets from cache for fingerprint/tagset resolution
     tagset_cache = entry_data.get("tagset_cache")
-    tagsets = tagset_cache.get_all() if tagset_cache else {}
+    tagsets = (tagset_cache.get_all() or None) if tagset_cache else None
 
     # Compute current tagset fingerprint
     fingerprint = get_tagset_fingerprint(entry, tv_id, tagsets=tagsets)
@@ -593,7 +593,7 @@ async def _async_shuffle_tv_inner(
 
     # Read tagsets from cache for tagset resolution / fingerprinting
     tagset_cache = entry_data.get("tagset_cache")
-    tagsets = tagset_cache.get_all() if tagset_cache else {}
+    tagsets = (tagset_cache.get_all() or None) if tagset_cache else None
     tagset_name = get_active_tagset_name(entry, tv_id, tagsets=tagsets)
     include_tags, _ = get_effective_tags(entry, tv_id, tagsets=tagsets)
 

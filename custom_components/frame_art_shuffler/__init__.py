@@ -285,7 +285,7 @@ if _HA_AVAILABLE:
 
                 # Get effective tags for this TV (resolves tagset from cache)
                 tagset_cache = data.get("tagset_cache")
-                tagsets = tagset_cache.get_all() if tagset_cache else {}
+                tagsets = (tagset_cache.get_all() or None) if tagset_cache else None
                 include_tags, exclude_tags = get_effective_tags(self._entry, tv_id, tagsets=tagsets)
 
                 # Calculate pool filenames
@@ -1075,7 +1075,9 @@ if _HA_AVAILABLE:
 
             # Validate tagset exists in cache (manager owns definitions)
             tagset_cache = hass.data.get(DOMAIN, {}).get(target_entry.entry_id, {}).get("tagset_cache")
-            tagsets = tagset_cache.get_all() if tagset_cache else get_global_tagsets(target_entry)
+            tagsets = (tagset_cache.get_all() or None) if tagset_cache else None
+            if tagsets is None:
+                tagsets = get_global_tagsets(target_entry)
             if name not in tagsets:
                 raise ServiceValidationError(f"Tagset '{name}' not found")
 
@@ -1110,7 +1112,9 @@ if _HA_AVAILABLE:
 
             # Validate tagset exists in cache (manager owns definitions)
             tagset_cache = hass.data.get(DOMAIN, {}).get(target_entry.entry_id, {}).get("tagset_cache")
-            tagsets = tagset_cache.get_all() if tagset_cache else get_global_tagsets(target_entry)
+            tagsets = (tagset_cache.get_all() or None) if tagset_cache else None
+            if tagsets is None:
+                tagsets = get_global_tagsets(target_entry)
             if name not in tagsets:
                 raise ServiceValidationError(f"Tagset '{name}' not found")
 
@@ -2315,6 +2319,11 @@ if _HA_AVAILABLE:
                 "tagset migration: pushed %d tagset(s) to manager, clearing from config entry",
                 len(pushed),
             )
+            # Refresh cache so subsequent shuffles see the newly pushed tagsets
+            entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+            tagset_cache = entry_data.get("tagset_cache")
+            if tagset_cache:
+                await tagset_cache.async_refresh()
             update_global_tagsets(hass, entry, {})
         else:
             _LOGGER.warning(

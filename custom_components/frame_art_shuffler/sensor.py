@@ -409,7 +409,7 @@ class FrameArtTVEntity(SensorEntity):
         # Read tagsets from cache (manager owns definitions; HA owns per-TV assignments)
         entry_data = self._hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
         tagset_cache = entry_data.get("tagset_cache")
-        tagsets = tagset_cache.get_all() if tagset_cache else {}
+        tagsets = (tagset_cache.get_all() or None) if tagset_cache else None
 
         # Get effective tags for the active tagset
         include_tags, exclude_tags = get_effective_tags(self._entry, self._tv_id, tagsets=tagsets)
@@ -1432,7 +1432,7 @@ class FrameArtTagsCombinedEntity(SensorEntity):
         # Use effective tags (resolved from tagset cache)
         entry_data = self._hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
         tagset_cache = entry_data.get("tagset_cache")
-        tagsets = tagset_cache.get_all() if tagset_cache else {}
+        tagsets = (tagset_cache.get_all() or None) if tagset_cache else None
         include_tags, exclude_tags = get_effective_tags(self._entry, self._tv_id, tagsets=tagsets)
         tag_weights = get_tag_weights(self._entry, self._tv_id, tagsets=tagsets)
         
@@ -1531,7 +1531,7 @@ class FrameArtSelectedTagsetWeightingEntity(SensorEntity):
         """Return the weighting type of the selected tagset (image or tag)."""
         entry_data = self._hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
         tagset_cache = entry_data.get("tagset_cache")
-        tagsets = tagset_cache.get_all() if tagset_cache else {}
+        tagsets = (tagset_cache.get_all() or None) if tagset_cache else None
         return get_weighting_type(self._entry, self._tv_id, tagsets=tagsets)
 
     @property
