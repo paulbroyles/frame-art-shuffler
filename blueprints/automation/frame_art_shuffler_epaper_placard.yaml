@@ -2,12 +2,15 @@ blueprint:
   name: "Frame Art Shuffler — OpenEpaperLink Placard"
   description: >
     Updates an OpenEpaperLink e-paper display when the artwork changes on a
-    Samsung Frame TV. Renders a museum-style placard: artist name, nationality
-    and lifespan, title and date (in red), medium, museum, and an optional
-    description, with a QR code linking to the full artwork info page.
+    Samsung Frame TV. Renders a museum-style placard: artist name, nationality,
+    lifespan, title and date, medium, dimensions, museum, a short description,
+    and a QR code linking to the full artwork info page.
 
     Tuned for a 4.2" 400×300 three-color (black/white/red) display.
     Adjust font sizes and y-positions in the payload for other display sizes.
+
+    After updating this blueprint, reload automations in HA
+    (Developer Tools → YAML → Reload Automations) for changes to take effect.
   domain: automation
   source_url: https://github.com/paulbroyles/frame-art-shuffler/blob/main/blueprints/automation/frame_art_shuffler_epaper_placard.yaml
   input:
@@ -23,10 +26,20 @@ blueprint:
       name: Artwork Page URL Sensor
       description: >
         The 'Artwork Page URL' sensor for the TV (sensor.*_artwork_page_url).
-        Provides the qr_image_url attribute used to render the QR code.
+        Its full_url attribute is used for the QR code if available. If the
+        attribute is missing, provide ha_base_url below instead.
       selector:
         entity:
           domain: sensor
+    ha_base_url:
+      name: Home Assistant Base URL (for QR code)
+      description: >
+        Internal URL of your HA instance (e.g. http://homeassistant.local:8123
+        or http://192.168.1.x:8123). Only needed if the Artwork Page URL sensor
+        does not have a full_url attribute. Leave blank if full_url is present.
+      default: ""
+      selector:
+        text:
     oel_device:
       name: OpenEpaperLink Display
       description: The e-paper display device to update.
@@ -51,13 +64,30 @@ blueprint:
           min: 100
           max: 1200
           unit_of_measurement: px
+    refresh_type:
+      name: Refresh Mode
+      description: >
+        E-paper refresh mode. Full (~2s) supports red title text and is
+        required for three-color displays. Fast (~1s) and Partial (~0.3s,
+        may ghost) are faster but only render black and white — select these
+        only if you prefer speed over the red title color.
+      default: "Full"
+      selector:
+        select:
+          options:
+            - Full
+            - Fast
+            - Partial
+            - Partial2
 
 # Expose blueprint inputs as template variables.
 variables:
   artwork_sensor: !input artwork_sensor
   page_url_sensor: !input page_url_sensor
+  ha_base_url: !input ha_base_url
   display_width: !input display_width
   display_height: !input display_height
+  refresh_type: !input refresh_type
 
 trigger:
   - platform: state
@@ -78,9 +108,19 @@ action:
       title: "{{ state_attr(artwork_sensor, 'title') | default('') | string }}"
       date: "{{ state_attr(artwork_sensor, 'date') | default('') | string }}"
       medium: "{{ state_attr(artwork_sensor, 'medium') | default('') | string }}"
+      dimensions: "{{ state_attr(artwork_sensor, 'dimensions') | default('') | string }}"
       museum: "{{ state_attr(artwork_sensor, 'museum') | default('') | string }}"
       description: "{{ state_attr(artwork_sensor, 'description') | default('') | string }}"
-      qr_image_url: "{{ state_attr(page_url_sensor, 'qr_image_url') | default('') | string }}"
+      # QR: prefer full_url attribute; fall back to ha_base_url + relative path
+      page_full_url: "{{ state_attr(page_url_sensor, 'full_url') | default('') | string }}"
+      artwork_url: >
+        {% if page_full_url %}
+          {{ page_full_url }}
+        {% elif ha_base_url %}
+          {{ ha_base_url.rstrip('/') }}{{ states(page_url_sensor) }}
+        {% else %}
+          {{ '' }}
+        {% endif %}
 
   - service: open_epaper_link.drawcustom
     target:
@@ -88,77 +128,107 @@ action:
     data:
       background: white
       rotate: 0
+      refresh_type: "{{ {'Full': 0, 'Fast': 1, 'Partial': 2, 'Partial2': 3}[refresh_type] | default(0) }}"
       payload: >
-        {% set ns = namespace(items=[]) %}
+        {% set ns = namespace(items=[], t_lines=1) %}
         {% set margin = 10 %}
+        {% set qr_margin = 15 %}
+        {% set content_width = display_width - margin * 2 %}
         {% set qr_size = (display_width * 0.225) | int %}
-        {% set qr_x = display_width - qr_size - margin %}
-        {% set qr_y = display_height - qr_size - margin %}
+        {% set qr_x = display_width - qr_size - qr_margin %}
+        {% set qr_y = display_height - qr_size - qr_margin %}
+        {% set title_color = 'red' if refresh_type == 'Full' else 'black' %}
 
         {# ── Artist name (all caps, black, large) ─────────────────────── #}
         {% if creator_name %}
           {% set ns.items = ns.items + [
-            {"type": "text", "x": margin, "y": 12,
-             "value": creator_name | upper, "size": 3, "color": "black"}
+            {"type": "text", "x": margin, "y": 10,
+             "value": creator_name | upper, "size": 26, "color": "black"}
           ] %}
         {% endif %}
 
-        {# ── Nationality, Lifespan (omit comma if nationality is blank) ── #}
-        {% set bio = (
-          (creator_nationality ~ ', ' ~ creator_lifespan)
-          if (creator_nationality and creator_lifespan)
-          else (creator_nationality or creator_lifespan)
-        ) %}
-        {% if bio %}
+        {# ── Nationality (size 16) and Lifespan below (size 14, parens) ── #}
+        {% if creator_nationality %}
           {% set ns.items = ns.items + [
-            {"type": "text", "x": margin, "y": 38,
-             "value": bio, "size": 2, "color": "black"}
+            {"type": "text", "x": margin, "y": 44,
+             "value": creator_nationality, "size": 16, "color": "black"}
+          ] %}
+          {% if creator_lifespan %}
+            {% set ns.items = ns.items + [
+              {"type": "text", "x": margin, "y": 62,
+               "value": "(" ~ creator_lifespan ~ ")", "size": 14, "color": "black"}
+            ] %}
+          {% endif %}
+        {% elif creator_lifespan %}
+          {# No nationality: lifespan alone at the nationality position #}
+          {% set ns.items = ns.items + [
+            {"type": "text", "x": margin, "y": 44,
+             "value": creator_lifespan, "size": 16, "color": "black"}
           ] %}
         {% endif %}
 
-        {# ── Title, Date (red — italic substitute on e-ink) ───────────── #}
-        {% set title_line = (
-          (title ~ ', ' ~ date) if (title and date)
-          else (title or date)
-        ) %}
-        {% if title_line %}
+        {# ── Title (multiline for long titles; red on Full refresh) ─────── #}
+        {# Estimate lines at size 22 (~13 px/char) to position year below. #}
+        {% if title %}
+          {% set cpl = (content_width / 13) | int %}
+          {% set ns.t_lines = [((title | length) / cpl) | round(0, 'ceil') | int, 1] | max %}
           {% set ns.items = ns.items + [
-            {"type": "text", "x": margin, "y": 62,
-             "value": title_line, "size": 2, "color": "red"}
+            {"type": "multiline", "x": margin, "y": 84,
+             "value": title, "size": 22, "offset_y": 26,
+             "delimiter": " ", "width": content_width | int,
+             "color": title_color}
+          ] %}
+        {% endif %}
+
+        {# ── Year in parentheses (below title, size 15, black) ──────────── #}
+        {% if date %}
+          {% set year_y = 84 + ns.t_lines * 26 + 4 %}
+          {% set ns.items = ns.items + [
+            {"type": "text", "x": margin, "y": year_y,
+             "value": "(" ~ date ~ ")", "size": 15, "color": "black"}
           ] %}
         {% endif %}
 
         {# ── Medium ───────────────────────────────────────────────────── #}
         {% if medium %}
           {% set ns.items = ns.items + [
-            {"type": "text", "x": margin, "y": 84,
-             "value": medium, "size": 2, "color": "black"}
+            {"type": "text", "x": margin, "y": 162,
+             "value": medium, "size": 15, "color": "black"}
+          ] %}
+        {% endif %}
+
+        {# ── Dimensions ───────────────────────────────────────────────── #}
+        {% if dimensions %}
+          {% set ns.items = ns.items + [
+            {"type": "text", "x": margin, "y": 180,
+             "value": dimensions, "size": 13, "color": "black"}
           ] %}
         {% endif %}
 
         {# ── Museum / Collection ──────────────────────────────────────── #}
         {% if museum %}
           {% set ns.items = ns.items + [
-            {"type": "text", "x": margin, "y": 106,
-             "value": museum, "size": 2, "color": "black"}
+            {"type": "text", "x": margin, "y": 197,
+             "value": museum, "size": 15, "color": "black"}
           ] %}
         {% endif %}
 
-        {# ── Description (bottom-left, beside QR) ─────────────────────── #}
-        {# Width constrained to stay left of the QR code.                  #}
+        {# ── Description (bottom-left, beside QR, truncated to ~2 lines) ─ #}
         {% if description %}
+          {% set desc_text = description | truncate(180, True, '...') %}
           {% set ns.items = ns.items + [
             {"type": "multiline", "x": margin, "y": qr_y,
-             "value": description, "size": 1,
-             "width": (qr_x - margin * 2) | int, "color": "black"}
+             "value": desc_text, "size": 13, "offset_y": 15,
+             "delimiter": " ", "width": (qr_x - margin * 2) | int,
+             "color": "black"}
           ] %}
         {% endif %}
 
-        {# ── QR code (bottom-right corner) ───────────────────────────── #}
-        {% if qr_image_url %}
+        {# ── QR code (bottom-right corner, native OEL qrcode type) ─────── #}
+        {% if artwork_url %}
           {% set ns.items = ns.items + [
-            {"type": "image", "x": qr_x, "y": qr_y,
-             "width": qr_size, "height": qr_size, "url": qr_image_url}
+            {"type": "qrcode", "x": qr_x, "y": qr_y,
+             "data": artwork_url, "size": qr_size, "color": "black"}
           ] %}
         {% endif %}
 

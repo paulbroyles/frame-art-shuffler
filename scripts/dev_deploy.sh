@@ -173,6 +173,7 @@ if [[ -d "$BLUEPRINTS_DIR" ]]; then
     ssh -T "$REMOTE_TARGET" "mkdir -p /config/blueprints"
     tar -C "$BLUEPRINTS_DIR/.." \
         --exclude='.DS_Store' \
+        --exclude='._*' \
         -czf - "blueprints" \
         | ssh -T "$REMOTE_TARGET" "tar -xzf - -C /config"
     echo "✅ Blueprints synced"
