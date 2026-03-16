@@ -218,6 +218,13 @@ async def _async_web_source_send(
         if coordinator := entry_data.get("coordinator"):
             await coordinator.async_set_active_image(tv_id, None, is_shuffle=True)
 
+        # Augment the artwork sensor with cache_file so entity_picture works
+        artwork_sensor = entry_data.get("artwork_sensors", {}).get(tv_id)
+        cache_file = data.get("cacheFile")
+        if artwork_sensor and cache_file:
+            artwork_sensor.set_cache_file(cache_file)
+            artwork_sensor.async_write_ha_state()
+
         if _notify:
             _notify("success", f"Web source selected: {title}")
 

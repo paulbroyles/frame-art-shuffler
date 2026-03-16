@@ -375,15 +375,6 @@ class FrameArtTVEntity(SensorEntity):
         """Return if entity is available."""
         return get_tv_config(self._entry, self._tv_id) is not None
 
-    @property
-    def entity_picture(self) -> str | None:
-        """Return the URL to the current artwork image for picture-entity card."""
-        current = self.native_value
-        if current and current != "Unknown":
-            return f"/api/frame_art_shuffler/image/{current}"
-        return None
-
-
 class FrameArtLastShuffleImageEntity(SensorEntity):
     """Sensor entity for last shuffled image filename."""
 
@@ -1734,6 +1725,21 @@ class FrameArtArtworkInfoSensor(SensorEntity, RestoreEntity):
             "source_type": source_type,
             **{k: v for k, v in metadata.items() if v is not None},
         }
+
+    def set_cache_file(self, cache_file: str) -> None:
+        """Augment current web source artwork with its cache filename for entity_picture."""
+        self._artwork_attrs["cache_file"] = cache_file
+
+    @property
+    def entity_picture(self) -> str | None:
+        """Return image URL for picture-entity cards."""
+        filename = self._artwork_attrs.get("filename")
+        if filename:
+            return f"/api/frame_art_shuffler/image/{filename}"
+        cache_file = self._artwork_attrs.get("cache_file")
+        if cache_file:
+            return f"/api/frame_art_shuffler/image/{cache_file}"
+        return None
 
     def set_external_artwork(self, content_id: str) -> None:
         """Update when an externally-set artwork is detected (no metadata available)."""

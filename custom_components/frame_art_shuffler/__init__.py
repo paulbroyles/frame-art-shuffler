@@ -353,11 +353,12 @@ if _HA_AVAILABLE:
 
             session = async_get_clientsession(self._hass)
 
-            # Try thumbnail first (smaller); fall back to full library image
+            # Try thumbnail, then full library image, then web source cache
             thumb_url = f"{manager_url}/thumbs/thumb_{filename}"
             full_url = f"{manager_url}/library/{filename}"
+            cache_url = f"{manager_url}/cache/{filename}"
 
-            for url in (thumb_url, full_url):
+            for url in (thumb_url, full_url, cache_url):
                 try:
                     async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                         if resp.status == 200:

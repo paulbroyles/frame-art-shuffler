@@ -386,6 +386,7 @@ def _get_tv_entities(
         "screen_on": f"{entry_id}_{tv_id}_screen_on",
         # Sensors
         "current_artwork": f"{entry_id}_{tv_id}",
+        "displayed_artwork": f"{entry_id}_{tv_id}_artwork_info",
         "last_shuffle_image": f"{entry_id}_{tv_id}_last_shuffle_image",
         "last_shuffle_timestamp": f"{entry_id}_{tv_id}_last_shuffle_timestamp",
         "auto_shuffle_next": f"{entry_id}_{tv_id}_auto_shuffle_next",
@@ -449,7 +450,7 @@ def _get_platform_for_key(key: str) -> str:
     """Get the platform (domain) for an entity key."""
     binary_sensors = {"screen_on"}
     sensors = {
-        "current_artwork", "last_shuffle_image", "last_shuffle_timestamp",
+        "current_artwork", "displayed_artwork", "last_shuffle_image", "last_shuffle_timestamp",
         "auto_shuffle_next",
         "ip_address", "mac_address", "motion_sensor", "light_sensor",
         "auto_bright_last", "auto_bright_next", "auto_bright_target",
@@ -558,24 +559,37 @@ def _build_artwork_section(entities: dict[str, str]) -> dict[str, Any] | None:
     """
     if "current_artwork" not in entities:
         return None
-    
-    artwork_entity = entities["current_artwork"]
+
+    displayed_entity = entities.get("displayed_artwork")
     screen_on_entity = entities.get("screen_on")
-    
+
     cards = []
-    
-    # Build image template that includes screen off indicator and matte info
+
+    # Build image URL using Displayed Artwork attributes (works for both local and web source)
     matte_entity = entities.get("current_matte")
+    if displayed_entity:
+        img_url_template = (
+            f"{{% set fn = state_attr('{displayed_entity}', 'filename') %}}"
+            f"{{% set cf = state_attr('{displayed_entity}', 'cache_file') %}}"
+            f"{{% set img = '/api/frame_art_shuffler/image/' ~ (fn if fn else cf) if (fn or cf) else '' %}}"
+        )
+    else:
+        img_url_template = "{% set img = '' %}"
+
     if screen_on_entity:
-        image_template = f"""{{% if is_state('{screen_on_entity}', 'on') %}}
-![Current Art](/api/frame_art_shuffler/image/{{{{ states('{artwork_entity}') }}}})
+        image_template = f"""{img_url_template}
+{{% if img %}}
+![Current Art]({{{{ img }}}})
 {{% else %}}
-![Current Art](/api/frame_art_shuffler/image/{{{{ states('{artwork_entity}') }}}})
+_No image_
+{{% endif %}}
+{{% if not is_state('{screen_on_entity}', 'on') %}}
 
 <center>***** Screen is off *****</center>
 {{% endif %}}"""
     else:
-        image_template = f"![Current Art](/api/frame_art_shuffler/image/{{{{ states('{artwork_entity}') }}}})"
+        image_template = f"""{img_url_template}
+{{% if img %}}![Current Art]({{{{ img }}}}){{% else %}}_No image_{{% endif %}}"""
 
     # Add matte info below the image, top left
     if matte_entity:
