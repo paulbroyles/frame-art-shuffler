@@ -1,0 +1,168 @@
+blueprint:
+  name: "Frame Art Shuffler — OpenEpaperLink Placard"
+  description: >
+    Updates an OpenEpaperLink e-paper display when the artwork changes on a
+    Samsung Frame TV. Renders a museum-style placard: artist name, nationality
+    and lifespan, title and date (in red), medium, museum, and an optional
+    description, with a QR code linking to the full artwork info page.
+
+    Tuned for a 4.2" 400×300 three-color (black/white/red) display.
+    Adjust font sizes and y-positions in the payload for other display sizes.
+  domain: automation
+  source_url: https://github.com/paulbroyles/frame-art-shuffler/blob/main/blueprints/automation/frame_art_shuffler_epaper_placard.yaml
+  input:
+    artwork_sensor:
+      name: Current Artwork Sensor
+      description: >
+        The 'Current Artwork' sensor for the TV (sensor.*_current_artwork).
+        Carries title, date, medium, museum, description, and creator fields.
+      selector:
+        entity:
+          domain: sensor
+    page_url_sensor:
+      name: Artwork Page URL Sensor
+      description: >
+        The 'Artwork Page URL' sensor for the TV (sensor.*_artwork_page_url).
+        Provides the qr_image_url attribute used to render the QR code.
+      selector:
+        entity:
+          domain: sensor
+    oel_entity:
+      name: OpenEpaperLink Display Entity
+      description: >
+        Any sensor entity belonging to the e-paper display (e.g.
+        sensor.*_battery or sensor.*_temperature). Used to target the
+        drawcustom service call.
+      selector:
+        entity:
+          domain: sensor
+    display_width:
+      name: Display Width (px)
+      description: Pixel width of your display. Default 400 for 4.2".
+      default: 400
+      selector:
+        number:
+          min: 100
+          max: 1600
+          unit_of_measurement: px
+    display_height:
+      name: Display Height (px)
+      description: Pixel height of your display. Default 300 for 4.2".
+      default: 300
+      selector:
+        number:
+          min: 100
+          max: 1200
+          unit_of_measurement: px
+
+# Expose blueprint inputs as template variables.
+variables:
+  artwork_sensor: !input artwork_sensor
+  page_url_sensor: !input page_url_sensor
+  display_width: !input display_width
+  display_height: !input display_height
+
+trigger:
+  - platform: state
+    entity_id: !input artwork_sensor
+    not_to:
+      - "unknown"
+      - "unavailable"
+
+# Restart so a rapid succession of changes always renders the latest artwork.
+mode: restart
+
+action:
+  # Snapshot all metadata fields at trigger time.
+  - variables:
+      creator_name: "{{ state_attr(artwork_sensor, 'creator_name') | default('') | string }}"
+      creator_nationality: "{{ state_attr(artwork_sensor, 'creator_nationality') | default('') | string }}"
+      creator_lifespan: "{{ state_attr(artwork_sensor, 'creator_lifespan') | default('') | string }}"
+      title: "{{ state_attr(artwork_sensor, 'title') | default('') | string }}"
+      date: "{{ state_attr(artwork_sensor, 'date') | default('') | string }}"
+      medium: "{{ state_attr(artwork_sensor, 'medium') | default('') | string }}"
+      museum: "{{ state_attr(artwork_sensor, 'museum') | default('') | string }}"
+      description: "{{ state_attr(artwork_sensor, 'description') | default('') | string }}"
+      qr_image_url: "{{ state_attr(page_url_sensor, 'qr_image_url') | default('') | string }}"
+
+  - service: open_epaper_link.drawcustom
+    target:
+      entity_id: !input oel_entity
+    data:
+      background: white
+      rotate: 0
+      payload: >
+        {% set ns = namespace(items=[]) %}
+        {% set margin = 10 %}
+        {% set qr_size = (display_width * 0.225) | int %}
+        {% set qr_x = display_width - qr_size - margin %}
+        {% set qr_y = display_height - qr_size - margin %}
+
+        {# ── Artist name (all caps, black, large) ─────────────────────── #}
+        {% if creator_name %}
+          {% set ns.items = ns.items + [
+            {"type": "text", "x": margin, "y": 12,
+             "text": creator_name | upper, "size": 3, "color": "black"}
+          ] %}
+        {% endif %}
+
+        {# ── Nationality, Lifespan (omit comma if nationality is blank) ── #}
+        {% set bio = (
+          (creator_nationality ~ ', ' ~ creator_lifespan)
+          if (creator_nationality and creator_lifespan)
+          else (creator_nationality or creator_lifespan)
+        ) %}
+        {% if bio %}
+          {% set ns.items = ns.items + [
+            {"type": "text", "x": margin, "y": 38,
+             "text": bio, "size": 2, "color": "black"}
+          ] %}
+        {% endif %}
+
+        {# ── Title, Date (red — italic substitute on e-ink) ───────────── #}
+        {% set title_line = (
+          (title ~ ', ' ~ date) if (title and date)
+          else (title or date)
+        ) %}
+        {% if title_line %}
+          {% set ns.items = ns.items + [
+            {"type": "text", "x": margin, "y": 62,
+             "text": title_line, "size": 2, "color": "red"}
+          ] %}
+        {% endif %}
+
+        {# ── Medium ───────────────────────────────────────────────────── #}
+        {% if medium %}
+          {% set ns.items = ns.items + [
+            {"type": "text", "x": margin, "y": 84,
+             "text": medium, "size": 2, "color": "black"}
+          ] %}
+        {% endif %}
+
+        {# ── Museum / Collection ──────────────────────────────────────── #}
+        {% if museum %}
+          {% set ns.items = ns.items + [
+            {"type": "text", "x": margin, "y": 106,
+             "text": museum, "size": 2, "color": "black"}
+          ] %}
+        {% endif %}
+
+        {# ── Description (bottom-left, beside QR) ─────────────────────── #}
+        {# Width constrained to stay left of the QR code.                  #}
+        {% if description %}
+          {% set ns.items = ns.items + [
+            {"type": "multiline", "x": margin, "y": qr_y,
+             "text": description, "size": 1,
+             "width": (qr_x - margin * 2) | int, "color": "black"}
+          ] %}
+        {% endif %}
+
+        {# ── QR code (bottom-right corner) ───────────────────────────── #}
+        {% if qr_image_url %}
+          {% set ns.items = ns.items + [
+            {"type": "image", "x": qr_x, "y": qr_y,
+             "width": qr_size, "height": qr_size, "url": qr_image_url}
+          ] %}
+        {% endif %}
+
+        {{ ns.items | to_json }}
