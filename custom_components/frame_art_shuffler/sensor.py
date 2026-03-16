@@ -45,12 +45,6 @@ _LOGGER = logging.getLogger(__name__)
 AUTO_BRIGHTNESS_INTERVAL_MINUTES = 10
 
 
-TV_DESCRIPTION = SensorEntityDescription(
-    key="current_artwork",
-    icon="mdi:image-frame",
-    translation_key="current_artwork",
-)
-
 LAST_SHUFFLE_IMAGE_DESCRIPTION = SensorEntityDescription(
     key="last_shuffle_image",
     icon="mdi:image-multiple",
@@ -244,7 +238,6 @@ async def async_setup_entry(
             hass.data[DOMAIN][entry.entry_id].setdefault("artwork_sensors", {})[tv_id] = artwork_info_entity
 
             tv_entities: list[SensorEntity] = [
-                FrameArtTVEntity(hass, entry, tv_id),
                 FrameArtLastShuffleImageEntity(hass, entry, tv_id),
                 FrameArtLastShuffleTimestampEntity(hass, entry, tv_id),
                 FrameArtAutoShuffleNextEntity(hass, entry, tv_id),
@@ -299,81 +292,6 @@ async def async_setup_entry(
     unsubscribe = coordinator.async_add_listener(_handle_coordinator_update)
     entry.async_on_unload(unsubscribe)
 
-
-class FrameArtTVEntity(SensorEntity):
-    """Sensor showing current artwork filename with entity_picture for dashboard cards."""
-
-    entity_description = TV_DESCRIPTION
-    _attr_has_entity_name = True
-    _attr_name = "Current Artwork"
-
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, tv_id: str) -> None:
-        self._hass = hass
-        self._entry = entry
-        self._tv_id = tv_id
-        self._attr_unique_id = f"{entry.entry_id}_{tv_id}"
-        self._unsubscribe_shuffle: Callable[[], None] | None = None
-
-        tv_config = get_tv_config(entry, tv_id)
-        tv_name = tv_config.get("name", tv_id) if tv_config else tv_id
-
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, tv_id)},
-            name=tv_name,
-            manufacturer="Samsung",
-            model="Frame TV",
-        )
-
-    async def async_added_to_hass(self) -> None:
-        """Subscribe to shuffle signal for updates."""
-        @callback
-        def _shuffle_updated() -> None:
-            self.async_write_ha_state()
-
-        signal = f"{SIGNAL_SHUFFLE}_{self._entry.entry_id}_{self._tv_id}"
-        self._unsubscribe_shuffle = async_dispatcher_connect(
-            self._hass, signal, _shuffle_updated,
-        )
-
-    async def async_will_remove_from_hass(self) -> None:
-        """Unsubscribe from signals."""
-        if self._unsubscribe_shuffle:
-            self._unsubscribe_shuffle()
-            self._unsubscribe_shuffle = None
-
-    @property
-    def native_value(self) -> str | None:  # type: ignore[override]
-        """Return the current artwork filename."""
-        # Check runtime cache first (set by button.py shuffle)
-        data = self._hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
-        shuffle_cache = data.get("shuffle_cache", {}).get(self._tv_id, {})
-        cached_image = shuffle_cache.get("current_image")
-        if cached_image:
-            return str(cached_image)
-
-        # Fall back to config entry (for initial value after restart)
-        tv_config = get_tv_config(self._entry, self._tv_id)
-        if not tv_config:
-            return None
-
-        current = tv_config.get("current_image")
-        if current:
-            return str(current)
-
-        # Fallback to legacy shuffle structure
-        shuffle = tv_config.get("shuffle", {})
-        if isinstance(shuffle, dict):
-            current = shuffle.get("currentImage") or shuffle.get("current")
-            if current:
-                if isinstance(current, str) and "/" in current:
-                    return current.split("/")[-1]
-                return str(current)
-        return "Unknown"
-
-    @property
-    def available(self) -> bool:  # type: ignore[override]
-        """Return if entity is available."""
-        return get_tv_config(self._entry, self._tv_id) is not None
 
 class FrameArtLastShuffleImageEntity(SensorEntity):
     """Sensor entity for last shuffled image filename."""
@@ -1678,7 +1596,7 @@ class FrameArtArtworkInfoSensor(SensorEntity, RestoreEntity):
 
     entity_description = ARTWORK_INFO_DESCRIPTION
     _attr_has_entity_name = True
-    _attr_name = "Displayed Artwork"
+    _attr_name = "Current Artwork"
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry, tv_id: str) -> None:
         self._hass = hass

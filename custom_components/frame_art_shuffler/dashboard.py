@@ -385,8 +385,7 @@ def _get_tv_entities(
         # Binary sensors
         "screen_on": f"{entry_id}_{tv_id}_screen_on",
         # Sensors
-        "current_artwork": f"{entry_id}_{tv_id}",
-        "displayed_artwork": f"{entry_id}_{tv_id}_artwork_info",
+        "current_artwork": f"{entry_id}_{tv_id}_artwork_info",
         "last_shuffle_image": f"{entry_id}_{tv_id}_last_shuffle_image",
         "last_shuffle_timestamp": f"{entry_id}_{tv_id}_last_shuffle_timestamp",
         "auto_shuffle_next": f"{entry_id}_{tv_id}_auto_shuffle_next",
@@ -450,7 +449,7 @@ def _get_platform_for_key(key: str) -> str:
     """Get the platform (domain) for an entity key."""
     binary_sensors = {"screen_on"}
     sensors = {
-        "current_artwork", "displayed_artwork", "last_shuffle_image", "last_shuffle_timestamp",
+        "current_artwork", "last_shuffle_image", "last_shuffle_timestamp",
         "auto_shuffle_next",
         "ip_address", "mac_address", "motion_sensor", "light_sensor",
         "auto_bright_last", "auto_bright_next", "auto_bright_target",
@@ -504,11 +503,11 @@ def _build_power_controls_section(entities: dict[str, str]) -> dict[str, Any] | 
             "name": "Brightness Level",
         })
 
-    # Image metadata at bottom of this card
+    # Current artwork (filename / source)
     if "current_artwork" in entities:
         button_entities.append({
             "entity": entities["current_artwork"],
-            "name": "Current Image",
+            "name": "Current Artwork",
         })
 
     if "matte_filter" in entities:
@@ -560,21 +559,18 @@ def _build_artwork_section(entities: dict[str, str]) -> dict[str, Any] | None:
     if "current_artwork" not in entities:
         return None
 
-    displayed_entity = entities.get("displayed_artwork")
+    current_artwork_entity = entities["current_artwork"]
     screen_on_entity = entities.get("screen_on")
 
     cards = []
 
     # Build image URL using Displayed Artwork attributes (works for both local and web source)
     matte_entity = entities.get("current_matte")
-    if displayed_entity:
-        img_url_template = (
-            f"{{% set fn = state_attr('{displayed_entity}', 'filename') %}}"
-            f"{{% set cf = state_attr('{displayed_entity}', 'cache_file') %}}"
-            f"{{% set img = '/api/frame_art_shuffler/image/' ~ (fn if fn else cf) if (fn or cf) else '' %}}"
-        )
-    else:
-        img_url_template = "{% set img = '' %}"
+    img_url_template = (
+        f"{{% set fn = state_attr('{current_artwork_entity}', 'filename') %}}"
+        f"{{% set cf = state_attr('{current_artwork_entity}', 'cache_file') %}}"
+        f"{{% set img = '/api/frame_art_shuffler/image/' ~ (fn if fn else cf) if (fn or cf) else '' %}}"
+    )
 
     if screen_on_entity:
         image_template = f"""{img_url_template}

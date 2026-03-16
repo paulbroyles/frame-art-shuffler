@@ -2223,10 +2223,14 @@ if _HA_AVAILABLE:
         """
         entity_registry = er.async_get(hass)
         tv_ids = list(entry.data.get("tvs", {}).keys())
-        # Entities removed in v1.x entity audit (merged into single buttons)
+        entry_id = entry.entry_id
         stale_unique_ids = (
+            # Merged into single smart Art Mode button (v1.x entity audit)
             [(tv_id, "button", f"{tv_id}_on_art_mode") for tv_id in tv_ids]
+            # Merged into single Shuffle button (v1.x entity audit)
             + [(tv_id, "button", f"{tv_id}_shuffle_silent") for tv_id in tv_ids]
+            # Replaced by FrameArtArtworkInfoSensor (renamed Current Artwork)
+            + [(tv_id, "sensor", f"{entry_id}_{tv_id}") for tv_id in tv_ids]
         )
         for _tv_id, platform, unique_id in stale_unique_ids:
             entity_id = entity_registry.async_get_entity_id(platform, DOMAIN, unique_id)
