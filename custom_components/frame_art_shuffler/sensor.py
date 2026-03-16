@@ -376,12 +376,12 @@ class FrameArtTVEntity(SensorEntity):
         return get_tv_config(self._entry, self._tv_id) is not None
 
     @property
-    def entity_picture(self) -> str:
+    def entity_picture(self) -> str | None:
         """Return the URL to the current artwork image for picture-entity card."""
         current = self.native_value
         if current and current != "Unknown":
-            return f"/local/frame_art/library/{current}"
-        return "/local/frame_art/library/_black_placeholder.jpg"
+            return f"/api/frame_art_shuffler/image/{current}"
+        return None
 
 
 class FrameArtLastShuffleImageEntity(SensorEntity):

@@ -568,14 +568,14 @@ def _build_artwork_section(entities: dict[str, str]) -> dict[str, Any] | None:
     matte_entity = entities.get("current_matte")
     if screen_on_entity:
         image_template = f"""{{% if is_state('{screen_on_entity}', 'on') %}}
-![Current Art](/local/frame_art/library/{{{{ states('{artwork_entity}') }}}})
+![Current Art](/api/frame_art_shuffler/image/{{{{ states('{artwork_entity}') }}}})
 {{% else %}}
-![Current Art](/local/frame_art/library/{{{{ states('{artwork_entity}') }}}})
+![Current Art](/api/frame_art_shuffler/image/{{{{ states('{artwork_entity}') }}}})
 
 <center>***** Screen is off *****</center>
 {{% endif %}}"""
     else:
-        image_template = f"![Current Art](/local/frame_art/library/{{{{ states('{artwork_entity}') }}}})"
+        image_template = f"![Current Art](/api/frame_art_shuffler/image/{{{{ states('{artwork_entity}') }}}})"
 
     # Add matte info below the image, top left
     if matte_entity:

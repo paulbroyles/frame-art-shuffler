@@ -320,6 +320,56 @@ if _HA_AVAILABLE:
             return web.json_response(result)
 
 
+    class FrameArtImageView(HomeAssistantView):
+        """Proxy endpoint that serves artwork images from the Frame Art Manager add-on.
+
+        Fetches thumbnails (or falls back to full-size) from the manager's HTTP
+        server and streams them to the HA frontend.  Used by the Current Artwork
+        sensor's entity_picture property so dashboard cards can display artwork.
+        """
+
+        url = "/api/frame_art_shuffler/image/{filename}"
+        name = "api:frame_art_shuffler:image"
+        requires_auth = True
+
+        def __init__(self, hass: Any, entry: Any) -> None:
+            self._hass = hass
+            self._entry = entry
+
+        async def get(self, request: Any, filename: str) -> Any:
+            """Proxy an image from the manager's thumbnail or library directory."""
+            import aiohttp
+            from aiohttp import web
+            from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+            # Basic path-traversal guard
+            if "/" in filename or "\\" in filename or ".." in filename:
+                return web.Response(status=400)
+
+            data = self._hass.data.get(DOMAIN, {}).get(self._entry.entry_id)
+            manager_url = data.get("manager_url") if data else None
+            if not manager_url:
+                return web.Response(status=503)
+
+            session = async_get_clientsession(self._hass)
+
+            # Try thumbnail first (smaller); fall back to full library image
+            thumb_url = f"{manager_url}/thumbs/thumb_{filename}"
+            full_url = f"{manager_url}/library/{filename}"
+
+            for url in (thumb_url, full_url):
+                try:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        if resp.status == 200:
+                            body = await resp.read()
+                            content_type = resp.headers.get("Content-Type", "image/jpeg")
+                            return web.Response(body=body, content_type=content_type.split(";")[0].strip())
+                except Exception:  # noqa: BLE001
+                    continue
+
+            return web.Response(status=404)
+
+
     async def async_setup_entry(hass: Any, entry: Any) -> bool:
         """Set up a config entry for Frame Art Shuffler."""
 
@@ -2064,8 +2114,9 @@ if _HA_AVAILABLE:
                 "Integration loaded",
             )
 
-        # Register pool health API endpoint
+        # Register API endpoints
         hass.http.register_view(PoolHealthView(hass, entry))
+        hass.http.register_view(FrameArtImageView(hass, entry))
 
         return True
 
