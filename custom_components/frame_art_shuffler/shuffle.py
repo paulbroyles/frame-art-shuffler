@@ -37,6 +37,30 @@ from .frame_tv import (
 _LOGGER = logging.getLogger(__name__)
 
 UploadWork = Callable[[], Awaitable[Any]]
+
+
+async def _build_local_sensor_meta(
+    entry_data: dict[str, Any],
+    filename: str,
+    tags: list[str],
+) -> dict[str, Any]:
+    """Build sensor metadata for a local image.
+
+    Starts with filename + tags, then augments with any custom attributes
+    (title, artist, year, medium, etc.) from the image cache.
+    """
+    meta: dict[str, Any] = {"filename": filename, "tags": tags}
+    cache = entry_data.get("image_cache")
+    if cache:
+        try:
+            image_meta = await cache.get_image(filename)
+            if image_meta:
+                for k, v in (image_meta.get("attributes") or {}).items():
+                    if v is not None and v != "":
+                        meta[k] = v
+        except Exception:
+            pass
+    return meta
 SkipCallback = Callable[[], None]
 StatusCallback = Callable[[str, str], None]
 
@@ -351,14 +375,10 @@ async def _async_fast_path_shuffle(
         # Update artwork info sensor
         artwork_sensor = entry_data.get("artwork_sensors", {}).get(tv_id)
         if artwork_sensor and content_id:
-            artwork_sensor.set_artwork(
-                content_id,
-                {
-                    "filename": image_filename,
-                    "tags": list(image_data.get("tags", [])),
-                },
-                source_type="local",
+            sensor_meta = await _build_local_sensor_meta(
+                entry_data, image_filename, list(image_data.get("tags", []))
             )
+            artwork_sensor.set_artwork(content_id, sensor_meta, source_type="local")
             artwork_sensor.async_write_ha_state()
 
         shuffle_cache[tv_id] = {
@@ -720,14 +740,10 @@ async def _async_shuffle_tv_inner(
         # Update artwork info sensor
         artwork_sensor = entry_data.get("artwork_sensors", {}).get(tv_id)
         if artwork_sensor and content_id:
-            artwork_sensor.set_artwork(
-                content_id,
-                {
-                    "filename": image_filename,
-                    "tags": list(selected_image.get("tags", [])),
-                },
-                source_type="local",
+            sensor_meta = await _build_local_sensor_meta(
+                entry_data, image_filename, list(selected_image.get("tags", []))
             )
+            artwork_sensor.set_artwork(content_id, sensor_meta, source_type="local")
             artwork_sensor.async_write_ha_state()
 
         now = datetime.now(timezone.utc)

@@ -697,11 +697,11 @@ if _HA_AVAILABLE:
                         if artwork_metadata:
                             artwork_sensor.set_artwork(content_id, artwork_metadata, source_type="web_source")
                         else:
-                            meta: dict = {}
-                            tags = await _async_get_image_tags(data, filename)
+                            from .shuffle import _build_local_sensor_meta
                             if filename:
-                                meta = {"filename": filename, "tags": tags}
-                            if not meta:
+                                tags = await _async_get_image_tags(data, filename)
+                                meta = await _build_local_sensor_meta(data, filename, tags)
+                            else:
                                 meta = {"filename": display_filename}
                             artwork_sensor.set_artwork(content_id, meta, source_type="local")
                         artwork_sensor.async_write_ha_state()
