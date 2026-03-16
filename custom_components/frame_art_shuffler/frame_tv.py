@@ -341,8 +341,30 @@ async def _rest_device_info(ip: str, timeout: float) -> Optional[dict]:
                 host=ip, port=DEFAULT_PORT, session=session, timeout=timeout
             )
             return await rest_api.rest_device_info()
-    except Exception:
+    except Exception as err:
+        _LOGGER.debug("REST device info failed for %s: %s", ip, err)
         return None
+
+
+async def _tcp_reachable(ip: str, port: int = DEFAULT_PORT, timeout: float = 1.5) -> bool:
+    """Quick TCP reachability check without a full HTTP request.
+
+    Used as a fallback when the REST API fails unexpectedly — if TCP connects,
+    the TV's network interface is up and we must not send WoL (which would act
+    as a second packet and wake the screen).
+    """
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, port), timeout=timeout
+        )
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
 
 
 async def get_tv_model_year(ip: str) -> Optional[int]:
@@ -896,6 +918,7 @@ async def select_and_cleanup(
     # --- Check screen state (before any WoL) ---
     # When screen_on=False, check actual screen state so we can show the image
     # if the screen happens to be on, without waking it if it's off.
+    pre_network_awake = False
     if pre_screen_on is None:
         pre_screen_on = False
         if not screen_on:
@@ -909,7 +932,7 @@ async def select_and_cleanup(
         client,
         mac_address=mac_address,
         screen_on=screen_on,
-        pre_network_awake=pre_screen_on if not screen_on else False,
+        pre_network_awake=pre_network_awake if not screen_on else False,
     )
 
     # --- Select image ---
@@ -1080,7 +1103,18 @@ async def _check_rest_state(ip: str, timeout: float = 3.0) -> tuple:
     """
     data = await _rest_device_info(ip, timeout)
     if data is None:
-        return False, False
+        # REST failed — fall back to a raw TCP probe to detect whether the
+        # network interface is actually up. This prevents a false-negative
+        # (thinking the TV is in deep sleep when it is merely not responding
+        # to HTTP) from causing a WoL packet that would wake the screen.
+        network_awake = await _tcp_reachable(ip)
+        if network_awake:
+            _LOGGER.debug(
+                "_check_rest_state: REST failed for %s but TCP reachable — "
+                "treating as network-awake, screen-off",
+                ip,
+            )
+        return network_awake, False
     power_on = data.get("device", {}).get("PowerState", "off") == "on"
     return True, power_on
 
