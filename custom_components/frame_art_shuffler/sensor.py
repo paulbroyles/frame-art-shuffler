@@ -1730,7 +1730,11 @@ class FrameArtArtworkPageUrlSensor(SensorEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         internal_url = self._hass.config.internal_url
         if internal_url:
-            return {"full_url": f"{internal_url.rstrip('/')}{self.native_value}"}
+            base = internal_url.rstrip('/')
+            return {
+                "full_url": f"{base}{self.native_value}",
+                "qr_image_url": f"{base}/api/frame_art_shuffler/placard_qr/{self._tv_id}",
+            }
         return {}
 
     @property
