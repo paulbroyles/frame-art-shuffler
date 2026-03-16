@@ -167,6 +167,17 @@ tar -C "$COMPONENT_DIR/.." \
 
 echo "✅ Files synced"
 
+# Deploy blueprints
+BLUEPRINTS_DIR="$REPO_ROOT/blueprints"
+if [[ -d "$BLUEPRINTS_DIR" ]]; then
+    ssh -T "$REMOTE_TARGET" "mkdir -p /config/blueprints"
+    tar -C "$BLUEPRINTS_DIR/.." \
+        --exclude='.DS_Store' \
+        -czf - "blueprints" \
+        | ssh -T "$REMOTE_TARGET" "tar -xzf - -C /config"
+    echo "✅ Blueprints synced"
+fi
+
 if [[ "$RELOAD_ENTRY" == true ]]; then
     echo "Checking for existing config entry..."
     ssh -T "$REMOTE_TARGET" <<'ENDSSH'
