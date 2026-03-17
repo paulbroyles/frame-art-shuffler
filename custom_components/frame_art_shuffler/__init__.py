@@ -630,7 +630,7 @@ if _HA_AVAILABLE:
                     # Update artwork info sensor
                     artwork_sensor = data.get("artwork_sensors", {}).get(tv_id)
                     if artwork_sensor and content_id:
-                        if artwork_metadata:
+                        if artwork_metadata is not None:
                             artwork_sensor.set_artwork(content_id, artwork_metadata, source_type="web_source")
                         else:
                             from .shuffle import _build_local_sensor_meta
