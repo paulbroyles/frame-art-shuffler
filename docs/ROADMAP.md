@@ -49,3 +49,19 @@ proactively, before any user request arrives. Possible approaches:
 
 See `TVConnectionManager.ensure_connected()` in `frame_tv.py` and
 `docs/STALE_ART_CHANNEL.md` for context.
+
+### Auto-recovery via power cycle
+
+A deeper failure mode exists where reconnect alone is insufficient: the art app crashes
+and won't recover until the TV sleeps and wakes. Observed 2026-03-17 — art probe failed
+for 20+ minutes while TV displayed art normally; manual power button sleep/wake resolved it.
+
+Proposed: after 5+ minutes of consecutive art probe failures while REST API reports
+`PowerState: on`, automatically:
+1. Send `KEY_POWER` via `SamsungTVWSAsyncRemote` (port 8002, unaffected by broken art channel)
+2. Poll REST until `PowerState: standby`
+3. Send `KEY_POWER` to wake
+4. Log an activity event
+
+Configuration: opt-in per TV (default off). Cooldown: once per 2 hours max.
+Guard condition: only trigger when `PowerState: on` (skip if TV is simply asleep/off).
