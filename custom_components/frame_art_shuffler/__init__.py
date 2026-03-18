@@ -25,6 +25,20 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect, async_dis
 
 _LOGGER = logging.getLogger(__name__)
 
+
+def _write_artwork_sensor_log(log_path: Path, tv_name: str, content_id: str, source_type: str, metadata: dict) -> None:
+    """Append one line to the artwork sensor update log (blocking; run via executor)."""
+    import os
+    os.makedirs(log_path.parent, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    title = metadata.get("title", "")
+    creator = metadata.get("creator_name", metadata.get("creator", ""))
+    keys = [k for k, v in metadata.items() if v not in (None, "", [])]
+    line = f"{ts} | {tv_name} | {content_id[:8]} | {source_type} | title={title!r} creator={creator!r} keys={keys}\n"
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(line)
+
+
 HA_IMPORT_ERROR_MESSAGE = (
     "Home Assistant is required for the Frame Art Shuffler integration. "
     "Install the 'homeassistant' package to enable integration entry points."
@@ -498,6 +512,10 @@ if _HA_AVAILABLE:
                     )
                     artwork_sensor.set_external_artwork(content_id)
                     artwork_sensor.async_write_ha_state()
+                    log_path = Path(hass.config.path("frame_art/logs/artwork_sensor.log"))
+                    await hass.async_add_executor_job(
+                        _write_artwork_sensor_log, log_path, tv_id, content_id, "external", {}
+                    )
             except Exception as err:  # pylint: disable=broad-except
                 _LOGGER.debug("Could not query current artwork for %s: %s", tv_id, err)
 
@@ -631,7 +649,18 @@ if _HA_AVAILABLE:
                     artwork_sensor = data.get("artwork_sensors", {}).get(tv_id)
                     if artwork_sensor and content_id:
                         if artwork_metadata is not None:
+                            _LOGGER.debug(
+                                "Artwork sensor update [%s] content_id=%s source=web_source title=%r creator=%r keys=%s",
+                                tv_name, content_id[:8],
+                                artwork_metadata.get("title", ""),
+                                artwork_metadata.get("creator_name", artwork_metadata.get("creator", "")),
+                                [k for k, v in artwork_metadata.items() if v not in (None, "", [])],
+                            )
                             artwork_sensor.set_artwork(content_id, artwork_metadata, source_type="web_source")
+                            log_path = Path(hass.config.path("frame_art/logs/artwork_sensor.log"))
+                            await hass.async_add_executor_job(
+                                _write_artwork_sensor_log, log_path, tv_name, content_id, "web_source", artwork_metadata
+                            )
                         else:
                             from .shuffle import _build_local_sensor_meta
                             if filename:
@@ -639,7 +668,15 @@ if _HA_AVAILABLE:
                                 meta = await _build_local_sensor_meta(data, filename, tags)
                             else:
                                 meta = {"filename": display_filename}
+                            _LOGGER.debug(
+                                "Artwork sensor update [%s] content_id=%s source=local filename=%r",
+                                tv_name, content_id[:8], display_filename,
+                            )
                             artwork_sensor.set_artwork(content_id, meta, source_type="local")
+                            log_path = Path(hass.config.path("frame_art/logs/artwork_sensor.log"))
+                            await hass.async_add_executor_job(
+                                _write_artwork_sensor_log, log_path, tv_name, content_id, "local", meta
+                            )
                         artwork_sensor.async_write_ha_state()
 
                     # Send signal to update sensors

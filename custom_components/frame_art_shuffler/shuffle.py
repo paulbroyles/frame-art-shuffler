@@ -39,6 +39,19 @@ _LOGGER = logging.getLogger(__name__)
 UploadWork = Callable[[], Awaitable[Any]]
 
 
+def _write_artwork_sensor_log(log_path: Path, tv_name: str, content_id: str, source_type: str, metadata: dict) -> None:
+    """Append one line to the artwork sensor update log (blocking; run via executor)."""
+    import os
+    os.makedirs(log_path.parent, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    title = metadata.get("title", "")
+    creator = metadata.get("creator_name", metadata.get("creator", ""))
+    keys = [k for k, v in metadata.items() if v not in (None, "", [])]
+    line = f"{ts} | {tv_name} | {content_id[:8]} | {source_type} | title={title!r} creator={creator!r} keys={keys}\n"
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(line)
+
+
 async def _build_local_sensor_meta(
     entry_data: dict[str, Any],
     filename: str,
@@ -343,10 +356,20 @@ async def _async_fast_path_shuffle(
         artwork_metadata = staged.get("artwork_metadata", {})
         artwork_sensor = entry_data.get("artwork_sensors", {}).get(tv_id)
         if artwork_sensor and content_id:
-            artwork_sensor.set_artwork(
-                content_id, artwork_metadata or art_metadata, source_type="web_source",
+            _meta = artwork_metadata or art_metadata
+            _LOGGER.debug(
+                "Artwork sensor update [%s] content_id=%s source=web_source(fast) title=%r creator=%r keys=%s",
+                tv_id, content_id[:8],
+                _meta.get("title", ""),
+                _meta.get("creator_name", _meta.get("creator", "")),
+                [k for k, v in _meta.items() if v not in (None, "", [])],
             )
+            artwork_sensor.set_artwork(content_id, _meta, source_type="web_source")
             artwork_sensor.async_write_ha_state()
+            log_path = Path(hass.config.path("frame_art/logs/artwork_sensor.log"))
+            await hass.async_add_executor_job(
+                _write_artwork_sensor_log, log_path, tv_id, content_id, "web_source(fast)", _meta
+            )
 
         shuffle_cache[tv_id] = {
             "current_image": None,
@@ -378,8 +401,16 @@ async def _async_fast_path_shuffle(
             sensor_meta = await _build_local_sensor_meta(
                 entry_data, image_filename, list(image_data.get("tags", []))
             )
+            _LOGGER.debug(
+                "Artwork sensor update [%s] content_id=%s source=local(staged) filename=%r",
+                tv_id, content_id[:8], image_filename,
+            )
             artwork_sensor.set_artwork(content_id, sensor_meta, source_type="local")
             artwork_sensor.async_write_ha_state()
+            log_path = Path(hass.config.path("frame_art/logs/artwork_sensor.log"))
+            await hass.async_add_executor_job(
+                _write_artwork_sensor_log, log_path, tv_id, content_id, "local(staged)", sensor_meta
+            )
 
         shuffle_cache[tv_id] = {
             "current_image": image_filename,
@@ -743,8 +774,16 @@ async def _async_shuffle_tv_inner(
             sensor_meta = await _build_local_sensor_meta(
                 entry_data, image_filename, list(selected_image.get("tags", []))
             )
+            _LOGGER.debug(
+                "Artwork sensor update [%s] content_id=%s source=local filename=%r",
+                tv_id, content_id[:8], image_filename,
+            )
             artwork_sensor.set_artwork(content_id, sensor_meta, source_type="local")
             artwork_sensor.async_write_ha_state()
+            log_path = Path(hass.config.path("frame_art/logs/artwork_sensor.log"))
+            await hass.async_add_executor_job(
+                _write_artwork_sensor_log, log_path, tv_id, content_id, "local", sensor_meta
+            )
 
         now = datetime.now(timezone.utc)
         timestamp = now.isoformat()
