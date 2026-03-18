@@ -866,12 +866,12 @@ if _HA_AVAILABLE:
                     device_id = entity_entry.device_id
 
             if not device_id:
-                raise ValueError("Must provide device_id or entity_id")
+                raise ServiceValidationError("Must provide device_id or entity_id")
 
             device_registry = dr.async_get(hass)
             device = device_registry.async_get(device_id)
             if not device:
-                raise ValueError(f"Device {device_id} not found")
+                raise ServiceValidationError(f"Device {device_id} not found")
 
             target_entry: Any | None = None
             for eid in device.config_entries:
@@ -881,11 +881,13 @@ if _HA_AVAILABLE:
                     break
 
             if not target_entry:
-                raise ValueError(f"No config entry found for device {device_id}")
+                raise ServiceValidationError(f"No Frame Art Shuffler config entry found for device {device_id}")
 
             data = hass.data.get(DOMAIN, {}).get(target_entry.entry_id)
             if not data:
-                raise ValueError(f"Integration data not found for entry {target_entry.entry_id}")
+                raise ServiceValidationError(
+                    "Integration is still initializing — please retry in a moment"
+                )
 
             tv_id = None
             for identifier in device.identifiers:
@@ -894,12 +896,12 @@ if _HA_AVAILABLE:
                     break
 
             if not tv_id:
-                raise ValueError(f"Could not determine TV ID from device {device_id}")
+                raise ServiceValidationError(f"Could not determine TV ID from device {device_id}")
 
             coordinator = data["coordinator"]
             tv_data = next((tv for tv in coordinator.data if tv["id"] == tv_id), None)
             if not tv_data:
-                raise ValueError(f"TV {tv_id} not found in coordinator data")
+                raise ServiceValidationError(f"TV {tv_id} not found in coordinator data")
 
             return target_entry, tv_id, tv_data
 
