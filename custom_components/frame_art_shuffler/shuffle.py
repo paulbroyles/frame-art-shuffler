@@ -331,6 +331,7 @@ async def _async_fast_path_shuffle(
     if staged.get("source_type") == "web_source":
         # Promote staged cache → display cache on the add-on so the artwork
         # page serves the correct image for what's now on the TV.
+        promote_cache_file = None
         registry = dr.async_get(hass)
         device = registry.async_get_device(identifiers={(DOMAIN, tv_id)})
         if device:
@@ -340,9 +341,11 @@ async def _async_fast_path_shuffle(
             session = async_get_clientsession(hass)
             try:
                 async with asyncio.timeout(10):
-                    await session.post(
+                    promote_resp = await session.post(
                         f"{frame_art_manager_url}/api/web-sources/cache/{device.id}/promote",
                     )
+                    promote_data = await promote_resp.json()
+                    promote_cache_file = promote_data.get("cacheFile")
             except Exception as err:
                 _LOGGER.warning("fast-path: cache promote failed for %s: %s", tv_name, err)
 
@@ -365,6 +368,8 @@ async def _async_fast_path_shuffle(
                 [k for k, v in _meta.items() if v not in (None, "", [])],
             )
             artwork_sensor.set_artwork(content_id, _meta, source_type="web_source")
+            if promote_cache_file:
+                artwork_sensor.set_cache_file(promote_cache_file)
             artwork_sensor.async_write_ha_state()
             log_path = Path(hass.config.path("frame_art/logs/artwork_sensor.log"))
             await hass.async_add_executor_job(
