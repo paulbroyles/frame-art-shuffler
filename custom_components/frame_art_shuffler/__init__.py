@@ -297,8 +297,11 @@ if _HA_AVAILABLE:
                 # Get shuffle frequency for this TV (default 60 minutes)
                 shuffle_frequency = int(tv_config.get(CONF_SHUFFLE_FREQUENCY, 60) or 60)
 
-                # Get effective tags for this TV (resolves tagset from cache)
+                # Get effective tags for this TV (resolves tagset from cache).
+                # Ensure cache is loaded; no-op if already loaded, single fetch if startup failed.
                 tagset_cache = data.get("tagset_cache")
+                if tagset_cache:
+                    await tagset_cache.async_ensure_loaded()
                 tagsets = (tagset_cache.get_all() or None) if tagset_cache else None
                 include_tags, exclude_tags = get_effective_tags(self._entry, tv_id, tagsets=tagsets)
 

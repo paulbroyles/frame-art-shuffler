@@ -27,6 +27,7 @@ class TagsetCache:
         self._hass = hass
         self._manager_url = manager_url.rstrip("/")
         self._tagsets: dict[str, Any] = {}
+        self._ever_loaded: bool = False
 
     async def async_refresh(self) -> bool:
         """Fetch all tagset definitions from the manager. Returns True on success."""
@@ -37,6 +38,7 @@ class TagsetCache:
                 if resp.status == 200:
                     data = await resp.json()
                     self._tagsets = data.get("tagsets", {})
+                    self._ever_loaded = True
                     _LOGGER.debug(
                         "tagset_cache: loaded %d tagsets", len(self._tagsets)
                     )
@@ -48,6 +50,16 @@ class TagsetCache:
         except Exception as err:
             _LOGGER.warning("tagset_cache: failed to refresh tagsets: %s", err)
         return False
+
+    async def async_ensure_loaded(self) -> None:
+        """Refresh if the cache has never been successfully loaded.
+
+        Safe to call on every shuffle: no-op once loaded, single fetch if not.
+        Handles the startup race condition where the manager add-on starts
+        after HA and the initial async_refresh() failed silently.
+        """
+        if not self._ever_loaded:
+            await self.async_refresh()
 
     def get_all(self) -> dict[str, Any]:
         """Return cached tagsets dict (sync)."""
