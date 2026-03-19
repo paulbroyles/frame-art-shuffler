@@ -1168,9 +1168,13 @@ if _HA_AVAILABLE:
             
             tv_name = tv_data.get("name", tv_id)
 
-            # Validate tagset exists in cache (manager owns definitions)
+            # Validate tagset exists in cache (manager owns definitions).
+            # If the cache is empty (manager was unreachable at startup), try a fresh fetch.
             tagset_cache = hass.data.get(DOMAIN, {}).get(target_entry.entry_id, {}).get("tagset_cache")
             tagsets = (tagset_cache.get_all() or None) if tagset_cache else None
+            if not tagsets and tagset_cache:
+                await tagset_cache.async_refresh()
+                tagsets = (tagset_cache.get_all() or None)
             if tagsets is None:
                 tagsets = get_global_tagsets(target_entry)
             if name not in tagsets:
@@ -1205,9 +1209,13 @@ if _HA_AVAILABLE:
             
             tv_name = tv_data.get("name", tv_id)
 
-            # Validate tagset exists in cache (manager owns definitions)
+            # Validate tagset exists in cache (manager owns definitions).
+            # If the cache is empty (manager was unreachable at startup), try a fresh fetch.
             tagset_cache = hass.data.get(DOMAIN, {}).get(target_entry.entry_id, {}).get("tagset_cache")
             tagsets = (tagset_cache.get_all() or None) if tagset_cache else None
+            if not tagsets and tagset_cache:
+                await tagset_cache.async_refresh()
+                tagsets = (tagset_cache.get_all() or None)
             if tagsets is None:
                 tagsets = get_global_tagsets(target_entry)
             if name not in tagsets:
