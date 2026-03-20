@@ -485,8 +485,12 @@ async def _async_pre_upload_next(
 
     _LOGGER.debug("pre-upload: starting for %s", tv_name)
 
-    # Read tagsets from cache for fingerprint/tagset resolution
+    # Read tagsets from cache for fingerprint/tagset resolution.
+    # Ensure loaded first: handles startup race where the manager add-on starts
+    # after HA and the initial TagsetCache fetch failed silently.
     tagset_cache = entry_data.get("tagset_cache")
+    if tagset_cache:
+        await tagset_cache.async_ensure_loaded()
     tagsets = (tagset_cache.get_all() or None) if tagset_cache else None
 
     # Compute current tagset fingerprint
@@ -654,8 +658,12 @@ async def _async_shuffle_tv_inner(
 
     entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
 
-    # Read tagsets from cache for tagset resolution / fingerprinting
+    # Read tagsets from cache for tagset resolution / fingerprinting.
+    # Ensure loaded first: handles startup race where the manager add-on starts
+    # after HA and the initial TagsetCache fetch failed silently.
     tagset_cache = entry_data.get("tagset_cache")
+    if tagset_cache:
+        await tagset_cache.async_ensure_loaded()
     tagsets = (tagset_cache.get_all() or None) if tagset_cache else None
     tagset_name = get_active_tagset_name(entry, tv_id, tagsets=tagsets)
     include_tags, _ = get_effective_tags(entry, tv_id, tagsets=tagsets)
