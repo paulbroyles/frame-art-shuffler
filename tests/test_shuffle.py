@@ -654,3 +654,283 @@ class TestFastPathFingerprint:
             "Different active tagsets must produce different fingerprints so "
             "staged images are invalidated on tagset switch"
         )
+
+
+# ---------------------------------------------------------------------------
+# 5. Local library full shuffle path
+# ---------------------------------------------------------------------------
+
+class TestLocalLibraryShuffle:
+    """Tests for the full shuffle path when the manager returns a local library image."""
+
+    def test_full_path_local_calls_guarded_upload(self):
+        """Local library shuffle calls async_guarded_upload (not web source path)."""
+        from custom_components.frame_art_shuffler.shuffle import _async_shuffle_tv_inner
+
+        tagset_cache = _LoadedTagsetCache(_TAGSETS)
+        entry = _make_entry()
+        tv_config = entry.data["tvs"]["tv1"]
+        entry_data = {
+            "tagset_cache": tagset_cache,
+            "staged_images": {},
+            "shuffle_cache": {},
+            "art_clients": {"tv1": MagicMock()},
+            "artwork_sensors": {"tv1": MagicMock()},
+            "tv_status_cache": {},
+        }
+        hass = _make_hass(entry_data=entry_data)
+
+        mock_guarded = AsyncMock(return_value=True)
+        mock_ws_send = AsyncMock(return_value=_WEB_SOURCE_SEND_RESULT)
+
+        async def _run():
+            with (
+                patch(
+                    "custom_components.frame_art_shuffler.shuffle._async_select_image",
+                    new=AsyncMock(return_value=_LOCAL_SELECT_RESULT),
+                ),
+                patch(
+                    "custom_components.frame_art_shuffler.shuffle._async_web_source_send",
+                    new=mock_ws_send,
+                ),
+                patch(
+                    "custom_components.frame_art_shuffler.shuffle.async_guarded_upload",
+                    new=mock_guarded,
+                ),
+                patch(
+                    "custom_components.frame_art_shuffler.shuffle._async_pre_upload_next",
+                    new=AsyncMock(),
+                ),
+                patch("pathlib.Path.exists", return_value=True),
+                patch("custom_components.frame_art_shuffler.shuffle.log_activity"),
+                patch("custom_components.frame_art_shuffler.shuffle.async_dispatcher_send"),
+            ):
+                return await _async_shuffle_tv_inner(
+                    hass, entry, "tv1", tv_config, "Test TV",
+                    "manual", False, lambda s, m: None,
+                )
+
+        result = asyncio.run(_run())
+
+        assert result is True
+        mock_guarded.assert_called_once()
+        mock_ws_send.assert_not_called()
+
+    def test_full_path_local_does_not_call_web_source_send(self):
+        """Local library shuffle must never call _async_web_source_send."""
+        from custom_components.frame_art_shuffler.shuffle import _async_shuffle_tv_inner
+
+        tagset_cache = _LoadedTagsetCache(_TAGSETS)
+        entry = _make_entry()
+        tv_config = entry.data["tvs"]["tv1"]
+        entry_data = {
+            "tagset_cache": tagset_cache,
+            "staged_images": {},
+            "shuffle_cache": {},
+            "art_clients": {"tv1": MagicMock()},
+            "artwork_sensors": {"tv1": MagicMock()},
+            "tv_status_cache": {},
+        }
+        hass = _make_hass(entry_data=entry_data)
+
+        mock_ws_send = AsyncMock()
+
+        async def _run():
+            with (
+                patch(
+                    "custom_components.frame_art_shuffler.shuffle._async_select_image",
+                    new=AsyncMock(return_value=_LOCAL_SELECT_RESULT),
+                ),
+                patch(
+                    "custom_components.frame_art_shuffler.shuffle._async_web_source_send",
+                    new=mock_ws_send,
+                ),
+                patch(
+                    "custom_components.frame_art_shuffler.shuffle.async_guarded_upload",
+                    new=AsyncMock(return_value=True),
+                ),
+                patch(
+                    "custom_components.frame_art_shuffler.shuffle._async_pre_upload_next",
+                    new=AsyncMock(),
+                ),
+                patch("pathlib.Path.exists", return_value=True),
+                patch("custom_components.frame_art_shuffler.shuffle.log_activity"),
+                patch("custom_components.frame_art_shuffler.shuffle.async_dispatcher_send"),
+            ):
+                return await _async_shuffle_tv_inner(
+                    hass, entry, "tv1", tv_config, "Test TV",
+                    "manual", False, lambda s, m: None,
+                )
+
+        asyncio.run(_run())
+        mock_ws_send.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 6. Local art fast path
+# ---------------------------------------------------------------------------
+
+class TestLocalFastPath:
+    """Tests for _async_fast_path_shuffle with source_type='local'."""
+
+    def _make_local_staged(self, fingerprint: str) -> dict:
+        return {
+            "content_id": "MY_F0042",
+            "source_type": "local",
+            "filename": "nighthawks-1942-f5ff1784.jpg",
+            "image_data": {"tags": ["night"]},
+            "matte": "none",
+            "photo_filter": None,
+            "selected_tag": "night",
+            "tagset_fingerprint": fingerprint,
+        }
+
+    def test_local_fast_path_calls_select_and_cleanup(self):
+        """Fast path for local art calls select_and_cleanup with the staged content_id."""
+        from custom_components.frame_art_shuffler.shuffle import _async_fast_path_shuffle
+
+        tagset_cache = _LoadedTagsetCache(_TAGSETS)
+        entry = _make_entry(selected_tagset="night")
+        hass = _make_hass()
+        hass.config.path = MagicMock(return_value="/tmp/test_local_fast.log")
+
+        entry_data = {
+            "tagset_cache": tagset_cache,
+            "art_clients": {"tv1": MagicMock()},
+            "artwork_sensors": {"tv1": MagicMock()},
+            "shuffle_cache": {},
+        }
+
+        staged = self._make_local_staged("fp_local")
+        mock_select = AsyncMock(return_value=True)
+
+        async def _run():
+            with (
+                patch(
+                    "custom_components.frame_art_shuffler.shuffle.select_and_cleanup",
+                    new=mock_select,
+                ),
+                patch("custom_components.frame_art_shuffler.shuffle.log_activity"),
+                patch("custom_components.frame_art_shuffler.shuffle.async_dispatcher_send"),
+            ):
+                return await _async_fast_path_shuffle(
+                    hass, entry, "tv1", "Test TV", staged, entry_data,
+                    lambda s, m: None,
+                )
+
+        result = asyncio.run(_run())
+
+        assert result is True
+        mock_select.assert_called_once()
+        args, kwargs = mock_select.call_args
+        assert args[0] is entry_data["art_clients"]["tv1"]
+        assert args[1] == "MY_F0042"
+
+    def test_local_fast_path_updates_shuffle_cache(self):
+        """Fast path for local art sets current_image in shuffle_cache."""
+        from custom_components.frame_art_shuffler.shuffle import _async_fast_path_shuffle
+
+        tagset_cache = _LoadedTagsetCache(_TAGSETS)
+        entry = _make_entry(selected_tagset="night")
+        hass = _make_hass()
+        hass.config.path = MagicMock(return_value="/tmp/test_local_fast.log")
+
+        entry_data = {
+            "tagset_cache": tagset_cache,
+            "art_clients": {"tv1": MagicMock()},
+            "artwork_sensors": {"tv1": MagicMock()},
+            "shuffle_cache": {},
+        }
+        staged = self._make_local_staged("fp_local")
+
+        async def _run():
+            with (
+                patch(
+                    "custom_components.frame_art_shuffler.shuffle.select_and_cleanup",
+                    new=AsyncMock(return_value=True),
+                ),
+                patch("custom_components.frame_art_shuffler.shuffle.log_activity"),
+                patch("custom_components.frame_art_shuffler.shuffle.async_dispatcher_send"),
+            ):
+                return await _async_fast_path_shuffle(
+                    hass, entry, "tv1", "Test TV", staged, entry_data,
+                    lambda s, m: None,
+                )
+
+        asyncio.run(_run())
+
+        cache = entry_data["shuffle_cache"].get("tv1", {})
+        assert cache.get("current_image") == "nighthawks-1942-f5ff1784.jpg"
+        assert cache.get("selected_tag") == "night"
+
+    def test_local_fast_path_updates_artwork_sensor(self):
+        """Fast path for local art calls set_artwork with source_type='local'."""
+        from custom_components.frame_art_shuffler.shuffle import _async_fast_path_shuffle
+
+        tagset_cache = _LoadedTagsetCache(_TAGSETS)
+        entry = _make_entry(selected_tagset="night")
+        hass = _make_hass()
+        hass.config.path = MagicMock(return_value="/tmp/test_local_fast.log")
+
+        artwork_sensor = MagicMock()
+        entry_data = {
+            "tagset_cache": tagset_cache,
+            "art_clients": {"tv1": MagicMock()},
+            "artwork_sensors": {"tv1": artwork_sensor},
+            "shuffle_cache": {},
+        }
+        staged = self._make_local_staged("fp_local")
+
+        async def _run():
+            with (
+                patch(
+                    "custom_components.frame_art_shuffler.shuffle.select_and_cleanup",
+                    new=AsyncMock(return_value=True),
+                ),
+                patch("custom_components.frame_art_shuffler.shuffle.log_activity"),
+                patch("custom_components.frame_art_shuffler.shuffle.async_dispatcher_send"),
+            ):
+                return await _async_fast_path_shuffle(
+                    hass, entry, "tv1", "Test TV", staged, entry_data,
+                    lambda s, m: None,
+                )
+
+        asyncio.run(_run())
+
+        artwork_sensor.set_artwork.assert_called_once()
+        _, kwargs = artwork_sensor.set_artwork.call_args
+        assert kwargs.get("source_type") == "local"
+
+    def test_local_fast_path_returns_false_when_select_fails(self):
+        """Fast path returns False (and doesn't update sensors) when select_and_cleanup fails."""
+        from custom_components.frame_art_shuffler.shuffle import _async_fast_path_shuffle
+
+        tagset_cache = _LoadedTagsetCache(_TAGSETS)
+        entry = _make_entry(selected_tagset="night")
+        hass = _make_hass()
+
+        artwork_sensor = MagicMock()
+        entry_data = {
+            "tagset_cache": tagset_cache,
+            "art_clients": {"tv1": MagicMock()},
+            "artwork_sensors": {"tv1": artwork_sensor},
+            "shuffle_cache": {},
+        }
+        staged = self._make_local_staged("fp_local")
+
+        async def _run():
+            with (
+                patch(
+                    "custom_components.frame_art_shuffler.shuffle.select_and_cleanup",
+                    new=AsyncMock(return_value=False),
+                ),
+            ):
+                return await _async_fast_path_shuffle(
+                    hass, entry, "tv1", "Test TV", staged, entry_data,
+                    lambda s, m: None,
+                )
+
+        result = asyncio.run(_run())
+
+        assert result is False
+        artwork_sensor.set_artwork.assert_not_called()
