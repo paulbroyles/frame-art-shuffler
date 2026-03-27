@@ -430,6 +430,19 @@ This represents how many hours of unique shuffles are possible before the fresh 
 
 The Frame Art Manager dashboard includes a "Pool Health" table that calls this API and displays the results in a user-friendly format.
 
+## Mood-Based Shuffle Composition
+
+Active **moods** (driven by HA sensors or service-call overrides) can tilt the probability
+distribution toward or away from specific image tags at shuffle time — without changing
+the underlying tagset. See [MOODS_FEATURE.md](MOODS_FEATURE.md) for the full design.
+
+In brief:
+- Moods are defined in the Frame Art Manager add-on UI (Advanced → Moods)
+- A TV is bound to a mood sensor via `set_mood_sensor` service; the sensor state is
+  read as comma-separated mood IDs at each shuffle
+- Active moods boost matching images, penalize or exclude suppressed images, and can
+  inject search terms into web source queries
+
 ## Future Enhancements
 
 Potential improvements not implemented:
@@ -438,7 +451,7 @@ Potential improvements not implemented:
 - [x] ~~Pool health monitoring~~ — Implemented via REST API
 - [x] ~~Pool health history/sparkline~~ — 7-day trend tracked per shuffle
 - [x] ~~Configurable recency windows~~ — Adjustable via service call (6-168 hours)
-- [ ] Time-of-day based tag filtering
+- [x] ~~Time-of-day based tag filtering~~ — Implemented via Mood system (sensor-driven)
 - [ ] Persistent notification on success/failure
 - [ ] Upload progress indicator
 - [ ] Batch shuffle multiple TVs

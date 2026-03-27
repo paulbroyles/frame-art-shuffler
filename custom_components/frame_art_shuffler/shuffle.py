@@ -26,7 +26,12 @@ from .config_entry import (
     get_tagset_fingerprint,
     get_tv_config,
 )
-from .const import DOMAIN
+from .const import (
+    CONF_MOOD_OVERRIDES,
+    CONF_MOOD_OVERRIDE_EXPIRY,
+    CONF_MOOD_SENSOR,
+    DOMAIN,
+)
 from .frame_tv import (
     FrameArtError,
     select_and_cleanup,
@@ -37,6 +42,47 @@ from .frame_tv import (
 _LOGGER = logging.getLogger(__name__)
 
 UploadWork = Callable[[], Awaitable[Any]]
+
+
+def _resolve_active_moods(hass: HomeAssistant, tv_config: dict[str, Any]) -> list[str]:
+    """Return the list of active mood IDs for a TV at the current moment.
+
+    Merges two sources:
+    - Sensor moods: read from the HA entity bound as mood_sensor (if any).
+      Supports comma-separated string state or attribute 'moods' list.
+    - Override moods: manually activated via the activate_mood service,
+      subject to optional expiry.
+    """
+    mood_sensor = tv_config.get(CONF_MOOD_SENSOR, "")
+    sensor_moods: list[str] = []
+    if mood_sensor:
+        state = hass.states.get(mood_sensor)
+        if state and state.state not in ("unavailable", "unknown", ""):
+            mood_attr = state.attributes.get("moods")
+            if isinstance(mood_attr, list):
+                sensor_moods = [str(m).strip() for m in mood_attr if m]
+            else:
+                sensor_moods = [m.strip() for m in state.state.split(",") if m.strip()]
+
+    override_moods: list[str] = list(tv_config.get(CONF_MOOD_OVERRIDES) or [])
+    expiry_str = tv_config.get(CONF_MOOD_OVERRIDE_EXPIRY)
+    if expiry_str and override_moods:
+        try:
+            expiry = datetime.fromisoformat(expiry_str)
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) > expiry:
+                override_moods = []
+        except Exception:
+            override_moods = []
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for m in sensor_moods + override_moods:
+        if m not in seen:
+            seen.add(m)
+            result.append(m)
+    return result
 
 
 def _write_artwork_sensor_log(log_path: Path, tv_name: str, content_id: str, source_type: str, metadata: dict) -> None:
@@ -117,6 +163,7 @@ async def _async_select_image(
     current_image: str | None,
     tv_name: str,
     recent_images: set[str] | None = None,
+    active_moods: list[str] | None = None,
 ) -> tuple[dict[str, Any] | None, int, str | None, int, bool]:
     """Call the manager add-on to select a random image.
 
@@ -124,12 +171,14 @@ async def _async_select_image(
         (image_dict, eligible_count, selected_tag, fresh_count, used_fallback)
     image_dict is None when no eligible images exist.
     image_dict has {"_web_sources": True, "_virtual_tag_id": ...} for web sources.
+    active_moods is the list of mood IDs currently active for this TV.
     """
     session = async_get_clientsession(hass)
     payload: dict[str, Any] = {
         "tagsetName": tagset_name,
         "currentImage": current_image,
         "recentImages": list(recent_images) if recent_images else [],
+        "activeMoods": active_moods or [],
     }
     try:
         async with asyncio.timeout(10):
@@ -149,7 +198,11 @@ async def _async_select_image(
 
     if result_type == "web_source":
         return (
-            {"_web_sources": True, "_virtual_tag_id": data.get("virtualTagId")},
+            {
+                "_web_sources": True,
+                "_virtual_tag_id": data.get("virtualTagId"),
+                "_mood_keyword": data.get("moodKeyword"),
+            },
             eligible_count,
             data.get("selectedTag"),
             0,
@@ -181,6 +234,8 @@ async def _async_web_source_send(
     matte: str | None = None,
     matching_count: int = 0,
     selected_tag: str | None = None,
+    active_moods: list[str] | None = None,
+    mood_keyword: str | None = None,
     _notify: Callable[[str, str], None] | None = None,
 ) -> dict[str, Any] | None:
     """Call the Frame Art Manager add-on to fetch and send a web source image.
@@ -207,6 +262,10 @@ async def _async_web_source_send(
         payload["screenOn"] = screen_on
     if virtual_tag_id:
         payload["virtualTagId"] = virtual_tag_id
+    if active_moods:
+        payload["activeMoods"] = active_moods
+    if mood_keyword:
+        payload["moodKeyword"] = mood_keyword
     if matte:
         payload["matte"] = matte
 
@@ -504,6 +563,9 @@ async def _async_pre_upload_next(
     current_image = runtime_state.get("current_image")
 
     manager_url = entry.data.get("frame_art_manager_url", "http://localhost:8099")
+    # Resolve active moods for the pre-upload (mirrors _async_shuffle_tv_inner).
+    pre_upload_moods = _resolve_active_moods(hass, tv_config)
+
     try:
         selected_image, _count, selected_tag, _fresh, _fallback = await _async_select_image(
             hass,
@@ -512,6 +574,7 @@ async def _async_pre_upload_next(
             current_image,
             tv_name,
             None,  # No recency filtering for pre-upload
+            active_moods=pre_upload_moods,
         )
     except Exception as err:
         _LOGGER.debug("pre-upload: image selection failed for %s: %s", tv_name, err)
@@ -530,6 +593,8 @@ async def _async_pre_upload_next(
                 hass, entry, tv_id, tv_name, entry_data,
                 select=False,
                 virtual_tag_id=selected_image.get("_virtual_tag_id"),
+                active_moods=pre_upload_moods,
+                mood_keyword=selected_image.get("_mood_keyword"),
             )
             if not result or not result.get("content_id"):
                 _LOGGER.debug("pre-upload: web source upload failed for %s", tv_name)
@@ -668,6 +733,11 @@ async def _async_shuffle_tv_inner(
     tagset_name = get_active_tagset_name(entry, tv_id, tagsets=tagsets)
     include_tags, _ = get_effective_tags(entry, tv_id, tagsets=tagsets)
 
+    # Resolve active moods for this TV (sensor + service overrides)
+    active_moods = _resolve_active_moods(hass, tv_config)
+    if active_moods:
+        _LOGGER.debug("Active moods for %s: %s", tv_name, active_moods)
+
     shuffle_cache = entry_data.setdefault("shuffle_cache", {})
     runtime_state = shuffle_cache.get(tv_id, {})
     current_image = runtime_state.get("current_image") or tv_config.get("current_image")
@@ -732,6 +802,7 @@ async def _async_shuffle_tv_inner(
         current_image,
         tv_name,
         recent_images,
+        active_moods=active_moods,
     )
 
     if not selected_image:
@@ -748,6 +819,8 @@ async def _async_shuffle_tv_inner(
             selected_tag=selected_tag,
             _notify=_notify,
             virtual_tag_id=selected_image.get("_virtual_tag_id"),
+            active_moods=active_moods,
+            mood_keyword=selected_image.get("_mood_keyword"),
         )
         if ws_result:
             hass.async_create_task(

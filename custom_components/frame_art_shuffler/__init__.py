@@ -94,6 +94,9 @@ if _HA_AVAILABLE:
         CONF_SHUFFLE_FREQUENCY,
         CONF_TAGSETS,
         CONF_TOKEN_DIR,
+        CONF_MOOD_SENSOR,
+        CONF_MOOD_OVERRIDES,
+        CONF_MOOD_OVERRIDE_EXPIRY,
         DOMAIN,
         SIGNAL_AUTO_SHUFFLE_NEXT,
     )
@@ -104,6 +107,7 @@ if _HA_AVAILABLE:
     from .frame_tv import TOKEN_DIR as DEFAULT_TOKEN_DIR, TVConnectionManager, set_token_directory, tv_on, tv_off, set_art_mode, is_screen_on, get_tv_model_year
     from .image_cache import ImageMetadataCache
     from .tagset_cache import TagsetCache
+    from .mood_cache import MoodCache
     from .dashboard import async_generate_dashboard
     from .activity import log_activity
     from .shuffle import async_guarded_upload, async_shuffle_tv
@@ -429,8 +433,10 @@ if _HA_AVAILABLE:
         manager_url = entry.data.get("frame_art_manager_url", "http://localhost:8099")
         image_cache = ImageMetadataCache(hass, manager_url)
         tagset_cache = TagsetCache(hass, manager_url)
+        mood_cache = MoodCache(hass, manager_url)
         # Non-fatal if manager unreachable at startup; sensors fall back to entry.data
         await tagset_cache.async_refresh()
+        await mood_cache.async_refresh()
 
         art_clients = {
             tv_id: TVConnectionManager(tv_cfg["ip"])
@@ -444,6 +450,7 @@ if _HA_AVAILABLE:
             "manager_url": manager_url,
             "image_cache": image_cache,
             "tagset_cache": tagset_cache,
+            "mood_cache": mood_cache,
             "token_dir": token_dir,
             "config_snapshot": _get_structural_config(entry.data),
             "art_clients": art_clients,
@@ -1286,6 +1293,138 @@ if _HA_AVAILABLE:
             DOMAIN,
             "clear_tagset_override",
             async_handle_clear_tagset_override,
+        )
+
+        # ── Mood services ──────────────────────────────────────────────────────
+
+        def _get_active_moods_from_sensor(hass: HomeAssistant, sensor_entity_id: str) -> list[str]:
+            """Read active mood IDs from a HA sensor entity.
+
+            Supports two formats:
+              1. Comma-separated string state: "night,snow"
+              2. State attribute 'moods' containing a list: ["night", "snow"]
+            """
+            if not sensor_entity_id:
+                return []
+            state = hass.states.get(sensor_entity_id)
+            if state is None or state.state in ("unavailable", "unknown", ""):
+                return []
+            # Format 2: attribute list
+            mood_attr = state.attributes.get("moods")
+            if isinstance(mood_attr, list):
+                return [str(m).strip() for m in mood_attr if m]
+            # Format 1: comma-separated string
+            return [m.strip() for m in state.state.split(",") if m.strip()]
+
+        def _resolve_active_moods(tv_config: dict, hass: HomeAssistant) -> list[str]:
+            """Merge sensor-derived moods and service-call overrides into the active mood list."""
+            mood_sensor = tv_config.get(CONF_MOOD_SENSOR, "")
+            sensor_moods = _get_active_moods_from_sensor(hass, mood_sensor)
+
+            override_moods: list[str] = tv_config.get(CONF_MOOD_OVERRIDES) or []
+            expiry_str = tv_config.get(CONF_MOOD_OVERRIDE_EXPIRY)
+            if expiry_str:
+                try:
+                    expiry = datetime.fromisoformat(expiry_str)
+                    if expiry.tzinfo is None:
+                        expiry = expiry.replace(tzinfo=timezone.utc)
+                    if datetime.now(timezone.utc) > expiry:
+                        override_moods = []
+                except Exception:
+                    override_moods = []
+
+            # Union: sensor moods + service overrides (deduplicated, order preserved)
+            seen: set[str] = set()
+            result: list[str] = []
+            for m in sensor_moods + override_moods:
+                if m not in seen:
+                    seen.add(m)
+                    result.append(m)
+            return result
+
+        async def async_handle_set_mood_sensor(call: ServiceCall) -> None:
+            """Bind a TV to a HA sensor entity that provides active mood IDs."""
+            target_entry, tv_id, tv_data = await _resolve_tv_from_call(call)
+            sensor = call.data.get("sensor", "").strip()
+            tv_name = tv_data.get("name", tv_id)
+
+            update_tv_config(hass, target_entry, tv_id, {CONF_MOOD_SENSOR: sensor or None})
+            _LOGGER.info("Set mood sensor to '%s' for %s", sensor or "(none)", tv_name)
+
+        async def async_handle_activate_mood(call: ServiceCall) -> None:
+            """Manually activate one or more moods on a TV with optional expiry."""
+            target_entry, tv_id, tv_data = await _resolve_tv_from_call(call)
+            mood_ids = call.data.get("moods", [])
+            expiry_str = call.data.get("expiry", "")
+            tv_name = tv_data.get("name", tv_id)
+
+            if not mood_ids:
+                raise ServiceValidationError("At least one mood ID is required")
+
+            mood_cache = hass.data.get(DOMAIN, {}).get(target_entry.entry_id, {}).get("mood_cache")
+            moods = (mood_cache.get_all() or {}) if mood_cache else {}
+            if mood_cache and not moods:
+                await mood_cache.async_refresh()
+                moods = mood_cache.get_all() or {}
+            for mid in mood_ids:
+                if moods and mid not in moods:
+                    raise ServiceValidationError(f"Mood '{mid}' not found")
+
+            tv_config = get_tv_config(target_entry, tv_id) or {}
+            current_overrides: list[str] = list(tv_config.get(CONF_MOOD_OVERRIDES) or [])
+            for mid in mood_ids:
+                if mid not in current_overrides:
+                    current_overrides.append(mid)
+
+            update_data: dict = {CONF_MOOD_OVERRIDES: current_overrides}
+            if expiry_str:
+                update_data[CONF_MOOD_OVERRIDE_EXPIRY] = expiry_str
+            else:
+                update_data[CONF_MOOD_OVERRIDE_EXPIRY] = None
+
+            update_tv_config(hass, target_entry, tv_id, update_data)
+            _LOGGER.info("Activated moods %s for %s", mood_ids, tv_name)
+            log_activity(
+                hass, target_entry.entry_id, tv_id,
+                "mood_activated",
+                f"Activated moods: {', '.join(mood_ids)}",
+            )
+
+        async def async_handle_deactivate_mood(call: ServiceCall) -> None:
+            """Remove service-call mood overrides from a TV."""
+            target_entry, tv_id, tv_data = await _resolve_tv_from_call(call)
+            mood_ids: list[str] = call.data.get("moods", [])
+            tv_name = tv_data.get("name", tv_id)
+
+            tv_config = get_tv_config(target_entry, tv_id) or {}
+            current_overrides: list[str] = list(tv_config.get(CONF_MOOD_OVERRIDES) or [])
+
+            if mood_ids:
+                new_overrides = [m for m in current_overrides if m not in mood_ids]
+            else:
+                new_overrides = []
+
+            update_tv_config(hass, target_entry, tv_id, {
+                CONF_MOOD_OVERRIDES: new_overrides or None,
+                CONF_MOOD_OVERRIDE_EXPIRY: None,
+            })
+            _LOGGER.info("Deactivated mood overrides for %s", tv_name)
+
+        # Register mood services
+        hass.services.async_register(
+            DOMAIN,
+            "set_mood_sensor",
+            async_handle_set_mood_sensor,
+        )
+        hass.services.async_register(
+            DOMAIN,
+            "activate_mood",
+            async_handle_activate_mood,
+        )
+        hass.services.async_register(
+            DOMAIN,
+            "deactivate_mood",
+            async_handle_deactivate_mood,
         )
 
         # Service to set recency windows

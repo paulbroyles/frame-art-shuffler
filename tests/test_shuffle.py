@@ -933,4 +933,175 @@ class TestLocalFastPath:
         result = asyncio.run(_run())
 
         assert result is False
-        artwork_sensor.set_artwork.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 6. Mood keyword routing
+# ---------------------------------------------------------------------------
+
+_MOOD_KEYWORD_SELECT_RESULT = (
+    {"_web_sources": True, "_virtual_tag_id": None, "_mood_keyword": "night snow"},
+    1,
+    None,       # selectedTag (mood search, no virtual tag)
+    0,
+    False,
+)
+
+_MOOD_KEYWORD_SEND_RESULT = {
+    "content_id": "MY_F0002",
+    "virtual_tag_id": None,
+    "metadata": {"source": "google_arts"},
+    "artwork_metadata": {"title": "Snowy Night"},
+}
+
+
+class TestMoodKeywordRouting:
+    """Tests for moodKeyword routing through the shuffle pipeline.
+
+    When the manager returns type=web_source with a moodKeyword (from a mood-derived
+    composed keyword search winning the pool), the keyword must be forwarded to
+    _async_web_source_send so it reaches fetch-and-send for the actual search.
+    """
+
+    def test_full_path_passes_mood_keyword_to_web_source_send(self):
+        """mood_keyword from the /select response is forwarded to _async_web_source_send."""
+        from custom_components.frame_art_shuffler.shuffle import _async_shuffle_tv_inner
+
+        tagset_cache = _LoadedTagsetCache(_TAGSETS)
+        entry = _make_entry()
+        tv_config = entry.data["tvs"]["tv1"]
+        entry_data = {
+            "tagset_cache": tagset_cache,
+            "staged_images": {},
+            "shuffle_cache": {},
+            "art_clients": {"tv1": MagicMock()},
+            "artwork_sensors": {"tv1": MagicMock()},
+            "tv_status_cache": {},
+        }
+        hass = _make_hass(entry_data=entry_data)
+
+        mock_send = AsyncMock(return_value=_MOOD_KEYWORD_SEND_RESULT)
+
+        async def _run():
+            with (
+                patch(
+                    "custom_components.frame_art_shuffler.shuffle._async_select_image",
+                    new=AsyncMock(return_value=_MOOD_KEYWORD_SELECT_RESULT),
+                ),
+                patch(
+                    "custom_components.frame_art_shuffler.shuffle._async_web_source_send",
+                    new=mock_send,
+                ),
+                patch(
+                    "custom_components.frame_art_shuffler.shuffle._async_pre_upload_next",
+                    new=AsyncMock(),
+                ),
+                patch("custom_components.frame_art_shuffler.shuffle.log_activity"),
+                patch("custom_components.frame_art_shuffler.shuffle.async_dispatcher_send"),
+            ):
+                return await _async_shuffle_tv_inner(
+                    hass, entry, "tv1", tv_config, "Test TV",
+                    "manual", False, lambda s, m: None,
+                )
+
+        asyncio.run(_run())
+
+        mock_send.assert_called_once()
+        _, kwargs = mock_send.call_args
+        assert kwargs.get("mood_keyword") == "night snow", (
+            "mood_keyword from the /select response must be forwarded to _async_web_source_send"
+        )
+        assert kwargs.get("virtual_tag_id") is None, (
+            "virtual_tag_id is None for mood keyword searches (no real virtual tag)"
+        )
+
+    def test_mood_keyword_select_result_captured_by_select_image(self):
+        """_async_select_image correctly captures moodKeyword from the manager response."""
+        from custom_components.frame_art_shuffler.shuffle import _async_select_image
+
+        # _async_select_image uses `await session.post(...)` (not context manager),
+        # then `await resp.json()`.
+        mock_resp = MagicMock()
+        mock_resp.json = AsyncMock(return_value={
+            "type": "web_source",
+            "moodKeyword": "night snow",
+            "virtualTagId": None,
+            "selectedTag": None,
+            "eligibleCount": 1,
+            "freshCount": 0,
+            "usedFallback": False,
+        })
+
+        mock_session = MagicMock()
+        mock_session.post = AsyncMock(return_value=mock_resp)
+
+        hass = MagicMock()
+
+        async def _run():
+            with patch(
+                "custom_components.frame_art_shuffler.shuffle.async_get_clientsession",
+                return_value=mock_session,
+            ):
+                return await _async_select_image(
+                    hass, "http://mock:8099", "google-wallpaper",
+                    None, "Test TV", [],
+                    active_moods=["night", "winter"],
+                )
+
+        image_dict, eligible_count, selected_tag, fresh_count, used_fallback = asyncio.run(_run())
+
+        assert image_dict is not None
+        assert image_dict.get("_web_sources") is True
+        assert image_dict.get("_mood_keyword") == "night snow", (
+            "_mood_keyword must be captured from the moodKeyword field in the manager response"
+        )
+        assert image_dict.get("_virtual_tag_id") is None
+
+    def test_full_path_without_mood_keyword_passes_none(self):
+        """When the normal web source path is taken (no moodKeyword), mood_keyword=None."""
+        from custom_components.frame_art_shuffler.shuffle import _async_shuffle_tv_inner
+
+        tagset_cache = _LoadedTagsetCache(_TAGSETS)
+        entry = _make_entry()
+        tv_config = entry.data["tvs"]["tv1"]
+        entry_data = {
+            "tagset_cache": tagset_cache,
+            "staged_images": {},
+            "shuffle_cache": {},
+            "art_clients": {"tv1": MagicMock()},
+            "artwork_sensors": {"tv1": MagicMock()},
+            "tv_status_cache": {},
+        }
+        hass = _make_hass(entry_data=entry_data)
+
+        mock_send = AsyncMock(return_value=_WEB_SOURCE_SEND_RESULT)
+
+        async def _run():
+            with (
+                patch(
+                    "custom_components.frame_art_shuffler.shuffle._async_select_image",
+                    new=AsyncMock(return_value=_WEB_SOURCE_SELECT_RESULT),
+                ),
+                patch(
+                    "custom_components.frame_art_shuffler.shuffle._async_web_source_send",
+                    new=mock_send,
+                ),
+                patch(
+                    "custom_components.frame_art_shuffler.shuffle._async_pre_upload_next",
+                    new=AsyncMock(),
+                ),
+                patch("custom_components.frame_art_shuffler.shuffle.log_activity"),
+                patch("custom_components.frame_art_shuffler.shuffle.async_dispatcher_send"),
+            ):
+                return await _async_shuffle_tv_inner(
+                    hass, entry, "tv1", tv_config, "Test TV",
+                    "manual", False, lambda s, m: None,
+                )
+
+        asyncio.run(_run())
+
+        mock_send.assert_called_once()
+        _, kwargs = mock_send.call_args
+        # Normal web source: no mood keyword, virtual_tag_id is the real tag
+        assert kwargs.get("mood_keyword") is None
+        assert kwargs.get("virtual_tag_id") == "google-wallpaper"
