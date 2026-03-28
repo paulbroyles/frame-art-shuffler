@@ -273,9 +273,12 @@ class TVConnectionManager:
         See docs/STALE_ART_CHANNEL.md for full analysis and community issue references.
         """
         # If the recv loop has stopped without a proper close, the connection is stale.
-        # This covers the case where the TV sent a Close frame (art app closed the
-        # WebSocket) but async_close() was never called on our side.
-        if self._art.is_alive() and self._art._recv_loop is None:
+        # This covers: (a) TV sent a Close frame (art app closed WebSocket) without us
+        # calling async_close(), and (b) recv loop Task crashed with an exception (e.g.
+        # KeyError in process_event from unexpected TV firmware event format).
+        recv_loop = self._art._recv_loop
+        recv_loop_dead = recv_loop is None or (recv_loop.done() and not recv_loop.cancelled())
+        if self._art.is_alive() and recv_loop_dead:
             _LOGGER.debug("Art recv loop stopped for %s; closing stale connection", self)
             await self.async_close()
 

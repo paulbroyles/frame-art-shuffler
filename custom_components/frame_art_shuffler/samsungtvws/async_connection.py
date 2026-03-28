@@ -117,12 +117,17 @@ class SamsungTVWSAsyncConnection(connection.SamsungTVWSBaseConnection):
         self._recv_loop = None
 
     async def close(self) -> None:
-        if self.is_alive():
-            await self.connection.close()
-            if self._recv_loop:
-                await self._recv_loop
-
-        self.connection = None
+        try:
+            if self.is_alive():
+                await self.connection.close()
+                if self._recv_loop:
+                    try:
+                        await self._recv_loop
+                    except Exception:
+                        pass
+        finally:
+            self._recv_loop = None
+            self.connection = None
         _LOGGING.debug("Connection closed.")
 
     async def send_commands(
