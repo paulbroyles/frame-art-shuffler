@@ -328,6 +328,15 @@ class TVConnectionManager:
         self._art.set_callback("art_mode_changed", callback)
         self._art.set_callback("wakeup", callback)
 
+    def set_wakeup_callback(self, callback) -> None:
+        """Register an async callback for the wakeup event only.
+
+        Unlike set_artwork_change_callback, this does not touch the
+        art_mode_changed callback — safe to use without disturbing other
+        registered callbacks.  Pass None to unregister.
+        """
+        self._art.set_callback("wakeup", callback)
+
     async def async_close(self) -> None:
         """Close the persistent connection."""
         try:

@@ -187,24 +187,42 @@ class FrameArtArtModeButton(ButtonEntity):
                         f"{self._tv_name} screen is off and no MAC address configured for Wake-on-LAN"
                     )
                 _LOGGER.info(f"{self._tv_name} screen is off, sending Wake-on-LAN...")
+
+                # The art channel is still reachable during standby, so connect now
+                # and register a wakeup callback before sending WoL.  The TV fires a
+                # 'wakeup' event on the art channel when the art app is ready — much
+                # more reliable than polling REST.
+                wakeup_future: asyncio.Future = asyncio.get_event_loop().create_future()
+
+                async def _on_wakeup(event, response):
+                    if not wakeup_future.done():
+                        wakeup_future.set_result(True)
+
+                try:
+                    await client.ensure_connected(timeout=8)
+                    # Register only for 'wakeup' so we don't disturb the
+                    # art_mode_changed callback registered by __init__.py.
+                    client.set_wakeup_callback(_on_wakeup)
+                except Exception:
+                    # Couldn't connect before WoL — fine, we'll reconnect after
+                    pass
+
                 # tv_on() handles both deep sleep (two-packet WoL) and network-awake
                 # standby (REST responds immediately → second WoL fires right away).
-                # It polls for 8s after the second WoL, but the Frame can take longer
-                # to fully boot from deep sleep, so we poll an additional 22s here.
                 await tv_on(self._tv_ip, self._tv_mac, client=client)
-                _LOGGER.info(f"{self._tv_name} WoL sent, waiting for screen to come on...")
-                deadline = asyncio.get_event_loop().time() + 22
-                while asyncio.get_event_loop().time() < deadline:
-                    await asyncio.sleep(2)
-                    if await is_screen_on(self._tv_ip, timeout=3):
-                        _LOGGER.info(f"{self._tv_name} screen is on after WoL")
-                        break
-                else:
-                    _LOGGER.warning(f"{self._tv_name} screen still off after WoL — attempting art mode anyway")
+                _LOGGER.info(f"{self._tv_name} WoL sent, waiting for wakeup event (up to 30s)...")
+
+                try:
+                    await asyncio.wait_for(wakeup_future, timeout=30)
+                    _LOGGER.info(f"{self._tv_name} wakeup event received")
+                except asyncio.TimeoutError:
+                    _LOGGER.warning(f"{self._tv_name} no wakeup event within 30s — attempting art mode anyway")
+                finally:
+                    client.set_wakeup_callback(None)
 
             # Ensure art channel is connected (reconnects if needed after WoL)
             try:
-                await client.ensure_connected(timeout=12)
+                await client.ensure_connected(timeout=8)
             except Exception as conn_err:
                 raise FrameArtError(f"Could not connect to art channel on {self._tv_name}: {conn_err}") from conn_err
 
