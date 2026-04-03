@@ -187,40 +187,37 @@ class FrameArtArtModeButton(ButtonEntity):
                         f"{self._tv_name} screen is off and no MAC address configured for Wake-on-LAN"
                     )
                 _LOGGER.info(f"{self._tv_name} screen is off, sending Wake-on-LAN...")
-
-                # The art channel is still reachable during standby, so connect now
-                # and register a wakeup callback before sending WoL.  The TV fires a
-                # 'wakeup' event on the art channel when the art app is ready — much
-                # more reliable than polling REST.
-                wakeup_future: asyncio.Future = asyncio.get_event_loop().create_future()
-
-                async def _on_wakeup(event, response):
-                    if not wakeup_future.done():
-                        wakeup_future.set_result(True)
-
-                try:
-                    await client.ensure_connected(timeout=8)
-                    # Register only for 'wakeup' so we don't disturb the
-                    # art_mode_changed callback registered by __init__.py.
-                    client.set_wakeup_callback(_on_wakeup)
-                except Exception:
-                    # Couldn't connect before WoL — fine, we'll reconnect after
-                    pass
-
                 # tv_on() handles both deep sleep (two-packet WoL) and network-awake
                 # standby (REST responds immediately → second WoL fires right away).
                 await tv_on(self._tv_ip, self._tv_mac, client=client)
-                _LOGGER.info(f"{self._tv_name} WoL sent, waiting for wakeup event (up to 30s)...")
 
-                try:
-                    await asyncio.wait_for(wakeup_future, timeout=30)
-                    _LOGGER.info(f"{self._tv_name} wakeup event received")
-                except asyncio.TimeoutError:
-                    _LOGGER.warning(f"{self._tv_name} no wakeup event within 30s — attempting art mode anyway")
-                finally:
-                    client.set_wakeup_callback(None)
+                # After WoL the TV reboots fully (~30-40s).  The art channel WebSocket
+                # is unavailable until the TV finishes booting.  Retry connect+set_art_mode
+                # every 4s for up to 60s rather than attempting once and failing.
+                _LOGGER.info(f"{self._tv_name} WoL sent, waiting for TV to boot (up to 60s)...")
+                deadline = asyncio.get_event_loop().time() + 60
+                last_err = None
+                while asyncio.get_event_loop().time() < deadline:
+                    await asyncio.sleep(4)
+                    try:
+                        await client.ensure_connected(timeout=8)
+                        await set_art_mode(client)
+                        _LOGGER.info(f"Switched {self._tv_name} to art mode (after WoL)")
+                        log_activity(
+                            self.hass, self._entry.entry_id, self._tv_id,
+                            "screen_on",
+                            "Art Mode",
+                        )
+                        return
+                    except Exception as err:
+                        last_err = err
+                        _LOGGER.debug(f"{self._tv_name} not ready yet ({err}), retrying...")
 
-            # Ensure art channel is connected (reconnects if needed after WoL)
+                raise FrameArtError(
+                    f"{self._tv_name} did not become ready within 60s after WoL: {last_err}"
+                )
+
+            # TV screen was already on — just connect and switch to art mode
             try:
                 await client.ensure_connected(timeout=8)
             except Exception as conn_err:
