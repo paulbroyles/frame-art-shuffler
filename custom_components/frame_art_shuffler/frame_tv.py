@@ -1285,6 +1285,28 @@ async def set_art_mode(client: TVConnectionManager) -> None:
         raise FrameArtUploadError(f"Failed to switch {client} to art mode: {err}") from err
 
 
+async def tv_screen_on(ip: str) -> None:
+    """Turn on the Frame TV screen via a short KEY_POWER click on the remote channel.
+
+    Used when the TV is in light standby (screen off, network reachable) and needs
+    to be woken without a full WoL sequence.  A single KEY_POWER click turns the screen
+    on; the caller should then call set_art_mode() to switch to art mode.
+    """
+    token_path = _token_path(ip)
+    remote = SamsungTVWSAsyncRemote(
+        host=ip,
+        port=DEFAULT_PORT,
+        timeout=_POWER_COMMAND_TIMEOUT,
+        token_file=str(token_path),
+        name="FrameArtShuffler",
+    )
+    try:
+        await remote.send_commands(SendRemoteKey.click("KEY_POWER"))
+        _LOGGER.info("KEY_POWER click sent to %s (screen on)", ip)
+    finally:
+        await remote.close()
+
+
 async def tv_off(ip: str) -> None:
     """Power off Frame TV screen while staying in art mode (hold KEY_POWER for 3 seconds).
 

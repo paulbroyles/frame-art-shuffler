@@ -16,7 +16,7 @@ from homeassistant.helpers import device_registry as dr
 
 from .config_entry import get_tv_config, update_tv_config
 from .const import DOMAIN, CONF_ENABLE_AUTO_SHUFFLE, CONF_LIGHT_SENSOR
-from .frame_tv import tv_on, tv_off, set_art_mode, is_screen_on, check_rest_state, delete_token, toggle_tv_orientation, get_tv_model_year, FrameArtError
+from .frame_tv import tv_on, tv_off, tv_screen_on, set_art_mode, is_screen_on, check_rest_state, delete_token, toggle_tv_orientation, get_tv_model_year, FrameArtError
 from .shuffle import async_shuffle_tv
 from .activity import log_activity
 
@@ -193,10 +193,16 @@ class FrameArtArtModeButton(ButtonEntity):
                     _LOGGER.info(f"{self._tv_name} WoL sent, waiting for TV to boot (up to 60s)...")
                 else:
                     # TV is in light standby (screen off, network already up).
-                    # DO NOT send WoL — a second WoL packet to a network-awake TV
-                    # can confuse it and cause a 2+ minute outage.
-                    # Just retry connecting and switching art mode until it responds.
-                    _LOGGER.info(f"{self._tv_name} screen off, network up — switching to art mode directly...")
+                    # DO NOT send WoL — a WoL packet to a network-awake TV acts as
+                    # the second packet of the two-packet sequence and can put the
+                    # TV into a broken state for 2+ minutes.
+                    # Send KEY_POWER click via the remote channel to turn the screen
+                    # on, then set_art_mode() to switch to art mode.
+                    _LOGGER.info(f"{self._tv_name} screen off, network up — sending KEY_POWER to wake screen...")
+                    try:
+                        await tv_screen_on(self._tv_ip)
+                    except Exception as err:
+                        _LOGGER.warning(f"{self._tv_name} KEY_POWER failed ({err}), will retry art mode directly")
 
                 # Retry ensure_connected + set_art_mode until TV responds (up to 60s).
                 # Covers both: post-WoL boot delay, and light-standby mode transition.
