@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from homeassistant.components.button import ButtonEntity
@@ -188,11 +189,22 @@ class FrameArtArtModeButton(ButtonEntity):
                 _LOGGER.info(f"{self._tv_name} screen is off, sending Wake-on-LAN...")
                 # tv_on() handles both deep sleep (two-packet WoL) and network-awake
                 # standby (REST responds immediately → second WoL fires right away).
+                # It polls for 8s after the second WoL, but the Frame can take longer
+                # to fully boot from deep sleep, so we poll an additional 22s here.
                 await tv_on(self._tv_ip, self._tv_mac, client=client)
+                _LOGGER.info(f"{self._tv_name} WoL sent, waiting for screen to come on...")
+                deadline = asyncio.get_event_loop().time() + 22
+                while asyncio.get_event_loop().time() < deadline:
+                    await asyncio.sleep(2)
+                    if await is_screen_on(self._tv_ip, timeout=3):
+                        _LOGGER.info(f"{self._tv_name} screen is on after WoL")
+                        break
+                else:
+                    _LOGGER.warning(f"{self._tv_name} screen still off after WoL — attempting art mode anyway")
 
             # Ensure art channel is connected (reconnects if needed after WoL)
             try:
-                await client.ensure_connected(timeout=8)
+                await client.ensure_connected(timeout=12)
             except Exception as conn_err:
                 raise FrameArtError(f"Could not connect to art channel on {self._tv_name}: {conn_err}") from conn_err
 
