@@ -1097,6 +1097,11 @@ async def is_screen_on(ip: str, timeout: Optional[float] = None) -> bool:
     return data.get("device", {}).get("PowerState", "off") == "on"
 
 
+async def check_rest_state(ip: str, timeout: float = 3.0) -> tuple:
+    """Public alias for _check_rest_state — see that function for full docs."""
+    return await _check_rest_state(ip, timeout)
+
+
 async def _check_rest_state(ip: str, timeout: float = 3.0) -> tuple:
     """Check TV network and screen state via async REST API.
 

@@ -16,7 +16,7 @@ from homeassistant.helpers import device_registry as dr
 
 from .config_entry import get_tv_config, update_tv_config
 from .const import DOMAIN, CONF_ENABLE_AUTO_SHUFFLE, CONF_LIGHT_SENSOR
-from .frame_tv import tv_on, tv_off, set_art_mode, is_screen_on, delete_token, toggle_tv_orientation, get_tv_model_year, FrameArtError
+from .frame_tv import tv_on, tv_off, set_art_mode, is_screen_on, check_rest_state, delete_token, toggle_tv_orientation, get_tv_model_year, FrameArtError
 from .shuffle import async_shuffle_tv
 from .activity import log_activity
 
@@ -180,63 +180,46 @@ class FrameArtArtModeButton(ButtonEntity):
             # off, art mode standby" (e.g. turned off by Apple TV CEC), the art
             # WebSocket is still reachable and set_artmode("on") is a no-op — the
             # screen stays dark.  We must wake it first via WoL.
-            screen_is_on = await is_screen_on(self._tv_ip, timeout=3)
+            network_awake, screen_is_on = await check_rest_state(self._tv_ip, timeout=3)
             if not screen_is_on:
-                if not self._tv_mac:
-                    raise FrameArtError(
-                        f"{self._tv_name} screen is off and no MAC address configured for Wake-on-LAN"
-                    )
-                _LOGGER.info(f"{self._tv_name} screen is off, sending Wake-on-LAN...")
+                if not network_awake:
+                    # TV is in deep sleep — need WoL to wake the network first.
+                    if not self._tv_mac:
+                        raise FrameArtError(
+                            f"{self._tv_name} is in deep sleep and no MAC address configured for Wake-on-LAN"
+                        )
+                    _LOGGER.info(f"{self._tv_name} in deep sleep, sending Wake-on-LAN...")
+                    await tv_on(self._tv_ip, self._tv_mac, client=client)
+                    _LOGGER.info(f"{self._tv_name} WoL sent, waiting for TV to boot (up to 60s)...")
+                else:
+                    # TV is in light standby (screen off, network already up).
+                    # DO NOT send WoL — a second WoL packet to a network-awake TV
+                    # can confuse it and cause a 2+ minute outage.
+                    # Just retry connecting and switching art mode until it responds.
+                    _LOGGER.info(f"{self._tv_name} screen off, network up — switching to art mode directly...")
 
-                # Register a wakeup callback before sending WoL.  If the TV sends a
-                # 'wakeup' D2D event after booting (on a reconnected art channel), the
-                # background probe's reconnect will deliver it and we can react instantly.
-                # The callback is on the same _art object across reconnects, so it
-                # survives the connection dying during reboot.
-                wakeup_event = asyncio.Event()
-
-                async def _on_wakeup(event, response):
-                    wakeup_event.set()
-
-                client.set_wakeup_callback(_on_wakeup)
-
-                # tv_on() handles both deep sleep (two-packet WoL) and network-awake
-                # standby (REST responds immediately → second WoL fires right away).
-                await tv_on(self._tv_ip, self._tv_mac, client=client)
-
-                # After WoL the TV reboots fully (~30-40s).  Poll every 4s; also
-                # react immediately if the wakeup event fires via the background probe.
-                _LOGGER.info(f"{self._tv_name} WoL sent, waiting for TV to boot (up to 60s)...")
+                # Retry ensure_connected + set_art_mode until TV responds (up to 60s).
+                # Covers both: post-WoL boot delay, and light-standby mode transition.
                 deadline = asyncio.get_event_loop().time() + 60
                 last_err = None
-                try:
-                    while asyncio.get_event_loop().time() < deadline:
-                        # Wait up to 4s for a wakeup event, then try anyway
-                        remaining = deadline - asyncio.get_event_loop().time()
-                        try:
-                            await asyncio.wait_for(wakeup_event.wait(), timeout=min(4, remaining))
-                            _LOGGER.info(f"{self._tv_name} wakeup event received — setting art mode")
-                        except asyncio.TimeoutError:
-                            pass
-                        try:
-                            await client.ensure_connected(timeout=8)
-                            await set_art_mode(client)
-                            _LOGGER.info(f"Switched {self._tv_name} to art mode (after WoL)")
-                            log_activity(
-                                self.hass, self._entry.entry_id, self._tv_id,
-                                "screen_on",
-                                "Art Mode",
-                            )
-                            return
-                        except Exception as err:
-                            last_err = err
-                            wakeup_event.clear()
-                            _LOGGER.debug(f"{self._tv_name} not ready yet ({err}), retrying...")
-                finally:
-                    client.set_wakeup_callback(None)
+                while asyncio.get_event_loop().time() < deadline:
+                    try:
+                        await client.ensure_connected(timeout=8)
+                        await set_art_mode(client)
+                        _LOGGER.info(f"Switched {self._tv_name} to art mode")
+                        log_activity(
+                            self.hass, self._entry.entry_id, self._tv_id,
+                            "screen_on",
+                            "Art Mode",
+                        )
+                        return
+                    except Exception as err:
+                        last_err = err
+                        _LOGGER.debug(f"{self._tv_name} not ready yet ({err}), retrying...")
+                        await asyncio.sleep(4)
 
                 raise FrameArtError(
-                    f"{self._tv_name} did not become ready within 60s after WoL: {last_err}"
+                    f"{self._tv_name} did not respond within 60s: {last_err}"
                 )
 
             # TV screen was already on — just connect and switch to art mode
