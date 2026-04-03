@@ -765,6 +765,14 @@ if _HA_AVAILABLE:
 
                 # No upload guard — pre-upload runs in background and must not
                 # block user-initiated select=True calls which DO use the guard.
+                # However, concurrent TV WebSocket usage (select=False alongside
+                # select=True) causes interleaved responses and failures, so
+                # abort fast if another upload is already running.
+                data = hass.data.get(DOMAIN, {}).get(target_entry.entry_id, {})
+                if tv_id in data.get("upload_in_progress", set()):
+                    raise HomeAssistantError(
+                        f"Pre-upload skipped for {tv_name}: another upload is in progress"
+                    )
                 try:
                     content_id = await frame_tv.upload_to_tv_only(
                         client,

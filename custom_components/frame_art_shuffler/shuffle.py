@@ -556,6 +556,13 @@ async def _async_pre_upload_next(
     tv_name = tv_config.get("name", tv_id)
     tv_mac = tv_config.get("mac")
 
+    # Abort if a full upload is already running for this TV.  Pre-upload uses the
+    # same TVConnectionManager as the full-path shuffle — concurrent WebSocket
+    # operations on the same connection cause interleaved responses and failures.
+    if tv_id in entry_data.get("upload_in_progress", set()):
+        _LOGGER.debug("pre-upload: skipping for %s — upload already in progress", tv_name)
+        return
+
     _LOGGER.debug("pre-upload: starting for %s", tv_name)
 
     # Read tagsets from cache for fingerprint/tagset resolution.
