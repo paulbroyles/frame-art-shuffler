@@ -187,31 +187,53 @@ class FrameArtArtModeButton(ButtonEntity):
                         f"{self._tv_name} screen is off and no MAC address configured for Wake-on-LAN"
                     )
                 _LOGGER.info(f"{self._tv_name} screen is off, sending Wake-on-LAN...")
+
+                # Register a wakeup callback before sending WoL.  If the TV sends a
+                # 'wakeup' D2D event after booting (on a reconnected art channel), the
+                # background probe's reconnect will deliver it and we can react instantly.
+                # The callback is on the same _art object across reconnects, so it
+                # survives the connection dying during reboot.
+                wakeup_event = asyncio.Event()
+
+                async def _on_wakeup(event, response):
+                    wakeup_event.set()
+
+                client.set_wakeup_callback(_on_wakeup)
+
                 # tv_on() handles both deep sleep (two-packet WoL) and network-awake
                 # standby (REST responds immediately → second WoL fires right away).
                 await tv_on(self._tv_ip, self._tv_mac, client=client)
 
-                # After WoL the TV reboots fully (~30-40s).  The art channel WebSocket
-                # is unavailable until the TV finishes booting.  Retry connect+set_art_mode
-                # every 4s for up to 60s rather than attempting once and failing.
+                # After WoL the TV reboots fully (~30-40s).  Poll every 4s; also
+                # react immediately if the wakeup event fires via the background probe.
                 _LOGGER.info(f"{self._tv_name} WoL sent, waiting for TV to boot (up to 60s)...")
                 deadline = asyncio.get_event_loop().time() + 60
                 last_err = None
-                while asyncio.get_event_loop().time() < deadline:
-                    await asyncio.sleep(4)
-                    try:
-                        await client.ensure_connected(timeout=8)
-                        await set_art_mode(client)
-                        _LOGGER.info(f"Switched {self._tv_name} to art mode (after WoL)")
-                        log_activity(
-                            self.hass, self._entry.entry_id, self._tv_id,
-                            "screen_on",
-                            "Art Mode",
-                        )
-                        return
-                    except Exception as err:
-                        last_err = err
-                        _LOGGER.debug(f"{self._tv_name} not ready yet ({err}), retrying...")
+                try:
+                    while asyncio.get_event_loop().time() < deadline:
+                        # Wait up to 4s for a wakeup event, then try anyway
+                        remaining = deadline - asyncio.get_event_loop().time()
+                        try:
+                            await asyncio.wait_for(wakeup_event.wait(), timeout=min(4, remaining))
+                            _LOGGER.info(f"{self._tv_name} wakeup event received — setting art mode")
+                        except asyncio.TimeoutError:
+                            pass
+                        try:
+                            await client.ensure_connected(timeout=8)
+                            await set_art_mode(client)
+                            _LOGGER.info(f"Switched {self._tv_name} to art mode (after WoL)")
+                            log_activity(
+                                self.hass, self._entry.entry_id, self._tv_id,
+                                "screen_on",
+                                "Art Mode",
+                            )
+                            return
+                        except Exception as err:
+                            last_err = err
+                            wakeup_event.clear()
+                            _LOGGER.debug(f"{self._tv_name} not ready yet ({err}), retrying...")
+                finally:
+                    client.set_wakeup_callback(None)
 
                 raise FrameArtError(
                     f"{self._tv_name} did not become ready within 60s after WoL: {last_err}"
