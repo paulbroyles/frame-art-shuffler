@@ -73,6 +73,7 @@ if ha_spec is not None:  # pragma: no cover - depends on optional dependency
         ServiceCall = getattr(_core, "ServiceCall")
         SupportsResponse = getattr(_core, "SupportsResponse")
         ServiceValidationError = getattr(_exceptions, "ServiceValidationError")
+        HomeAssistantError = getattr(_exceptions, "HomeAssistantError")
         dr = _helpers_dr
         er = _helpers_er
         async_track_time_interval = getattr(_helpers_event, "async_track_time_interval")
@@ -512,6 +513,26 @@ if _HA_AVAILABLE:
             artwork_sensor = data.get("artwork_sensors", {}).get(tv_id)
             if not artwork_sensor:
                 return
+
+            # Suppress during active uploads — the art_mode_changed event fired by the TV
+            # after a successful upload can race with the sensor update in _perform_upload.
+            if tv_id in data.get("upload_in_progress", set()):
+                _LOGGER.debug(
+                    "External artwork check suppressed for %s: upload in progress", tv_id
+                )
+                return
+
+            # Suppress for 30s after an upload guard clears — handles the window where
+            # aiohttp may have cancelled _perform_upload (client disconnect on timeout)
+            # but the TV still received and selected the image.
+            last_cleared = data.get("last_upload_cleared_at", 0)
+            if asyncio.get_event_loop().time() - last_cleared < 30:
+                _LOGGER.debug(
+                    "External artwork check suppressed for %s: recent upload (%.0fs ago)",
+                    tv_id, asyncio.get_event_loop().time() - last_cleared,
+                )
+                return
+
             try:
                 current = await client.art.get_current()
                 content_id = current.get("content_id") if current else None
@@ -744,12 +765,15 @@ if _HA_AVAILABLE:
 
                 # No upload guard — pre-upload runs in background and must not
                 # block user-initiated select=True calls which DO use the guard.
-                content_id = await frame_tv.upload_to_tv_only(
-                    client,
-                    image_path,
-                    mac_address=mac,
-                    matte=matte,
-                )
+                try:
+                    content_id = await frame_tv.upload_to_tv_only(
+                        client,
+                        image_path,
+                        mac_address=mac,
+                        matte=matte,
+                    )
+                except frame_tv.FrameArtError as err:
+                    raise HomeAssistantError(str(err)) from err
 
                 return {"content_id": content_id}
 

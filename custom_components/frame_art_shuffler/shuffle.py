@@ -154,6 +154,7 @@ async def async_guarded_upload(
         return await work()
     finally:
         upload_flags.discard(tv_id)
+        data["last_upload_cleared_at"] = asyncio.get_event_loop().time()
 
 
 async def _async_select_image(
