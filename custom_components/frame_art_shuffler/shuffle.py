@@ -270,6 +270,15 @@ async def _async_web_source_send(
     if matte:
         payload["matte"] = matte
 
+    # Hold the upload flag for select=True so the external-artwork detector
+    # suppresses any art_mode_changed events fired by the TV during/after the
+    # upload, and continues to suppress for 30s after the call returns (success
+    # or failure) — covering the case where the add-on times out but the TV
+    # still received and selected the image.
+    if select:
+        upload_flags: set = entry_data.setdefault("upload_in_progress", set())
+        upload_flags.add(tv_id)
+
     try:
         async with asyncio.timeout(65 if select else 120):
             resp = await session.post(
@@ -282,6 +291,10 @@ async def _async_web_source_send(
             raise FrameArtError(f"Web source API call failed for {tv_name}: {err}") from err
         _LOGGER.warning("pre-upload: web source fetch-and-send failed for %s: %s", tv_name, err)
         return None
+    finally:
+        if select:
+            upload_flags.discard(tv_id)
+            entry_data["last_upload_cleared_at"] = asyncio.get_event_loop().time()
 
     if not data.get("success"):
         error_msg = data.get("error", "Unknown error")
