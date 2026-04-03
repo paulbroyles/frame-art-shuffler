@@ -15,7 +15,7 @@ from homeassistant.helpers import device_registry as dr
 
 from .config_entry import get_tv_config, update_tv_config
 from .const import DOMAIN, CONF_ENABLE_AUTO_SHUFFLE, CONF_LIGHT_SENSOR
-from .frame_tv import tv_on, tv_off, set_art_mode, delete_token, toggle_tv_orientation, get_tv_model_year, FrameArtError
+from .frame_tv import tv_on, tv_off, set_art_mode, is_screen_on, delete_token, toggle_tv_orientation, get_tv_model_year, FrameArtError
 from .shuffle import async_shuffle_tv
 from .activity import log_activity
 
@@ -175,17 +175,26 @@ class FrameArtArtModeButton(ButtonEntity):
             if client is None:
                 raise FrameArtError(f"No art client for {self._tv_name}")
 
-            # Try connecting directly first (fast path if TV is awake)
-            try:
-                await client.ensure_connected(timeout=4)
-            except Exception:
-                # TV unreachable — try WoL if MAC is available
+            # Check if screen is on before connecting.  When the TV is in "screen
+            # off, art mode standby" (e.g. turned off by Apple TV CEC), the art
+            # WebSocket is still reachable and set_artmode("on") is a no-op — the
+            # screen stays dark.  We must wake it first via WoL.
+            screen_is_on = await is_screen_on(self._tv_ip, timeout=3)
+            if not screen_is_on:
                 if not self._tv_mac:
                     raise FrameArtError(
-                        f"{self._tv_name} is unreachable and no MAC address available for WoL"
+                        f"{self._tv_name} screen is off and no MAC address configured for Wake-on-LAN"
                     )
-                _LOGGER.info(f"{self._tv_name} unreachable, sending WoL...")
+                _LOGGER.info(f"{self._tv_name} screen is off, sending Wake-on-LAN...")
+                # tv_on() handles both deep sleep (two-packet WoL) and network-awake
+                # standby (REST responds immediately → second WoL fires right away).
                 await tv_on(self._tv_ip, self._tv_mac, client=client)
+
+            # Ensure art channel is connected (reconnects if needed after WoL)
+            try:
+                await client.ensure_connected(timeout=8)
+            except Exception as conn_err:
+                raise FrameArtError(f"Could not connect to art channel on {self._tv_name}: {conn_err}") from conn_err
 
             await set_art_mode(client)
             _LOGGER.info(f"Switched {self._tv_name} to art mode")
