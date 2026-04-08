@@ -369,20 +369,33 @@ async def _async_fast_path_shuffle(
 
     photo_filter = staged.get("photo_filter")
 
-    try:
-        ok = await select_and_cleanup(
-            client,
-            content_id,
-            screen_on=screen_on,
-            mac_address=tv_mac,
-            photo_filter=photo_filter,
-            debug=False,
-        )
-    except Exception as err:
-        _LOGGER.warning("fast-path: select_and_cleanup failed for %s: %s", tv_name, err)
-        return False
+    # Guard against concurrent TV WebSocket operations (e.g. two rapid button
+    # presses).  Two concurrent select_and_cleanup calls share the same WebSocket
+    # connection and produce interleaved responses that confuse the art channel.
+    async def _do_select() -> bool:
+        try:
+            return await select_and_cleanup(
+                client,
+                content_id,
+                screen_on=screen_on,
+                mac_address=tv_mac,
+                photo_filter=photo_filter,
+                debug=False,
+            )
+        except Exception as err:
+            _LOGGER.warning("fast-path: select_and_cleanup failed for %s: %s", tv_name, err)
+            return False
 
-    if not ok:
+    def _on_skip() -> None:
+        _LOGGER.info(
+            "fast-path: skipping %s for %s — another upload already in progress",
+            content_id, tv_name,
+        )
+
+    result = await async_guarded_upload(
+        hass, entry, tv_id, "fast-path shuffle", _do_select, on_skip=_on_skip,
+    )
+    if not result:
         return False
 
     # --- Update sensors, cache, activity (mirrors full-path _perform_upload) ---

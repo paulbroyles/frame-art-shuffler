@@ -1105,3 +1105,382 @@ class TestMoodKeywordRouting:
         # Normal web source: no mood keyword, virtual_tag_id is the real tag
         assert kwargs.get("mood_keyword") is None
         assert kwargs.get("virtual_tag_id") == "google-wallpaper"
+
+
+# ---------------------------------------------------------------------------
+# Upload guard deadlock regression tests
+# ---------------------------------------------------------------------------
+
+class TestUploadGuardDeadlock:
+    """Regression tests for the upload guard deadlock (2026-04).
+
+    Bug: _async_web_source_send used to set upload_in_progress *before* calling
+    the add-on HTTP endpoint.  The add-on immediately calls back into the HA
+    send_image service, which runs via async_guarded_upload.  async_guarded_upload
+    saw the flag already set → called on_skip() → HTTP 500 → shuffle broken.
+
+    Fix: _async_web_source_send must NOT touch upload_in_progress.  Only
+    async_guarded_upload (invoked inside send_image) sets and clears the flag.
+    """
+
+    def test_upload_flag_not_held_during_addon_http_call(self):
+        """upload_in_progress must be clear while the add-on HTTP call is in flight.
+
+        Uses an asyncio.Event to pause the mock HTTP response, then probes the
+        upload_in_progress set.  If the flag is set during the HTTP call the
+        add-on callback into send_image would immediately 500.
+        """
+        import asyncio
+
+        from custom_components.frame_art_shuffler.shuffle import _async_web_source_send
+
+        entry = _make_entry()
+        entry_data: dict = {"upload_in_progress": set()}
+        hass = _make_hass(entry_data=entry_data)
+
+        http_started: asyncio.Event
+        http_unblock: asyncio.Event
+        flag_during_http: list[bool] = []
+
+        async def _run():
+            nonlocal http_started, http_unblock
+            http_started = asyncio.Event()
+            http_unblock = asyncio.Event()
+
+            async def _pausing_post(*args, **kwargs):
+                http_started.set()
+                await http_unblock.wait()
+                mock_resp = AsyncMock()
+                mock_resp.json = AsyncMock(return_value={
+                    "success": True,
+                    "contentId": "MY_F0001",
+                    "metadata": {"title": "Test", "source": "google_art_wallpaper"},
+                    "artworkMetadata": {"title": "Test"},
+                })
+                return mock_resp
+
+            mock_session = MagicMock()
+            mock_session.post = _pausing_post
+
+            mock_device = MagicMock()
+            mock_device.id = "device123"
+
+            async def _probe_then_unblock():
+                await http_started.wait()
+                flag_during_http.append("tv1" in entry_data.get("upload_in_progress", set()))
+                http_unblock.set()
+
+            with (
+                patch(
+                    "custom_components.frame_art_shuffler.shuffle.dr.async_get",
+                    return_value=MagicMock(
+                        async_get_device=MagicMock(return_value=mock_device)
+                    ),
+                ),
+                patch(
+                    "custom_components.frame_art_shuffler.shuffle.async_get_clientsession",
+                    return_value=mock_session,
+                ),
+            ):
+                await asyncio.gather(
+                    _async_web_source_send(
+                        hass, entry, "tv1", "Test TV", entry_data, select=False
+                    ),
+                    _probe_then_unblock(),
+                )
+
+        asyncio.run(_run())
+
+        assert flag_during_http == [False], (
+            "upload_in_progress must NOT be held during the add-on HTTP call. "
+            "If True, the add-on callback into send_image would immediately 500."
+        )
+
+    def test_concurrent_guarded_upload_succeeds_during_web_source_send(self):
+        """A concurrent async_guarded_upload must complete (not skip) while
+        _async_web_source_send is waiting for the add-on HTTP response.
+
+        This is the actual failure mode: the add-on calls back into HA's
+        send_image service.  send_image calls async_guarded_upload.  If
+        upload_in_progress is already set, on_skip() fires → 500 from service.
+        """
+        import asyncio
+
+        from custom_components.frame_art_shuffler.shuffle import (
+            _async_web_source_send,
+            async_guarded_upload,
+        )
+
+        entry = _make_entry()
+        entry_data: dict = {"upload_in_progress": set()}
+        hass = _make_hass(entry_data=entry_data)
+
+        skip_called = False
+
+        async def _run():
+            http_started = asyncio.Event()
+            http_unblock = asyncio.Event()
+
+            async def _pausing_post(*args, **kwargs):
+                http_started.set()
+                await http_unblock.wait()
+                mock_resp = AsyncMock()
+                mock_resp.json = AsyncMock(return_value={
+                    "success": True,
+                    "contentId": "MY_F0001",
+                    "metadata": {"title": "Test", "source": "google_art_wallpaper"},
+                    "artworkMetadata": {},
+                })
+                return mock_resp
+
+            mock_session = MagicMock()
+            mock_session.post = _pausing_post
+            mock_device = MagicMock()
+            mock_device.id = "device123"
+
+            work_ran = []
+
+            async def _addon_callback_work():
+                """Simulates the work send_image does inside async_guarded_upload."""
+                work_ran.append(True)
+                return "ok"
+
+            async def _simulate_addon_callback():
+                """Simulates the add-on calling back into send_image while HTTP is in flight."""
+                await http_started.wait()
+
+                def _on_skip():
+                    nonlocal skip_called
+                    skip_called = True
+
+                result = await async_guarded_upload(
+                    hass, entry, "tv1", "send_image",
+                    _addon_callback_work,
+                    on_skip=_on_skip,
+                )
+                http_unblock.set()
+                return result
+
+            with (
+                patch(
+                    "custom_components.frame_art_shuffler.shuffle.dr.async_get",
+                    return_value=MagicMock(
+                        async_get_device=MagicMock(return_value=mock_device)
+                    ),
+                ),
+                patch(
+                    "custom_components.frame_art_shuffler.shuffle.async_get_clientsession",
+                    return_value=mock_session,
+                ),
+            ):
+                ws_result, callback_result = await asyncio.gather(
+                    _async_web_source_send(
+                        hass, entry, "tv1", "Test TV", entry_data, select=False
+                    ),
+                    _simulate_addon_callback(),
+                )
+
+            assert not skip_called, (
+                "on_skip() must not be called — the add-on callback should run, not be skipped. "
+                "If skip_called=True, _async_web_source_send is illegally holding upload_in_progress."
+            )
+            assert work_ran == [True], (
+                "The simulated send_image work must have run (not been skipped)"
+            )
+
+        asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Fast-path shuffle concurrency tests
+# ---------------------------------------------------------------------------
+
+class TestFastPathConcurrency:
+    """Regression tests for concurrent fast-path shuffle calls (2026-04).
+
+    Bug: _async_fast_path_shuffle called select_and_cleanup without holding
+    upload_in_progress.  Two rapid button presses launched two concurrent
+    select_and_cleanup calls on the same WebSocket, producing interleaved
+    responses that confused the art channel.
+
+    Fix: _async_fast_path_shuffle wraps the TV operation in async_guarded_upload.
+    The second concurrent call hits the guard, fires on_skip(), and returns False.
+    select_and_cleanup is only called once.
+    """
+
+    def _make_staged(self) -> dict:
+        return {
+            "content_id": "MY_F0042",
+            "source_type": "web_source",
+            "virtual_tag_id": "google-wallpaper",
+            "selected_tag": "ws:google-wallpaper",
+            "metadata": {"title": "Test Art", "source": "google_arts"},
+            "artwork_metadata": {"title": "Test Art"},
+            "tagset_fingerprint": "fp_abc123",
+        }
+
+    def test_second_concurrent_fast_path_is_skipped(self):
+        """A second _async_fast_path_shuffle call while the first is in-flight
+        must be skipped (select_and_cleanup called only once).
+
+        Simulates two rapid button presses: the first call pauses inside
+        select_and_cleanup; the second call arrives and should hit the
+        upload guard and return False without calling select_and_cleanup.
+        """
+        import asyncio
+
+        from custom_components.frame_art_shuffler.shuffle import _async_fast_path_shuffle
+
+        entry = _make_entry()
+        entry_data: dict = {
+            "upload_in_progress": set(),
+            "art_clients": {"tv1": MagicMock()},
+            "artwork_sensors": {"tv1": MagicMock()},
+            "shuffle_cache": {},
+            "tagset_cache": _LoadedTagsetCache(_TAGSETS),
+        }
+        hass = _make_hass(entry_data=entry_data)
+
+        select_call_count = []
+        skip_called = []
+
+        async def _run():
+            first_started = asyncio.Event()
+            first_unblock = asyncio.Event()
+
+            async def _pausing_select_and_cleanup(*args, **kwargs):
+                select_call_count.append(1)
+                first_started.set()
+                await first_unblock.wait()
+                return True
+
+            async def _first():
+                with (
+                    patch(
+                        "custom_components.frame_art_shuffler.shuffle.select_and_cleanup",
+                        side_effect=_pausing_select_and_cleanup,
+                    ),
+                    patch("custom_components.frame_art_shuffler.shuffle.log_activity"),
+                    patch("custom_components.frame_art_shuffler.shuffle.async_dispatcher_send"),
+                    patch("custom_components.frame_art_shuffler.shuffle.dr"),
+                    patch("custom_components.frame_art_shuffler.shuffle.async_get_clientsession"),
+                ):
+                    return await _async_fast_path_shuffle(
+                        hass, entry, "tv1", "Test TV",
+                        _make_staged_copy(), entry_data,
+                        lambda status, msg: None,
+                        screen_on=False,
+                    )
+
+            async def _second():
+                await first_started.wait()
+
+                def _on_skip_recorded():
+                    skip_called.append(True)
+
+                with (
+                    patch(
+                        "custom_components.frame_art_shuffler.shuffle.select_and_cleanup",
+                        side_effect=_pausing_select_and_cleanup,
+                    ),
+                    patch("custom_components.frame_art_shuffler.shuffle.log_activity"),
+                    patch("custom_components.frame_art_shuffler.shuffle.async_dispatcher_send"),
+                    patch("custom_components.frame_art_shuffler.shuffle.dr"),
+                    patch("custom_components.frame_art_shuffler.shuffle.async_get_clientsession"),
+                ):
+                    result = await _async_fast_path_shuffle(
+                        hass, entry, "tv1", "Test TV",
+                        _make_staged_copy(), entry_data,
+                        lambda status, msg: None,
+                        screen_on=False,
+                    )
+                first_unblock.set()
+                return result
+
+            results = await asyncio.gather(_first(), _second())
+            return results
+
+        def _make_staged_copy():
+            return dict(self._make_staged())
+
+        results = asyncio.run(_run())
+
+        assert select_call_count == [1], (
+            f"select_and_cleanup must be called exactly once, got {len(select_call_count)} calls. "
+            "If 2, two concurrent fast-path shuffles are sharing the WebSocket."
+        )
+        # First call succeeds (or fails — not important here); second must return False
+        assert results[1] is False, (
+            "The second concurrent fast-path call must return False (skipped by upload guard)"
+        )
+
+    def test_sequential_fast_path_calls_both_succeed(self):
+        """Sequential (non-concurrent) fast-path calls must both call select_and_cleanup.
+
+        Guards that the fix doesn't accidentally block legitimate sequential calls.
+        """
+        import asyncio
+
+        from custom_components.frame_art_shuffler.shuffle import _async_fast_path_shuffle
+
+        entry = _make_entry()
+        entry_data: dict = {
+            "upload_in_progress": set(),
+            "art_clients": {"tv1": MagicMock()},
+            "artwork_sensors": {"tv1": MagicMock()},
+            "shuffle_cache": {},
+            "tagset_cache": _LoadedTagsetCache(_TAGSETS),
+        }
+        hass = _make_hass(entry_data=entry_data)
+
+        select_call_count = []
+
+        async def _select_ok(*args, **kwargs):
+            select_call_count.append(1)
+            return True
+
+        def _make_staged_copy():
+            return dict({
+                "content_id": "MY_F0042",
+                "source_type": "web_source",
+                "virtual_tag_id": "google-wallpaper",
+                "selected_tag": "ws:google-wallpaper",
+                "metadata": {"title": "Test Art", "source": "google_arts"},
+                "artwork_metadata": {"title": "Test Art"},
+                "tagset_fingerprint": "fp_abc123",
+            })
+
+        async def _run():
+            patches = (
+                patch(
+                    "custom_components.frame_art_shuffler.shuffle.select_and_cleanup",
+                    side_effect=_select_ok,
+                ),
+                patch("custom_components.frame_art_shuffler.shuffle.log_activity"),
+                patch("custom_components.frame_art_shuffler.shuffle.async_dispatcher_send"),
+                patch("custom_components.frame_art_shuffler.shuffle.dr"),
+                patch("custom_components.frame_art_shuffler.shuffle.async_get_clientsession"),
+            )
+            with patches[0], patches[1], patches[2], patches[3], patches[4]:
+                r1 = await _async_fast_path_shuffle(
+                    hass, entry, "tv1", "Test TV",
+                    _make_staged_copy(), entry_data,
+                    lambda status, msg: None,
+                    screen_on=False,
+                )
+                r2 = await _async_fast_path_shuffle(
+                    hass, entry, "tv1", "Test TV",
+                    _make_staged_copy(), entry_data,
+                    lambda status, msg: None,
+                    screen_on=False,
+                )
+            return r1, r2
+
+        r1, r2 = asyncio.run(_run())
+
+        assert select_call_count == [1, 1], (
+            f"Sequential fast-path calls must each invoke select_and_cleanup once, "
+            f"got {select_call_count}"
+        )
+        assert r1 is True
+        assert r2 is True

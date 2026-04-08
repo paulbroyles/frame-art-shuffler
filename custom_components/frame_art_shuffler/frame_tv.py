@@ -927,66 +927,83 @@ async def select_and_cleanup(
     else:
         keep_content_ids = keep_content_ids | {content_id}
 
-    # --- Check screen state (before any WoL) ---
-    # When screen_on=False, check actual screen state so we can show the image
-    # if the screen happens to be on, without waking it if it's off.
-    pre_network_awake = False
-    if pre_screen_on is None:
-        pre_screen_on = False
-        if not screen_on:
-            pre_network_awake, pre_screen_on = await _check_rest_state(ip)
-    else:
-        # Caller provided pre_screen_on; derive pre_network_awake from it
-        pre_network_awake = pre_screen_on  # if screen was on, network is awake
-
-    # --- Connectivity / Wake ---
-    await _ensure_tv_reachable(
-        client,
-        mac_address=mac_address,
-        screen_on=screen_on,
-        pre_network_awake=pre_network_awake if not screen_on else False,
-    )
-
-    # --- Select image ---
-    await client.ensure_connected()
+    # art is assigned inside the try block but referenced outside for cleanup.
     art = client.art
 
-    # Determine show flag: if caller says screen_on, always show.
-    # If screen_on=False, show only if the screen was already on before we started.
-    show = screen_on or pre_screen_on
-
     try:
-        await art.select_image(content_id, show=show)
-        client._last_art_ok = asyncio.get_event_loop().time()
-    except Exception as err:
-        _LOGGER.warning("select_and_cleanup: select_image failed for %s: %s", content_id, err)
+        # Hard cap on the select phase.  WoL can take up to 45s, reconnect up to
+        # 30s, select_image 2s, verify up to 8s — theoretical max ~85s.  90s gives
+        # a small buffer while ensuring upload_in_progress is never held indefinitely
+        # when the TV is unreachable or the art channel hangs.
+        async with asyncio.timeout(90):
+            # --- Check screen state (before any WoL) ---
+            # When screen_on=False, check actual screen state so we can show the image
+            # if the screen happens to be on, without waking it if it's off.
+            pre_network_awake = False
+            if pre_screen_on is None:
+                pre_screen_on = False
+                if not screen_on:
+                    pre_network_awake, pre_screen_on = await _check_rest_state(ip)
+            else:
+                # Caller provided pre_screen_on; derive pre_network_awake from it
+                pre_network_awake = pre_screen_on  # if screen was on, network is awake
+
+            # --- Connectivity / Wake ---
+            await _ensure_tv_reachable(
+                client,
+                mac_address=mac_address,
+                screen_on=screen_on,
+                pre_network_awake=pre_network_awake if not screen_on else False,
+            )
+
+            # --- Select image ---
+            await client.ensure_connected()
+            art = client.art
+
+            # Determine show flag: if caller says screen_on, always show.
+            # If screen_on=False, show only if the screen was already on before we started.
+            show = screen_on or pre_screen_on
+
+            try:
+                await art.select_image(content_id, show=show)
+                client._last_art_ok = asyncio.get_event_loop().time()
+            except Exception as err:
+                _LOGGER.warning("select_and_cleanup: select_image failed for %s: %s", content_id, err)
+                return False
+
+            # Verify selection for screen-on displays
+            if show:
+                verified = await _poll_until(
+                    lambda: _verify_current_art(art, content_id, debug=debug),
+                    max_wait=_DISPLAY_VERIFY_MAX_WAIT,
+                    label="verify staged display",
+                )
+                if not verified:
+                    _LOGGER.warning("select_and_cleanup: could not verify %s is displayed", content_id)
+            else:
+                _LOGGER.info("select_and_cleanup: %s selected silently (screen off)", content_id)
+
+            # Apply photo filter if specified
+            if photo_filter is not None and photo_filter.lower() not in ("none", ""):
+                try:
+                    await art.set_photo_filter(content_id, photo_filter)
+                    if debug:
+                        _LOGGER.debug("Applied photo filter '%s' to %s", photo_filter, content_id)
+                except Exception as filter_err:
+                    _LOGGER.warning("Failed to apply photo filter '%s': %s", photo_filter, filter_err)
+
+            elapsed = asyncio.get_event_loop().time() - _op_start
+            _LOGGER.info("select_and_cleanup: selected in %.1fs for %s", elapsed, ip)
+
+    except TimeoutError:
+        elapsed = asyncio.get_event_loop().time() - _op_start
+        _LOGGER.warning(
+            "select_and_cleanup: timed out after %.1fs for %s — upload guard released",
+            elapsed, ip,
+        )
         return False
 
-    # Verify selection for screen-on displays
-    if show:
-        verified = await _poll_until(
-            lambda: _verify_current_art(art, content_id, debug=debug),
-            max_wait=_DISPLAY_VERIFY_MAX_WAIT,
-            label="verify staged display",
-        )
-        if not verified:
-            _LOGGER.warning("select_and_cleanup: could not verify %s is displayed", content_id)
-    else:
-        _LOGGER.info("select_and_cleanup: %s selected silently (screen off)", content_id)
-
-    # Apply photo filter if specified
-    if photo_filter is not None and photo_filter.lower() not in ("none", ""):
-        try:
-            await art.set_photo_filter(content_id, photo_filter)
-            if debug:
-                _LOGGER.debug("Applied photo filter '%s' to %s", photo_filter, content_id)
-        except Exception as filter_err:
-            _LOGGER.warning("Failed to apply photo filter '%s': %s", photo_filter, filter_err)
-
-    elapsed = asyncio.get_event_loop().time() - _op_start
-    _LOGGER.info("select_and_cleanup: selected in %.1fs for %s", elapsed, ip)
-
-    # --- Cleanup old images ---
+    # --- Cleanup old images (outside timeout — non-critical, background-safe) ---
     if blocking_cleanup:
         await _delete_other_images(art, keep_content_ids, debug=debug)
     else:
@@ -1301,7 +1318,7 @@ async def tv_screen_on(ip: str) -> None:
         name="FrameArtShuffler",
     )
     try:
-        await remote.send_commands(SendRemoteKey.click("KEY_POWER"))
+        await remote.send_commands([SendRemoteKey.click("KEY_POWER")])
         _LOGGER.info("KEY_POWER click sent to %s (screen on)", ip)
     finally:
         await remote.close()
