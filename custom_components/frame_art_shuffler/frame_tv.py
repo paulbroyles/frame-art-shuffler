@@ -771,7 +771,15 @@ async def set_art_on_tv_deleteothers(
 
         if delete_others:
             _log_progress("Cleaning up old images from TV memory...")
-            await _delete_other_images(art, {content_id}, debug=debug)
+            try:
+                await _delete_other_images(art, {content_id}, debug=debug)
+            except Exception as cleanup_err:  # pylint: disable=broad-except
+                # Cleanup is non-critical — the upload and selection succeeded.
+                # Log and continue so the artwork sensor and activity log still update.
+                _LOGGER.warning(
+                    "Cleanup failed for %s (non-fatal, upload succeeded): %s",
+                    content_id, cleanup_err,
+                )
 
         _op_elapsed = asyncio.get_event_loop().time() - _op_start
         _log_progress(f"Upload complete for {ip} (content_id={content_id})")
