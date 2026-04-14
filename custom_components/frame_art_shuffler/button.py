@@ -210,13 +210,19 @@ class FrameArtArtModeButton(ButtonEntity):
                     except Exception as err:
                         _LOGGER.warning(f"{self._tv_name} KEY_POWER click 1 failed ({err}), will retry art mode directly")
                     else:
-                        # Wait for the TV to finish mode transition after click 1.
-                        await asyncio.sleep(3)
-                        try:
-                            await client.ensure_connected(timeout=8)
-                            art_mode_on = await is_art_mode_enabled(client)
-                        except Exception:
-                            art_mode_on = None
+                        # Poll is_art_mode_enabled() every 300ms starting at 500ms after click 1.
+                        # We need click 2 before CEC fires (~2-3s after screen on), so poll fast
+                        # rather than sleeping a fixed 3s.
+                        art_mode_on = None
+                        await asyncio.sleep(0.5)
+                        poll_deadline = asyncio.get_event_loop().time() + 5.0
+                        while asyncio.get_event_loop().time() < poll_deadline:
+                            try:
+                                await client.ensure_connected(timeout=2)
+                                art_mode_on = await is_art_mode_enabled(client)
+                                break  # got a definitive answer
+                            except Exception:
+                                await asyncio.sleep(0.3)
                         if art_mode_on is True:
                             _LOGGER.info(f"{self._tv_name} already in art mode after click 1 — done")
                             log_activity(self.hass, self._entry.entry_id, self._tv_id, "screen_on", "Art Mode")
