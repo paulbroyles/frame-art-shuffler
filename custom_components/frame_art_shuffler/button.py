@@ -16,7 +16,7 @@ from homeassistant.helpers import device_registry as dr
 
 from .config_entry import get_tv_config, update_tv_config
 from .const import DOMAIN, CONF_ENABLE_AUTO_SHUFFLE, CONF_LIGHT_SENSOR
-from .frame_tv import tv_on, tv_off, tv_screen_on, set_art_mode, is_screen_on, check_rest_state, delete_token, toggle_tv_orientation, get_tv_model_year, FrameArtError
+from .frame_tv import tv_on, tv_off, tv_screen_on, set_art_mode, is_art_mode_enabled, is_screen_on, check_rest_state, delete_token, toggle_tv_orientation, get_tv_model_year, FrameArtError
 from .shuffle import async_shuffle_tv
 from .activity import log_activity
 
@@ -196,16 +196,44 @@ class FrameArtArtModeButton(ButtonEntity):
                     # DO NOT send WoL — a WoL packet to a network-awake TV acts as
                     # the second packet of the two-packet sequence and can put the
                     # TV into a broken state for 2+ minutes.
-                    # Send KEY_POWER click via the remote channel to turn the screen
-                    # on, then set_art_mode() to switch to art mode.
-                    _LOGGER.info(f"{self._tv_name} screen off, network up — sending KEY_POWER to wake screen...")
+                    #
+                    # State-aware two-click sequence:
+                    #   Click 1 → wakes screen into TV/HDMI mode
+                    #   Wait ~3s for mode transition to settle
+                    #   Check is_art_mode_enabled():
+                    #     True  → already in art mode (rare but possible) — done
+                    #     False → TV mode; Click 2 → pushes into art mode standby
+                    #     None  → couldn't check; proceed to retry loop anyway
+                    _LOGGER.info(f"{self._tv_name} screen off, network up — sending KEY_POWER (click 1) to wake screen...")
                     try:
                         await tv_screen_on(self._tv_ip)
                     except Exception as err:
-                        _LOGGER.warning(f"{self._tv_name} KEY_POWER failed ({err}), will retry art mode directly")
+                        _LOGGER.warning(f"{self._tv_name} KEY_POWER click 1 failed ({err}), will retry art mode directly")
+                    else:
+                        # Wait for the TV to finish mode transition after click 1.
+                        await asyncio.sleep(3)
+                        try:
+                            await client.ensure_connected(timeout=8)
+                            art_mode_on = await is_art_mode_enabled(client)
+                        except Exception:
+                            art_mode_on = None
+                        if art_mode_on is True:
+                            _LOGGER.info(f"{self._tv_name} already in art mode after click 1 — done")
+                            log_activity(self.hass, self._entry.entry_id, self._tv_id, "screen_on", "Art Mode")
+                            return
+                        elif art_mode_on is False:
+                            # TV woke into TV/HDMI mode. Second click pushes it to art mode standby.
+                            _LOGGER.info(f"{self._tv_name} in TV mode after click 1 — sending KEY_POWER (click 2) to enter art mode")
+                            try:
+                                await tv_screen_on(self._tv_ip)
+                            except Exception as err:
+                                _LOGGER.warning(f"{self._tv_name} KEY_POWER click 2 failed ({err})")
+                            await asyncio.sleep(2)
+                        else:
+                            _LOGGER.debug(f"{self._tv_name} art mode state unknown after click 1 — proceeding to retry loop")
 
                 # Retry ensure_connected + set_art_mode until TV responds (up to 60s).
-                # Covers both: post-WoL boot delay, and light-standby mode transition.
+                # Covers both: post-WoL boot delay, and post-KEY_POWER mode transition.
                 deadline = asyncio.get_event_loop().time() + 60
                 last_err = None
                 while asyncio.get_event_loop().time() < deadline:
