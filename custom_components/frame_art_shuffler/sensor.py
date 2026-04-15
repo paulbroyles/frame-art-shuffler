@@ -1334,7 +1334,7 @@ class FrameArtSelectedTagsetEntity(SensorEntity):
     async def async_added_to_hass(self) -> None:
         """Subscribe to tagset assignment updates."""
         signal = f"{DOMAIN}_tagset_updated_{self._entry.entry_id}_{self._tv_id}"
-        self.async_on_unload(
+        self.async_on_remove(
             async_dispatcher_connect(self._hass, signal, self.async_write_ha_state)
         )
 
@@ -1378,7 +1378,7 @@ class FrameArtSelectedTagsetWeightingEntity(SensorEntity):
     async def async_added_to_hass(self) -> None:
         """Subscribe to tagset assignment updates."""
         signal = f"{DOMAIN}_tagset_updated_{self._entry.entry_id}_{self._tv_id}"
-        self.async_on_unload(
+        self.async_on_remove(
             async_dispatcher_connect(self._hass, signal, self.async_write_ha_state)
         )
 
@@ -1422,7 +1422,7 @@ class FrameArtOverrideTagsetEntity(SensorEntity):
     async def async_added_to_hass(self) -> None:
         """Subscribe to tagset assignment updates."""
         signal = f"{DOMAIN}_tagset_updated_{self._entry.entry_id}_{self._tv_id}"
-        self.async_on_unload(
+        self.async_on_remove(
             async_dispatcher_connect(self._hass, signal, self.async_write_ha_state)
         )
 
@@ -1466,7 +1466,7 @@ class FrameArtOverrideExpiryEntity(SensorEntity):
     async def async_added_to_hass(self) -> None:
         """Subscribe to tagset assignment updates."""
         signal = f"{DOMAIN}_tagset_updated_{self._entry.entry_id}_{self._tv_id}"
-        self.async_on_unload(
+        self.async_on_remove(
             async_dispatcher_connect(self._hass, signal, self.async_write_ha_state)
         )
 
