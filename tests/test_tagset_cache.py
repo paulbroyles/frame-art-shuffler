@@ -150,6 +150,39 @@ class TestTagsetCacheRefresh:
         assert cache._ever_loaded is True
         assert cache.get_all() == _TAGSETS
 
+    def test_refresh_second_call_replaces_first(self):
+        """A successful refresh after a prior successful refresh replaces the data.
+
+        Ensures that a newly added tagset on the manager shows up after a second
+        refresh, even when the first refresh had already populated the cache.
+        This is the cache-layer half of the stale-tagset regression test; the
+        service-layer half is in TestTagsetCacheStaleData.
+        """
+        hass = MagicMock()
+        cache = TagsetCache(hass, "http://mock:8099")
+
+        updated_tagsets = {
+            **_TAGSETS,
+            "extra": {"tags": ["extra"], "exclude_tags": [], "weighting_type": "image", "tag_weights": {}},
+        }
+
+        async def _run():
+            with patch(
+                "custom_components.frame_art_shuffler.tagset_cache.async_get_clientsession",
+                return_value=_make_mock_session(200, {"tagsets": _TAGSETS}),
+            ):
+                await cache.async_refresh()
+            assert cache.get("extra") is None
+
+            with patch(
+                "custom_components.frame_art_shuffler.tagset_cache.async_get_clientsession",
+                return_value=_make_mock_session(200, {"tagsets": updated_tagsets}),
+            ):
+                await cache.async_refresh()
+
+        asyncio.run(_run())
+        assert cache.get("extra") is not None
+
 
 class TestTagsetCacheEnsureLoaded:
     """Tests for the async_ensure_loaded no-op contract.
@@ -235,3 +268,72 @@ class TestTagsetCacheEnsureLoaded:
 
         assert cache._ever_loaded is True
         assert cache.get_all() == _TAGSETS
+
+
+class TestTagsetCacheStaleData:
+    """Tests that document the service-layer on-demand refresh contract.
+
+    The bug: select_tagset only refreshed when the cache was *empty*, so a tagset
+    added after the initial load was never visible until HA restarted.  These tests
+    pin the behavior that makes the fix correct.
+    """
+
+    def test_get_returns_none_for_unknown_key_when_loaded(self):
+        """get() returns None for a key not in the cache even when the cache is populated.
+
+        Guards against accidental default-value returns that could mask missing tagsets
+        and prevent the service handler from triggering its on-demand refresh.
+        """
+        hass = MagicMock()
+        cache = TagsetCache(hass, "http://mock:8099")
+
+        async def _run():
+            with patch(
+                "custom_components.frame_art_shuffler.tagset_cache.async_get_clientsession",
+                return_value=_make_mock_session(200),
+            ):
+                await cache.async_refresh()
+
+        asyncio.run(_run())
+
+        assert cache.get_all() != {}  # cache is populated
+        assert cache.get("does-not-exist") is None
+
+    def test_refresh_picks_up_newly_added_tagset(self):
+        """A tagset added on the manager after initial load is visible after refresh.
+
+        This is the regression test for the stale-cache bug: the cache had data
+        (so the old code skipped refresh), but the requested tagset was missing.
+        The fix: refresh on-demand when a name lookup fails, not only when empty.
+        """
+        hass = MagicMock()
+        cache = TagsetCache(hass, "http://mock:8099")
+
+        new_tagset = {
+            "tags": ["ws:mixed-landscape-painting"],
+            "exclude_tags": [],
+            "weighting_type": "tag",
+            "tag_weights": {"ws:google-wallpaper": 0.5},
+        }
+        updated_tagsets = {**_TAGSETS, "mixed-landscape-painting": new_tagset}
+
+        async def _run():
+            # Initial load — new tagset doesn't exist yet
+            with patch(
+                "custom_components.frame_art_shuffler.tagset_cache.async_get_clientsession",
+                return_value=_make_mock_session(200, {"tagsets": _TAGSETS}),
+            ):
+                await cache.async_refresh()
+
+            assert cache.get("mixed-landscape-painting") is None
+
+            # Tagset added on manager; on-demand refresh triggered by service handler
+            with patch(
+                "custom_components.frame_art_shuffler.tagset_cache.async_get_clientsession",
+                return_value=_make_mock_session(200, {"tagsets": updated_tagsets}),
+            ):
+                await cache.async_refresh()
+
+        asyncio.run(_run())
+
+        assert cache.get("mixed-landscape-painting") == new_tagset

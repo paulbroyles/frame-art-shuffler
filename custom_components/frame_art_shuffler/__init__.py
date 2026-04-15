@@ -1214,12 +1214,14 @@ if _HA_AVAILABLE:
             # If the cache is empty (manager was unreachable at startup), try a fresh fetch.
             tagset_cache = hass.data.get(DOMAIN, {}).get(target_entry.entry_id, {}).get("tagset_cache")
             tagsets = (tagset_cache.get_all() or None) if tagset_cache else None
-            if not tagsets and tagset_cache:
-                await tagset_cache.async_refresh()
-                tagsets = (tagset_cache.get_all() or None)
             if tagsets is None:
                 tagsets = get_global_tagsets(target_entry)
-            if name not in tagsets:
+            if name not in (tagsets or {}):
+                # Not in cache — refresh once in case it was added since last load.
+                if tagset_cache:
+                    await tagset_cache.async_refresh()
+                    tagsets = tagset_cache.get_all() or tagsets
+            if name not in (tagsets or {}):
                 raise ServiceValidationError(f"Tagset '{name}' not found")
 
             update_tv_config(hass, target_entry, tv_id, {CONF_SELECTED_TAGSET: name})
@@ -1252,15 +1254,16 @@ if _HA_AVAILABLE:
             tv_name = tv_data.get("name", tv_id)
 
             # Validate tagset exists in cache (manager owns definitions).
-            # If the cache is empty (manager was unreachable at startup), try a fresh fetch.
+            # If the name isn't found, refresh once in case it was added since last load.
             tagset_cache = hass.data.get(DOMAIN, {}).get(target_entry.entry_id, {}).get("tagset_cache")
             tagsets = (tagset_cache.get_all() or None) if tagset_cache else None
-            if not tagsets and tagset_cache:
-                await tagset_cache.async_refresh()
-                tagsets = (tagset_cache.get_all() or None)
             if tagsets is None:
                 tagsets = get_global_tagsets(target_entry)
-            if name not in tagsets:
+            if name not in (tagsets or {}):
+                if tagset_cache:
+                    await tagset_cache.async_refresh()
+                    tagsets = tagset_cache.get_all() or tagsets
+            if name not in (tagsets or {}):
                 raise ServiceValidationError(f"Tagset '{name}' not found")
 
             expiry_time = datetime.now(timezone.utc) + timedelta(minutes=duration_minutes)
