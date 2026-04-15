@@ -127,7 +127,7 @@ class TestSelectedTagsetSensorSubscription:
             connected_signals.append(signal)
             return lambda: None  # unsubscribe noop
 
-        sensor.async_on_unload = MagicMock()
+        sensor.async_on_remove = lambda fn: None  # real stub — wrong method name raises AttributeError
 
         async def _run():
             with patch(
@@ -154,7 +154,7 @@ class TestOverrideTagsetSensorSubscription:
         hass.data = {DOMAIN: {ENTRY_ID: {}}}
 
         sensor = FrameArtOverrideTagsetEntity(hass, entry, TV_ID)
-        sensor.async_on_unload = MagicMock()
+        sensor.async_on_remove = lambda fn: None  # real stub — wrong method name raises AttributeError
 
         connected_signals = []
 
@@ -180,7 +180,7 @@ class TestOverrideExpirySensorSubscription:
         hass.data = {DOMAIN: {ENTRY_ID: {}}}
 
         sensor = FrameArtOverrideExpiryEntity(hass, entry, TV_ID)
-        sensor.async_on_unload = MagicMock()
+        sensor.async_on_remove = lambda fn: None  # real stub — wrong method name raises AttributeError
 
         connected_signals = []
 
