@@ -1331,6 +1331,13 @@ class FrameArtSelectedTagsetEntity(SensorEntity):
             model="Frame TV",
         )
 
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to tagset assignment updates."""
+        signal = f"{DOMAIN}_tagset_updated_{self._entry.entry_id}_{self._tv_id}"
+        self.async_on_unload(
+            async_dispatcher_connect(self._hass, signal, self.async_write_ha_state)
+        )
+
     @property
     def native_value(self) -> str | None:  # type: ignore[override]
         """Return the selected tagset name."""
@@ -1366,6 +1373,13 @@ class FrameArtSelectedTagsetWeightingEntity(SensorEntity):
             name=tv_name,
             manufacturer="Samsung",
             model="Frame TV",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to tagset assignment updates."""
+        signal = f"{DOMAIN}_tagset_updated_{self._entry.entry_id}_{self._tv_id}"
+        self.async_on_unload(
+            async_dispatcher_connect(self._hass, signal, self.async_write_ha_state)
         )
 
     @property
@@ -1405,6 +1419,13 @@ class FrameArtOverrideTagsetEntity(SensorEntity):
             model="Frame TV",
         )
 
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to tagset assignment updates."""
+        signal = f"{DOMAIN}_tagset_updated_{self._entry.entry_id}_{self._tv_id}"
+        self.async_on_unload(
+            async_dispatcher_connect(self._hass, signal, self.async_write_ha_state)
+        )
+
     @property
     def native_value(self) -> str | None:  # type: ignore[override]
         """Return the override tagset name, or 'none' if no override active."""
@@ -1440,6 +1461,13 @@ class FrameArtOverrideExpiryEntity(SensorEntity):
             name=tv_name,
             manufacturer="Samsung",
             model="Frame TV",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to tagset assignment updates."""
+        signal = f"{DOMAIN}_tagset_updated_{self._entry.entry_id}_{self._tv_id}"
+        self.async_on_unload(
+            async_dispatcher_connect(self._hass, signal, self.async_write_ha_state)
         )
 
     @property
