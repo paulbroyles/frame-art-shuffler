@@ -88,6 +88,11 @@ _WOL_SCREEN_POLL_TIMEOUT = 8    # seconds to poll REST for screen-on after 2nd W
 _WOL_BROADCAST_IP = "255.255.255.255"
 _WOL_BROADCAST_PORT = 9
 
+# Deep-sleep detection during upload: poll REST every N seconds; if it goes
+# dark for M consecutive checks the TV entered deep sleep — abort immediately.
+_DEEP_SLEEP_POLL_SECS = 8
+_DEEP_SLEEP_FAIL_THRESHOLD = 2
+
 # Use a dedicated directory for integration data to keep /config clean
 # This matches the structure we want for tokens as well
 DATA_DIR = Path("/config/frame_art_shuffler")
@@ -133,6 +138,14 @@ class FrameArtConnectionError(FrameArtError):
 
 class FrameArtUploadError(FrameArtError):
     """Raised when an upload or art operation fails."""
+
+
+class FrameArtDeepSleepError(FrameArtUploadError):
+    """Raised when the TV enters deep sleep during an upload.
+
+    Retrying immediately is pointless — the caller should wait for the TV to
+    wake (user turns it on, or WoL) before attempting another upload.
+    """
 
 
 def set_token_directory(path: Path) -> None:
@@ -445,6 +458,60 @@ async def _ensure_tv_reachable(
             await tv_network_wake(mac_address, ip, client=client)
 
 
+async def _upload_detecting_deep_sleep(art, file_path: str, matte: str, ip: str, timeout: int = 120):
+    """Run art.upload(), aborting immediately if the TV enters deep sleep.
+
+    Polls REST every _DEEP_SLEEP_POLL_SECS seconds while the upload runs.
+    If REST (and TCP) go dark for _DEEP_SLEEP_FAIL_THRESHOLD consecutive checks,
+    the TV entered deep sleep — cancels the upload and raises FrameArtDeepSleepError
+    instead of waiting for the full upload timeout.
+
+    Returns the content_id on success; propagates art.upload() exceptions on failure.
+    """
+    upload_task = asyncio.create_task(
+        art.upload(str(file_path), matte=matte, portrait_matte=matte, timeout=timeout)
+    )
+
+    consecutive_dark = 0
+    while True:
+        try:
+            # Wait up to _DEEP_SLEEP_POLL_SECS for the upload to finish.
+            # asyncio.shield() keeps the task running if wait_for times out.
+            return await asyncio.wait_for(asyncio.shield(upload_task), timeout=_DEEP_SLEEP_POLL_SECS)
+        except asyncio.TimeoutError:
+            pass  # still running — fall through to REST probe
+        except asyncio.CancelledError:
+            upload_task.cancel()
+            raise
+        except Exception:
+            raise  # real upload error — propagate as-is
+
+        # Upload still in progress — check whether the TV is still reachable.
+        network_awake, _ = await _check_rest_state(ip, timeout=3.0)
+        if network_awake:
+            consecutive_dark = 0
+        else:
+            consecutive_dark += 1
+            _LOGGER.debug(
+                "REST/TCP dark during upload for %s (%s/%s consecutive)",
+                ip, consecutive_dark, _DEEP_SLEEP_FAIL_THRESHOLD,
+            )
+            if consecutive_dark >= _DEEP_SLEEP_FAIL_THRESHOLD:
+                _LOGGER.warning(
+                    "TV %s entered deep sleep during upload — aborting (REST dark for %ss)",
+                    ip, consecutive_dark * _DEEP_SLEEP_POLL_SECS,
+                )
+                upload_task.cancel()
+                try:
+                    await upload_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                raise FrameArtDeepSleepError(
+                    f"TV {ip} entered deep sleep mid-upload; "
+                    "retry after TV wakes (WoL or user power-on)"
+                )
+
+
 async def set_art_on_tv_deleteothers(
     client: TVConnectionManager,
     artpath: str,
@@ -621,11 +688,8 @@ async def set_art_on_tv_deleteothers(
                 if desired_matte and desired_matte != "none":
                     _log_progress(f"Uploading with placeholder matte (will apply '{desired_matte}' after)")
 
-                upload_result = await art.upload(
-                    str(file_path),
-                    matte=upload_matte,
-                    portrait_matte=upload_matte,
-                    timeout=120,
+                upload_result = await _upload_detecting_deep_sleep(
+                    art, str(file_path), upload_matte, ip
                 )
 
                 if upload_result:
@@ -705,6 +769,8 @@ async def set_art_on_tv_deleteothers(
                     else:
                         raise last_error
 
+            except FrameArtDeepSleepError:
+                raise  # TV is in deep sleep — retrying immediately is pointless
             except Exception as upload_err:  # pylint: disable=broad-except
                 last_error = upload_err
                 if attempt < _UPLOAD_RETRIES - 1:
