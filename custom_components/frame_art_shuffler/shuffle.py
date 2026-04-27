@@ -222,6 +222,33 @@ async def _async_select_image(
 
 
 
+async def _async_trigger_prefetch(
+    hass: HomeAssistant,
+    manager_url: str,
+    device_id: str,
+    virtual_tag_id: str | None = None,
+    tv_orientation: str | None = None,
+    active_moods: list[str] | None = None,
+) -> None:
+    """Fire-and-forget: ask the add-on to pre-fetch the next image for a device."""
+    session = async_get_clientsession(hass)
+    payload: dict[str, Any] = {}
+    if virtual_tag_id:
+        payload["virtualTagId"] = virtual_tag_id
+    if tv_orientation:
+        payload["tvOrientation"] = tv_orientation
+    if active_moods:
+        payload["activeMoods"] = active_moods
+    try:
+        async with asyncio.timeout(10):
+            await session.post(
+                f"{manager_url}/api/web-sources/prefetch/{device_id}",
+                json=payload,
+            )
+    except Exception as err:  # pylint: disable=broad-except
+        _LOGGER.debug("Pre-fetch trigger failed for device %s (non-fatal): %s", device_id, err)
+
+
 async def _async_web_source_send(
     hass: HomeAssistant,
     entry: Any,
@@ -328,6 +355,21 @@ async def _async_web_source_send(
 
         if _notify:
             _notify("success", f"Web source selected: {title}")
+
+        # Kick off background pre-fetch so the NEXT shuffle can skip the
+        # fetch+process overhead.  Fire-and-forget.
+        # The add-on stores the pre-fetch keyed by (config fingerprint + activeMoods);
+        # at use-time only the moods are checked, not the specific keyword.
+        used_virtual_tag_id = data.get("virtualTagId") or virtual_tag_id
+        if used_virtual_tag_id or active_moods:
+            hass.async_create_background_task(
+                _async_trigger_prefetch(
+                    hass, frame_art_manager_url, device.id,
+                    used_virtual_tag_id,
+                    active_moods=active_moods,
+                ),
+                name=f"prefetch_{tv_id}",
+            )
 
     return {
         "content_id": data.get("contentId"),

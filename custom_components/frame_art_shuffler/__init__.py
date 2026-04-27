@@ -1197,9 +1197,46 @@ if _HA_AVAILABLE:
                 _make_tv_invalidator(tv_id),
             )
 
+        async def _async_invalidate_and_prefetch_for_tv(tv_id: str, new_tagset_name: str | None) -> None:
+            """Invalidate the web-source pre-fetch for a TV, then kick off a fresh one.
+
+            Called after a tagset assignment change so the pre-fetched image
+            (which was optimised for the old tagset's virtual tag) is replaced
+            as quickly as possible.
+            """
+            from .shuffle import _async_trigger_prefetch  # noqa: E402 - late import
+            from .shuffle import _async_select_image       # noqa: E402
+            from homeassistant.helpers.aiohttp_client import async_get_clientsession  # noqa: E402
+
+            mgr_url: str = entry.data.get("frame_art_manager_url", "http://localhost:8099")
+            registry = dr.async_get(hass)
+            device = registry.async_get_device(identifiers={(DOMAIN, tv_id)})
+            if not device:
+                return
+            device_id = device.id
+            session = async_get_clientsession(hass)
+
+            # Invalidate the stored pre-fetch.
+            try:
+                async with asyncio.timeout(5):
+                    await session.delete(f"{mgr_url}/api/web-sources/prefetch/{device_id}")
+            except Exception as err:  # pylint: disable=broad-except
+                _LOGGER.debug("Could not delete pre-fetch for %s (non-fatal): %s", tv_id, err)
+
+            # Ask the add-on to pick the next image using the new tagset's virtual tag.
+            try:
+                tv_name = entry.data.get("tvs", {}).get(tv_id, {}).get("name", tv_id)
+                selected, _, _, _, _ = await _async_select_image(
+                    hass, mgr_url, new_tagset_name, None, tv_name, recent_images=None
+                )
+                if selected and selected.get("_web_sources") and (vtid := selected.get("_virtual_tag_id")):
+                    await _async_trigger_prefetch(hass, mgr_url, device_id, vtid)
+            except Exception as err:  # pylint: disable=broad-except
+                _LOGGER.debug("Could not start pre-fetch for %s after tagset change (non-fatal): %s", tv_id, err)
+
         async def async_handle_select_tagset(call: ServiceCall) -> None:
             """Permanently switch which tagset a TV uses.
-            
+
             Requires device_id - this is a per-TV assignment.
             """
             target_entry, tv_id, tv_data = await _resolve_tv_from_call(call)
@@ -1235,6 +1272,10 @@ if _HA_AVAILABLE:
             if tagset_cache:
                 await tagset_cache.async_refresh()
             async_dispatcher_send(hass, f"{DOMAIN}_tagset_updated_{target_entry.entry_id}_{tv_id}")
+            hass.async_create_background_task(
+                _async_invalidate_and_prefetch_for_tv(tv_id, name),
+                name=f"prefetch-after-tagset-{tv_id}",
+            )
 
         async def async_handle_override_tagset(call: ServiceCall) -> None:
             """Apply a temporary tagset override with required expiry.
@@ -1282,7 +1323,11 @@ if _HA_AVAILABLE:
                 f"Override '{name}' applied for {duration_minutes}m",
             )
             async_dispatcher_send(hass, f"{DOMAIN}_tagset_updated_{target_entry.entry_id}_{tv_id}")
-            
+            hass.async_create_background_task(
+                _async_invalidate_and_prefetch_for_tv(tv_id, name),
+                name=f"prefetch-after-override-{tv_id}",
+            )
+
             # Trigger immediate shuffle to apply the override tagset
             # Skip recency - user deliberately chose this tagset, don't constrain the pool
             await async_shuffle_tv(hass, target_entry, tv_id, reason="override", recent_images=None)
@@ -1310,6 +1355,12 @@ if _HA_AVAILABLE:
                     f"Override '{override_name}' cleared",
                 )
             async_dispatcher_send(hass, f"{DOMAIN}_tagset_updated_{target_entry.entry_id}_{tv_id}")
+            # After clearing the override, fall back to the permanent tagset.
+            permanent_tagset = get_tv_config(target_entry, tv_id).get(CONF_SELECTED_TAGSET) if get_tv_config(target_entry, tv_id) else None
+            hass.async_create_background_task(
+                _async_invalidate_and_prefetch_for_tv(tv_id, permanent_tagset),
+                name=f"prefetch-after-override-clear-{tv_id}",
+            )
 
         # Register tagset assignment services
         hass.services.async_register(
