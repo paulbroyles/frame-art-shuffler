@@ -19,6 +19,7 @@ from homeassistant.helpers.selector import (
 )
 
 from .const import (
+    CONF_CALENDAR_ENTITY_ID,
     CONF_EXCLUDE_TAGS,
     CONF_LOGGING_ENABLED,
     CONF_LOG_FLUSH_MINUTES,
@@ -213,6 +214,8 @@ class FrameArtOptionsFlowHandler(config_entries.OptionsFlow):
                 return await self.async_step_delete_tv()
             elif user_input["action"] == "logging_settings":
                 return await self.async_step_logging_settings()
+            elif user_input["action"] == "calendar_settings":
+                return await self.async_step_calendar_settings()
 
         # Get list of existing TVs
         from .config_entry import list_tv_configs
@@ -220,6 +223,7 @@ class FrameArtOptionsFlowHandler(config_entries.OptionsFlow):
         
         options = {
             "logging_settings": "Logging settings",
+            "calendar_settings": "Calendar event settings",
             "add_tv": "Add a new TV",
         }
         if tvs:
@@ -297,6 +301,31 @@ class FrameArtOptionsFlowHandler(config_entries.OptionsFlow):
             step_id="logging_settings",
             data_schema=schema,
             errors=errors,
+        )
+
+    async def async_step_calendar_settings(
+        self,
+        user_input: Optional[Dict[str, Any]] = None,
+    ) -> ConfigFlowResult:
+        """Configure the HA calendar entity to monitor for tagset override events."""
+        current = self.config_entry.data.get(CONF_CALENDAR_ENTITY_ID)
+
+        if user_input is not None:
+            entity_id = user_input.get(CONF_CALENDAR_ENTITY_ID) or None
+            new_data = {**self.config_entry.data, CONF_CALENDAR_ENTITY_ID: entity_id}
+            self.hass.config_entries.async_update_entry(self.config_entry, data=new_data)
+            return self.async_create_entry(title="", data={})
+
+        schema = vol.Schema(
+            {
+                vol.Optional(CONF_CALENDAR_ENTITY_ID, default=current): EntitySelector(
+                    EntitySelectorConfig(domain="calendar")
+                ),
+            }
+        )
+        return self.async_show_form(
+            step_id="calendar_settings",
+            data_schema=schema,
         )
 
     async def async_step_pick_edit_tv(self, user_input: Optional[Dict[str, Any]] = None) -> ConfigFlowResult:

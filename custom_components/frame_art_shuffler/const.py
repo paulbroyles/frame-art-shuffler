@@ -45,6 +45,10 @@ CONF_MOOD_OVERRIDES = "mood_overrides"    # list of mood IDs activated via servi
 CONF_MOOD_OVERRIDE_EXPIRY = "mood_override_expiry"  # ISO timestamp for override expiry
 CONF_MOOD_BASELINE_FLOOR = "mood_baseline_floor"  # float 0.0-1.0, reserved fraction for base rotation
 
+# Calendar events
+CONF_CALENDAR_ENTITY_ID = "calendar_entity_id"  # HA calendar entity to monitor for tagset overrides
+CONF_CALENDAR_SUPPRESS_MOODS = "calendar_suppress_moods"  # per-TV runtime flag: suppress moods during calendar event
+
 DEFAULT_LOGGING_ENABLED = True
 DEFAULT_LOG_RETENTION_MONTHS = 6
 DEFAULT_LOG_FLUSH_MINUTES = 5

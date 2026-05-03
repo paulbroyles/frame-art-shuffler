@@ -84,6 +84,8 @@ if ha_spec is not None:  # pragma: no cover - depends on optional dependency
 
 if _HA_AVAILABLE:
     from .const import (
+        CONF_CALENDAR_ENTITY_ID,
+        CONF_CALENDAR_SUPPRESS_MOODS,
         CONF_ENABLE_AUTO_SHUFFLE,
         CONF_LOGGING_ENABLED,
         CONF_LOG_FLUSH_MINUTES,
@@ -436,6 +438,289 @@ if _HA_AVAILABLE:
                 await _async_trigger_prefetch(hass, mgr_url, device_id, vtid)
         except Exception as err:  # pylint: disable=broad-except
             _LOGGER.debug("Could not start pre-fetch for %s after tagset change (non-fatal): %s", tv_id, err)
+
+    def _parse_calendar_event_description(description: str | None) -> dict:
+        """Parse structured flags from a Frame Art calendar event description.
+
+        Supported flags (one per line, case-insensitive):
+            suppress_moods: true|false
+        """
+        result = {"suppress_moods": False}
+        if not description:
+            return result
+        for line in description.splitlines():
+            line = line.strip()
+            if ":" not in line:
+                continue
+            key, _, value = line.partition(":")
+            key = key.strip().lower()
+            value = value.strip().lower()
+            if key == "suppress_moods":
+                result["suppress_moods"] = value in ("true", "1", "yes")
+        return result
+
+    async def _async_setup_calendar_monitor(
+        hass: Any,
+        entry: Any,
+        list_tv_configs_fn: Any,
+        update_tv_config_fn: Any,
+        start_tagset_override_timer_fn: Any,
+        cancel_tagset_override_timer_fn: Any,
+    ) -> None:
+        """Set up the calendar event monitor for tagset overrides.
+
+        Watches the configured HA calendar entity and applies/clears tagset
+        overrides on all TVs as calendar events start and end. Event title must
+        match a tagset name exactly. Mood suppression is per-event opt-in via
+        'suppress_moods: true' in the event description.
+        """
+        from homeassistant.helpers.event import (
+            async_track_point_in_time,
+            async_track_state_change_event,
+            async_track_time_interval,
+        )
+
+        calendar_entity_id: str | None = entry.data.get(CONF_CALENDAR_ENTITY_ID)
+        if not calendar_entity_id:
+            return
+
+        _LOGGER.debug("Calendar monitor: watching %s", calendar_entity_id)
+
+        # active_calendar_events: uid -> {tagset, suppress_moods, end_time, end_unsub}
+        active_calendar_events: dict[str, dict] = {}
+        # upcoming_start_unsubs: uid -> unsubscribe callable for start timer
+        upcoming_start_unsubs: dict[str, Any] = {}
+
+        async def _async_apply_calendar_event(event_data: dict) -> None:
+            """Apply a calendar event as a tagset override on all TVs."""
+            uid = event_data.get("uid") or event_data.get("summary", "")
+            tagset_name = (event_data.get("summary") or "").strip()
+            description = event_data.get("description")
+            flags = _parse_calendar_event_description(description)
+            suppress_moods = flags["suppress_moods"]
+
+            end_dt: datetime | None = event_data.get("_end_dt")
+            if not end_dt:
+                return
+
+            if not tagset_name:
+                _LOGGER.warning("Calendar monitor: event has no title, skipping")
+                return
+
+            # Validate tagset exists
+            tagset_cache = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("tagset_cache")
+            tagsets = (tagset_cache.get_all() or None) if tagset_cache else None
+            if tagsets is None:
+                tagsets = get_global_tagsets(entry)
+            if tagset_name not in (tagsets or {}):
+                if tagset_cache:
+                    await tagset_cache.async_refresh()
+                    tagsets = tagset_cache.get_all() or tagsets
+            if tagset_name not in (tagsets or {}):
+                _LOGGER.warning(
+                    "Calendar monitor: tagset '%s' not found, skipping event", tagset_name
+                )
+                return
+
+            _LOGGER.info(
+                "Calendar monitor: applying event '%s' (suppress_moods=%s) until %s",
+                tagset_name, suppress_moods, end_dt,
+            )
+
+            # Apply override to all TVs
+            for tv_id in list_tv_configs_fn(entry):
+                update_tv_config_fn(hass, entry, tv_id, {
+                    CONF_OVERRIDE_TAGSET: tagset_name,
+                    CONF_OVERRIDE_EXPIRY_TIME: end_dt.isoformat(),
+                    CONF_CALENDAR_SUPPRESS_MOODS: suppress_moods,
+                })
+                start_tagset_override_timer_fn(tv_id, end_dt)
+                async_dispatcher_send(hass, f"{DOMAIN}_tagset_updated_{entry.entry_id}_{tv_id}")
+                hass.async_create_background_task(
+                    _async_invalidate_web_prefetch_for_tv(hass, entry, tv_id, tagset_name),
+                    name=f"cal-prefetch-{tv_id}",
+                )
+                log_activity(
+                    hass, entry.entry_id, tv_id,
+                    "calendar_event_started",
+                    f"Calendar event: override '{tagset_name}' active until {end_dt.strftime('%H:%M')}",
+                )
+                hass.async_create_background_task(
+                    async_shuffle_tv(hass, entry, tv_id, reason="calendar_event", recent_images=None),
+                    name=f"cal-shuffle-{tv_id}",
+                )
+
+            # Schedule end timer
+            async def _on_event_end(_now: Any) -> None:
+                await _async_clear_calendar_event(uid)
+
+            end_unsub = async_track_point_in_time(hass, _on_event_end, end_dt)
+            active_calendar_events[uid] = {
+                "tagset": tagset_name,
+                "suppress_moods": suppress_moods,
+                "end_dt": end_dt,
+                "end_unsub": end_unsub,
+            }
+
+        async def _async_clear_calendar_event(uid: str) -> None:
+            """Clear the tagset override set by a calendar event."""
+            event_info = active_calendar_events.pop(uid, None)
+            if not event_info:
+                return
+
+            # Cancel end timer (may already have fired)
+            unsub = event_info.get("end_unsub")
+            if unsub:
+                try:
+                    unsub()
+                except Exception:  # pylint: disable=broad-except
+                    pass
+
+            tagset_name = event_info["tagset"]
+            _LOGGER.info("Calendar monitor: event '%s' ended, clearing override", tagset_name)
+
+            for tv_id in list_tv_configs_fn(entry):
+                tv_config = get_tv_config(entry, tv_id) or {}
+                # Only clear if this event's tagset is still the active override
+                if tv_config.get(CONF_OVERRIDE_TAGSET) == tagset_name:
+                    cancel_tagset_override_timer_fn(tv_id)
+                    permanent_tagset = tv_config.get(CONF_SELECTED_TAGSET)
+                    update_tv_config_fn(hass, entry, tv_id, {
+                        CONF_OVERRIDE_TAGSET: None,
+                        CONF_OVERRIDE_EXPIRY_TIME: None,
+                        CONF_CALENDAR_SUPPRESS_MOODS: False,
+                    })
+                    async_dispatcher_send(hass, f"{DOMAIN}_tagset_updated_{entry.entry_id}_{tv_id}")
+                    hass.async_create_background_task(
+                        _async_invalidate_web_prefetch_for_tv(hass, entry, tv_id, permanent_tagset),
+                        name=f"cal-prefetch-clear-{tv_id}",
+                    )
+                    log_activity(
+                        hass, entry.entry_id, tv_id,
+                        "calendar_event_ended",
+                        f"Calendar event: override '{tagset_name}' ended, reverted to selected tagset",
+                    )
+                    hass.async_create_background_task(
+                        async_shuffle_tv(hass, entry, tv_id, reason="calendar_event_end", recent_images=None),
+                        name=f"cal-shuffle-clear-{tv_id}",
+                    )
+
+        async def _async_scan_calendar(now: Any = None) -> None:
+            """Fetch calendar events and apply/schedule as needed."""
+            try:
+                result = await hass.services.async_call(
+                    "calendar",
+                    "get_events",
+                    {
+                        "entity_id": calendar_entity_id,
+                        "start_date_time": datetime.now(timezone.utc).isoformat(),
+                        "end_date_time": (datetime.now(timezone.utc) + timedelta(hours=25)).isoformat(),
+                    },
+                    blocking=True,
+                    return_response=True,
+                )
+            except Exception as err:  # pylint: disable=broad-except
+                _LOGGER.warning("Calendar monitor: failed to fetch events: %s", err)
+                return
+
+            if not result:
+                return
+
+            events = result.get(calendar_entity_id, {}).get("events", [])
+            now_dt = datetime.now(timezone.utc)
+            seen_uids: set[str] = set()
+
+            for raw in events:
+                # Parse start/end — HA returns ISO strings or date strings
+                start_raw = raw.get("start")
+                end_raw = raw.get("end")
+                try:
+                    start_dt = _parse_calendar_dt(start_raw)
+                    end_dt = _parse_calendar_dt(end_raw)
+                except (ValueError, TypeError) as err:
+                    _LOGGER.warning("Calendar monitor: could not parse event times: %s", err)
+                    continue
+
+                uid = raw.get("uid") or raw.get("summary", "")
+                seen_uids.add(uid)
+
+                if end_dt <= now_dt:
+                    continue  # already ended
+
+                event_data = {**raw, "_end_dt": end_dt, "uid": uid}
+
+                if start_dt <= now_dt:
+                    # Currently active
+                    if uid not in active_calendar_events:
+                        await _async_apply_calendar_event(event_data)
+                else:
+                    # Upcoming — schedule start timer
+                    if uid not in upcoming_start_unsubs and uid not in active_calendar_events:
+                        async def _make_start_callback(ed: dict) -> Any:
+                            async def _on_start(_now: Any) -> None:
+                                upcoming_start_unsubs.pop(ed["uid"], None)
+                                await _async_apply_calendar_event(ed)
+                            return _on_start
+
+                        start_unsub = async_track_point_in_time(
+                            hass, await _make_start_callback(event_data), start_dt
+                        )
+                        upcoming_start_unsubs[uid] = start_unsub
+                        _LOGGER.debug(
+                            "Calendar monitor: scheduled start of '%s' at %s",
+                            raw.get("summary"), start_dt,
+                        )
+
+            # Clear any active events that are no longer in the calendar
+            for uid in list(active_calendar_events.keys()):
+                if uid not in seen_uids:
+                    _LOGGER.info("Calendar monitor: event %s removed from calendar, clearing", uid)
+                    await _async_clear_calendar_event(uid)
+
+            # Cancel upcoming timers for removed events
+            for uid in list(upcoming_start_unsubs.keys()):
+                if uid not in seen_uids:
+                    unsub = upcoming_start_unsubs.pop(uid)
+                    try:
+                        unsub()
+                    except Exception:  # pylint: disable=broad-except
+                        pass
+
+        def _on_calendar_state_change(event: Any) -> None:
+            """Re-scan when the calendar entity state changes."""
+            hass.async_create_background_task(
+                _async_scan_calendar(), name="cal-monitor-rescan"
+            )
+
+        # Subscribe to calendar state changes (fires when current/next event shifts)
+        unsub_state = async_track_state_change_event(
+            hass, [calendar_entity_id], _on_calendar_state_change
+        )
+        # Hourly safety-net rescan
+        unsub_interval = async_track_time_interval(
+            hass, _async_scan_calendar, timedelta(hours=1)
+        )
+        hass.data[DOMAIN][entry.entry_id]["calendar_unsubs"] = [unsub_state, unsub_interval]
+
+        # Initial scan — catch any event that was already active on startup
+        await _async_scan_calendar()
+
+    def _parse_calendar_dt(value: Any) -> "datetime":
+        """Parse a HA calendar event start/end value to an aware datetime."""
+        from datetime import date as date_type
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc)
+            return value
+        if isinstance(value, date_type):
+            # All-day event: treat as UTC midnight
+            return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+        if isinstance(value, str):
+            dt = datetime.fromisoformat(value)
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=timezone.utc)
+            return dt
+        raise TypeError(f"Cannot parse calendar datetime: {value!r}")
 
     async def async_setup_entry(hass: Any, entry: Any) -> bool:
         """Set up a config entry for Frame Art Shuffler."""
@@ -1186,6 +1471,13 @@ if _HA_AVAILABLE:
                         _LOGGER.info(f"Cleared expired tagset override for {tv_config.get('name', tv_id)}")
                 except (ValueError, TypeError) as e:
                     _LOGGER.warning(f"Invalid override expiry time for {tv_id}: {e}")
+
+        # --- Calendar event monitor ---
+        # Watches a configured HA calendar entity and applies tagset overrides
+        # for the duration of each event. Event title must match a tagset name.
+        # Optional description flags (one per line): suppress_moods: true
+        await _async_setup_calendar_monitor(hass, entry, list_tv_configs, update_tv_config,
+                                            start_tagset_override_timer, cancel_tagset_override_timer)
 
         # --- Staged image invalidation on tagset changes ---
         # When a tagset definition or TV assignment changes, clear staged images

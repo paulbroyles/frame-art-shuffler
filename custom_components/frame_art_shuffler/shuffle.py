@@ -27,6 +27,7 @@ from .config_entry import (
     get_tv_config,
 )
 from .const import (
+    CONF_CALENDAR_SUPPRESS_MOODS,
     CONF_MOOD_OVERRIDES,
     CONF_MOOD_OVERRIDE_EXPIRY,
     CONF_MOOD_SENSOR,
@@ -53,6 +54,9 @@ def _resolve_active_moods(hass: HomeAssistant, tv_config: dict[str, Any]) -> lis
     - Override moods: manually activated via the activate_mood service,
       subject to optional expiry.
     """
+    if tv_config.get(CONF_CALENDAR_SUPPRESS_MOODS):
+        return []
+
     mood_sensor = tv_config.get(CONF_MOOD_SENSOR, "")
     sensor_moods: list[str] = []
     if mood_sensor:
