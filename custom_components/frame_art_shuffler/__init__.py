@@ -626,9 +626,11 @@ if _HA_AVAILABLE:
                 return
 
             if not result:
+                _LOGGER.debug("Calendar monitor: scan returned no result")
                 return
 
             events = result.get(calendar_entity_id, {}).get("events", [])
+            _LOGGER.debug("Calendar monitor: scan found %d event(s) in 25h window", len(events))
             now_dt = datetime.now(timezone.utc)
             seen_uids: set[str] = set()
 
