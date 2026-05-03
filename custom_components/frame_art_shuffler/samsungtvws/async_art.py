@@ -119,16 +119,19 @@ class SamsungTVAsyncArt(SamsungTVWSAsyncConnection):
         return self.art_uuid
 
     async def wait_for_response(self, request_uuid, timeout=2):
-        data = None
+        if request_uuid not in self.pending_requests.keys():
+            self.pending_requests[request_uuid] = asyncio.Future()
         try:
-            if request_uuid not in self.pending_requests.keys():
-                self.pending_requests[request_uuid] = asyncio.Future()
             response = await asyncio.wait_for(self.pending_requests[request_uuid], timeout)
-            data = json.loads(response["data"])
-        except asyncio.exceptions.TimeoutError:
-            pass
-        self.pending_requests.pop(request_uuid, None)
-        if data and data.get("event", "*") == "error":
+        finally:
+            # Always clean up the pending request, whether we succeeded, timed out, or
+            # were cancelled.  TimeoutError is NOT caught here — it propagates so callers
+            # know the TV did not respond.  Previously this was swallowed (pass), which
+            # caused select_image() to silently succeed and _last_art_ok to be updated
+            # even when the TV never acknowledged the command.
+            self.pending_requests.pop(request_uuid, None)
+        data = json.loads(response["data"])
+        if data.get("event", "*") == "error":
             raise exceptions.ResponseError(
                 f"{json.loads(data['request_data'])['request']} request failed "
                 f"with error number {data['error_code']}"
@@ -154,7 +157,11 @@ class SamsungTVAsyncArt(SamsungTVWSAsyncConnection):
             data = json.loads(response["data"])
             sub_event = data.get("event", "*")
             if 'artmode_status' in sub_event:
-                self.art_mode = data['value'] == 'on'
+                if 'value' not in data:
+                    _LOGGING.debug(
+                        "artmode_status event missing 'value' key; full data: %s", data
+                    )
+                self.art_mode = data.get('value', data.get('status', '')) == 'on'
             elif sub_event == 'art_mode_changed':
                 self.art_mode = data['status'] == 'on'
             elif sub_event == 'go_to_standby':

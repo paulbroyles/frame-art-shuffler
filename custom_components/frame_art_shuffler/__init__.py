@@ -73,6 +73,7 @@ if ha_spec is not None:  # pragma: no cover - depends on optional dependency
         ServiceCall = getattr(_core, "ServiceCall")
         SupportsResponse = getattr(_core, "SupportsResponse")
         ServiceValidationError = getattr(_exceptions, "ServiceValidationError")
+        HomeAssistantError = getattr(_exceptions, "HomeAssistantError")
         dr = _helpers_dr
         er = _helpers_er
         async_track_time_interval = getattr(_helpers_event, "async_track_time_interval")
@@ -94,6 +95,9 @@ if _HA_AVAILABLE:
         CONF_SHUFFLE_FREQUENCY,
         CONF_TAGSETS,
         CONF_TOKEN_DIR,
+        CONF_MOOD_SENSOR,
+        CONF_MOOD_OVERRIDES,
+        CONF_MOOD_OVERRIDE_EXPIRY,
         DOMAIN,
         SIGNAL_AUTO_SHUFFLE_NEXT,
     )
@@ -104,6 +108,7 @@ if _HA_AVAILABLE:
     from .frame_tv import TOKEN_DIR as DEFAULT_TOKEN_DIR, TVConnectionManager, set_token_directory, tv_on, tv_off, set_art_mode, is_screen_on, get_tv_model_year
     from .image_cache import ImageMetadataCache
     from .tagset_cache import TagsetCache
+    from .mood_cache import MoodCache
     from .dashboard import async_generate_dashboard
     from .activity import log_activity
     from .shuffle import async_guarded_upload, async_shuffle_tv
@@ -390,6 +395,48 @@ if _HA_AVAILABLE:
 
 
 
+    async def _async_invalidate_web_prefetch_for_tv(
+        hass: Any,
+        entry: Any,
+        tv_id: str,
+        new_tagset_name: str | None,
+    ) -> None:
+        """Invalidate the web-source pre-fetch for a TV, then kick off a fresh one.
+
+        Called after a tagset assignment change so the pre-fetched image
+        (which was optimised for the old tagset's virtual tag) is replaced
+        as quickly as possible.
+        """
+        from .shuffle import _async_trigger_prefetch  # noqa: E402 - late import
+        from .shuffle import _async_select_image       # noqa: E402
+        from homeassistant.helpers.aiohttp_client import async_get_clientsession  # noqa: E402
+
+        mgr_url: str = entry.data.get("frame_art_manager_url", "http://localhost:8099")
+        registry = dr.async_get(hass)
+        device = registry.async_get_device(identifiers={(DOMAIN, tv_id)})
+        if not device:
+            return
+        device_id = device.id
+        session = async_get_clientsession(hass)
+
+        # Invalidate the stored pre-fetch.
+        try:
+            async with asyncio.timeout(5):
+                await session.delete(f"{mgr_url}/api/web-sources/prefetch/{device_id}")
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.debug("Could not delete pre-fetch for %s (non-fatal): %s", tv_id, err)
+
+        # Ask the add-on to pick the next image using the new tagset's virtual tag.
+        try:
+            tv_name = entry.data.get("tvs", {}).get(tv_id, {}).get("name", tv_id)
+            selected, _, _, _, _ = await _async_select_image(
+                hass, mgr_url, new_tagset_name, None, tv_name, recent_images=None
+            )
+            if selected and selected.get("_web_sources") and (vtid := selected.get("_virtual_tag_id")):
+                await _async_trigger_prefetch(hass, mgr_url, device_id, vtid)
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.debug("Could not start pre-fetch for %s after tagset change (non-fatal): %s", tv_id, err)
+
     async def async_setup_entry(hass: Any, entry: Any) -> bool:
         """Set up a config entry for Frame Art Shuffler."""
 
@@ -429,8 +476,10 @@ if _HA_AVAILABLE:
         manager_url = entry.data.get("frame_art_manager_url", "http://localhost:8099")
         image_cache = ImageMetadataCache(hass, manager_url)
         tagset_cache = TagsetCache(hass, manager_url)
+        mood_cache = MoodCache(hass, manager_url)
         # Non-fatal if manager unreachable at startup; sensors fall back to entry.data
         await tagset_cache.async_refresh()
+        await mood_cache.async_refresh()
 
         art_clients = {
             tv_id: TVConnectionManager(tv_cfg["ip"])
@@ -444,6 +493,7 @@ if _HA_AVAILABLE:
             "manager_url": manager_url,
             "image_cache": image_cache,
             "tagset_cache": tagset_cache,
+            "mood_cache": mood_cache,
             "token_dir": token_dir,
             "config_snapshot": _get_structural_config(entry.data),
             "art_clients": art_clients,
@@ -505,6 +555,26 @@ if _HA_AVAILABLE:
             artwork_sensor = data.get("artwork_sensors", {}).get(tv_id)
             if not artwork_sensor:
                 return
+
+            # Suppress during active uploads — the art_mode_changed event fired by the TV
+            # after a successful upload can race with the sensor update in _perform_upload.
+            if tv_id in data.get("upload_in_progress", set()):
+                _LOGGER.debug(
+                    "External artwork check suppressed for %s: upload in progress", tv_id
+                )
+                return
+
+            # Suppress for 30s after an upload guard clears — handles the window where
+            # aiohttp may have cancelled _perform_upload (client disconnect on timeout)
+            # but the TV still received and selected the image.
+            last_cleared = data.get("last_upload_cleared_at", 0)
+            if asyncio.get_event_loop().time() - last_cleared < 30:
+                _LOGGER.debug(
+                    "External artwork check suppressed for %s: recent upload (%.0fs ago)",
+                    tv_id, asyncio.get_event_loop().time() - last_cleared,
+                )
+                return
+
             try:
                 current = await client.art.get_current()
                 content_id = current.get("content_id") if current else None
@@ -737,12 +807,23 @@ if _HA_AVAILABLE:
 
                 # No upload guard — pre-upload runs in background and must not
                 # block user-initiated select=True calls which DO use the guard.
-                content_id = await frame_tv.upload_to_tv_only(
-                    client,
-                    image_path,
-                    mac_address=mac,
-                    matte=matte,
-                )
+                # However, concurrent TV WebSocket usage (select=False alongside
+                # select=True) causes interleaved responses and failures, so
+                # abort fast if another upload is already running.
+                data = hass.data.get(DOMAIN, {}).get(target_entry.entry_id, {})
+                if tv_id in data.get("upload_in_progress", set()):
+                    raise HomeAssistantError(
+                        f"Pre-upload skipped for {tv_name}: another upload is in progress"
+                    )
+                try:
+                    content_id = await frame_tv.upload_to_tv_only(
+                        client,
+                        image_path,
+                        mac_address=mac,
+                        matte=matte,
+                    )
+                except frame_tv.FrameArtError as err:
+                    raise HomeAssistantError(str(err)) from err
 
                 return {"content_id": content_id}
 
@@ -1158,9 +1239,13 @@ if _HA_AVAILABLE:
                 _make_tv_invalidator(tv_id),
             )
 
+        # Bind the module-level helper to this entry's context.
+        async def _async_invalidate_and_prefetch_for_tv(tv_id: str, new_tagset_name: str | None) -> None:
+            await _async_invalidate_web_prefetch_for_tv(hass, entry, tv_id, new_tagset_name)
+
         async def async_handle_select_tagset(call: ServiceCall) -> None:
             """Permanently switch which tagset a TV uses.
-            
+
             Requires device_id - this is a per-TV assignment.
             """
             target_entry, tv_id, tv_data = await _resolve_tv_from_call(call)
@@ -1175,12 +1260,14 @@ if _HA_AVAILABLE:
             # If the cache is empty (manager was unreachable at startup), try a fresh fetch.
             tagset_cache = hass.data.get(DOMAIN, {}).get(target_entry.entry_id, {}).get("tagset_cache")
             tagsets = (tagset_cache.get_all() or None) if tagset_cache else None
-            if not tagsets and tagset_cache:
-                await tagset_cache.async_refresh()
-                tagsets = (tagset_cache.get_all() or None)
             if tagsets is None:
                 tagsets = get_global_tagsets(target_entry)
-            if name not in tagsets:
+            if name not in (tagsets or {}):
+                # Not in cache — refresh once in case it was added since last load.
+                if tagset_cache:
+                    await tagset_cache.async_refresh()
+                    tagsets = tagset_cache.get_all() or tagsets
+            if name not in (tagsets or {}):
                 raise ServiceValidationError(f"Tagset '{name}' not found")
 
             update_tv_config(hass, target_entry, tv_id, {CONF_SELECTED_TAGSET: name})
@@ -1194,6 +1281,10 @@ if _HA_AVAILABLE:
             if tagset_cache:
                 await tagset_cache.async_refresh()
             async_dispatcher_send(hass, f"{DOMAIN}_tagset_updated_{target_entry.entry_id}_{tv_id}")
+            hass.async_create_background_task(
+                _async_invalidate_and_prefetch_for_tv(tv_id, name),
+                name=f"prefetch-after-tagset-{tv_id}",
+            )
 
         async def async_handle_override_tagset(call: ServiceCall) -> None:
             """Apply a temporary tagset override with required expiry.
@@ -1213,15 +1304,16 @@ if _HA_AVAILABLE:
             tv_name = tv_data.get("name", tv_id)
 
             # Validate tagset exists in cache (manager owns definitions).
-            # If the cache is empty (manager was unreachable at startup), try a fresh fetch.
+            # If the name isn't found, refresh once in case it was added since last load.
             tagset_cache = hass.data.get(DOMAIN, {}).get(target_entry.entry_id, {}).get("tagset_cache")
             tagsets = (tagset_cache.get_all() or None) if tagset_cache else None
-            if not tagsets and tagset_cache:
-                await tagset_cache.async_refresh()
-                tagsets = (tagset_cache.get_all() or None)
             if tagsets is None:
                 tagsets = get_global_tagsets(target_entry)
-            if name not in tagsets:
+            if name not in (tagsets or {}):
+                if tagset_cache:
+                    await tagset_cache.async_refresh()
+                    tagsets = tagset_cache.get_all() or tagsets
+            if name not in (tagsets or {}):
                 raise ServiceValidationError(f"Tagset '{name}' not found")
 
             expiry_time = datetime.now(timezone.utc) + timedelta(minutes=duration_minutes)
@@ -1240,7 +1332,11 @@ if _HA_AVAILABLE:
                 f"Override '{name}' applied for {duration_minutes}m",
             )
             async_dispatcher_send(hass, f"{DOMAIN}_tagset_updated_{target_entry.entry_id}_{tv_id}")
-            
+            hass.async_create_background_task(
+                _async_invalidate_and_prefetch_for_tv(tv_id, name),
+                name=f"prefetch-after-override-{tv_id}",
+            )
+
             # Trigger immediate shuffle to apply the override tagset
             # Skip recency - user deliberately chose this tagset, don't constrain the pool
             await async_shuffle_tv(hass, target_entry, tv_id, reason="override", recent_images=None)
@@ -1268,6 +1364,12 @@ if _HA_AVAILABLE:
                     f"Override '{override_name}' cleared",
                 )
             async_dispatcher_send(hass, f"{DOMAIN}_tagset_updated_{target_entry.entry_id}_{tv_id}")
+            # After clearing the override, fall back to the permanent tagset.
+            permanent_tagset = get_tv_config(target_entry, tv_id).get(CONF_SELECTED_TAGSET) if get_tv_config(target_entry, tv_id) else None
+            hass.async_create_background_task(
+                _async_invalidate_and_prefetch_for_tv(tv_id, permanent_tagset),
+                name=f"prefetch-after-override-clear-{tv_id}",
+            )
 
         # Register tagset assignment services
         hass.services.async_register(
@@ -1286,6 +1388,138 @@ if _HA_AVAILABLE:
             DOMAIN,
             "clear_tagset_override",
             async_handle_clear_tagset_override,
+        )
+
+        # ── Mood services ──────────────────────────────────────────────────────
+
+        def _get_active_moods_from_sensor(hass: HomeAssistant, sensor_entity_id: str) -> list[str]:
+            """Read active mood IDs from a HA sensor entity.
+
+            Supports two formats:
+              1. Comma-separated string state: "night,snow"
+              2. State attribute 'moods' containing a list: ["night", "snow"]
+            """
+            if not sensor_entity_id:
+                return []
+            state = hass.states.get(sensor_entity_id)
+            if state is None or state.state in ("unavailable", "unknown", ""):
+                return []
+            # Format 2: attribute list
+            mood_attr = state.attributes.get("moods")
+            if isinstance(mood_attr, list):
+                return [str(m).strip() for m in mood_attr if m]
+            # Format 1: comma-separated string
+            return [m.strip() for m in state.state.split(",") if m.strip()]
+
+        def _resolve_active_moods(tv_config: dict, hass: HomeAssistant) -> list[str]:
+            """Merge sensor-derived moods and service-call overrides into the active mood list."""
+            mood_sensor = tv_config.get(CONF_MOOD_SENSOR, "")
+            sensor_moods = _get_active_moods_from_sensor(hass, mood_sensor)
+
+            override_moods: list[str] = tv_config.get(CONF_MOOD_OVERRIDES) or []
+            expiry_str = tv_config.get(CONF_MOOD_OVERRIDE_EXPIRY)
+            if expiry_str:
+                try:
+                    expiry = datetime.fromisoformat(expiry_str)
+                    if expiry.tzinfo is None:
+                        expiry = expiry.replace(tzinfo=timezone.utc)
+                    if datetime.now(timezone.utc) > expiry:
+                        override_moods = []
+                except Exception:
+                    override_moods = []
+
+            # Union: sensor moods + service overrides (deduplicated, order preserved)
+            seen: set[str] = set()
+            result: list[str] = []
+            for m in sensor_moods + override_moods:
+                if m not in seen:
+                    seen.add(m)
+                    result.append(m)
+            return result
+
+        async def async_handle_set_mood_sensor(call: ServiceCall) -> None:
+            """Bind a TV to a HA sensor entity that provides active mood IDs."""
+            target_entry, tv_id, tv_data = await _resolve_tv_from_call(call)
+            sensor = call.data.get("sensor", "").strip()
+            tv_name = tv_data.get("name", tv_id)
+
+            update_tv_config(hass, target_entry, tv_id, {CONF_MOOD_SENSOR: sensor or None})
+            _LOGGER.info("Set mood sensor to '%s' for %s", sensor or "(none)", tv_name)
+
+        async def async_handle_activate_mood(call: ServiceCall) -> None:
+            """Manually activate one or more moods on a TV with optional expiry."""
+            target_entry, tv_id, tv_data = await _resolve_tv_from_call(call)
+            mood_ids = call.data.get("moods", [])
+            expiry_str = call.data.get("expiry", "")
+            tv_name = tv_data.get("name", tv_id)
+
+            if not mood_ids:
+                raise ServiceValidationError("At least one mood ID is required")
+
+            mood_cache = hass.data.get(DOMAIN, {}).get(target_entry.entry_id, {}).get("mood_cache")
+            moods = (mood_cache.get_all() or {}) if mood_cache else {}
+            if mood_cache and not moods:
+                await mood_cache.async_refresh()
+                moods = mood_cache.get_all() or {}
+            for mid in mood_ids:
+                if moods and mid not in moods:
+                    raise ServiceValidationError(f"Mood '{mid}' not found")
+
+            tv_config = get_tv_config(target_entry, tv_id) or {}
+            current_overrides: list[str] = list(tv_config.get(CONF_MOOD_OVERRIDES) or [])
+            for mid in mood_ids:
+                if mid not in current_overrides:
+                    current_overrides.append(mid)
+
+            update_data: dict = {CONF_MOOD_OVERRIDES: current_overrides}
+            if expiry_str:
+                update_data[CONF_MOOD_OVERRIDE_EXPIRY] = expiry_str
+            else:
+                update_data[CONF_MOOD_OVERRIDE_EXPIRY] = None
+
+            update_tv_config(hass, target_entry, tv_id, update_data)
+            _LOGGER.info("Activated moods %s for %s", mood_ids, tv_name)
+            log_activity(
+                hass, target_entry.entry_id, tv_id,
+                "mood_activated",
+                f"Activated moods: {', '.join(mood_ids)}",
+            )
+
+        async def async_handle_deactivate_mood(call: ServiceCall) -> None:
+            """Remove service-call mood overrides from a TV."""
+            target_entry, tv_id, tv_data = await _resolve_tv_from_call(call)
+            mood_ids: list[str] = call.data.get("moods", [])
+            tv_name = tv_data.get("name", tv_id)
+
+            tv_config = get_tv_config(target_entry, tv_id) or {}
+            current_overrides: list[str] = list(tv_config.get(CONF_MOOD_OVERRIDES) or [])
+
+            if mood_ids:
+                new_overrides = [m for m in current_overrides if m not in mood_ids]
+            else:
+                new_overrides = []
+
+            update_tv_config(hass, target_entry, tv_id, {
+                CONF_MOOD_OVERRIDES: new_overrides or None,
+                CONF_MOOD_OVERRIDE_EXPIRY: None,
+            })
+            _LOGGER.info("Deactivated mood overrides for %s", tv_name)
+
+        # Register mood services
+        hass.services.async_register(
+            DOMAIN,
+            "set_mood_sensor",
+            async_handle_set_mood_sensor,
+        )
+        hass.services.async_register(
+            DOMAIN,
+            "activate_mood",
+            async_handle_activate_mood,
+        )
+        hass.services.async_register(
+            DOMAIN,
+            "deactivate_mood",
+            async_handle_deactivate_mood,
         )
 
         # Service to set recency windows

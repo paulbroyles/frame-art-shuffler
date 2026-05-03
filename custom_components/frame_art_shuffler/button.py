@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from homeassistant.components.button import ButtonEntity
@@ -15,7 +16,7 @@ from homeassistant.helpers import device_registry as dr
 
 from .config_entry import get_tv_config, update_tv_config
 from .const import DOMAIN, CONF_ENABLE_AUTO_SHUFFLE, CONF_LIGHT_SENSOR
-from .frame_tv import tv_on, tv_off, set_art_mode, delete_token, toggle_tv_orientation, get_tv_model_year, FrameArtError
+from .frame_tv import tv_on, tv_off, tv_screen_on, set_art_mode, is_art_mode_enabled, is_screen_on, check_rest_state, delete_token, toggle_tv_orientation, get_tv_model_year, FrameArtError
 from .shuffle import async_shuffle_tv
 from .activity import log_activity
 
@@ -175,17 +176,97 @@ class FrameArtArtModeButton(ButtonEntity):
             if client is None:
                 raise FrameArtError(f"No art client for {self._tv_name}")
 
-            # Try connecting directly first (fast path if TV is awake)
+            # Check if screen is on before connecting.  When the TV is in "screen
+            # off, art mode standby" (e.g. turned off by Apple TV CEC), the art
+            # WebSocket is still reachable and set_artmode("on") is a no-op — the
+            # screen stays dark.  We must wake it first via WoL.
+            network_awake, screen_is_on = await check_rest_state(self._tv_ip, timeout=3)
+            if not screen_is_on:
+                if not network_awake:
+                    # TV is in deep sleep — need WoL to wake the network first.
+                    if not self._tv_mac:
+                        raise FrameArtError(
+                            f"{self._tv_name} is in deep sleep and no MAC address configured for Wake-on-LAN"
+                        )
+                    _LOGGER.info(f"{self._tv_name} in deep sleep, sending Wake-on-LAN...")
+                    await tv_on(self._tv_ip, self._tv_mac, client=client)
+                    _LOGGER.info(f"{self._tv_name} WoL sent, waiting for TV to boot (up to 60s)...")
+                else:
+                    # TV is in light standby (screen off, network already up).
+                    # DO NOT send WoL — a WoL packet to a network-awake TV acts as
+                    # the second packet of the two-packet sequence and can put the
+                    # TV into a broken state for 2+ minutes.
+                    #
+                    # State-aware two-click sequence:
+                    #   Click 1 → wakes screen into TV/HDMI mode
+                    #   Wait ~3s for mode transition to settle
+                    #   Check is_art_mode_enabled():
+                    #     True  → already in art mode (rare but possible) — done
+                    #     False → TV mode; Click 2 → pushes into art mode standby
+                    #     None  → couldn't check; proceed to retry loop anyway
+                    _LOGGER.info(f"{self._tv_name} screen off, network up — sending KEY_POWER (click 1) to wake screen...")
+                    try:
+                        await tv_screen_on(self._tv_ip)
+                    except Exception as err:
+                        _LOGGER.warning(f"{self._tv_name} KEY_POWER click 1 failed ({err}), will retry art mode directly")
+                    else:
+                        # Poll is_art_mode_enabled() every 300ms starting at 500ms after click 1.
+                        # We need click 2 before CEC fires (~2-3s after screen on), so poll fast
+                        # rather than sleeping a fixed 3s.
+                        art_mode_on = None
+                        await asyncio.sleep(0.5)
+                        poll_deadline = asyncio.get_event_loop().time() + 5.0
+                        while asyncio.get_event_loop().time() < poll_deadline:
+                            try:
+                                await client.ensure_connected(timeout=2)
+                                art_mode_on = await is_art_mode_enabled(client)
+                                break  # got a definitive answer
+                            except Exception:
+                                await asyncio.sleep(0.3)
+                        if art_mode_on is True:
+                            _LOGGER.info(f"{self._tv_name} already in art mode after click 1 — done")
+                            log_activity(self.hass, self._entry.entry_id, self._tv_id, "screen_on", "Art Mode")
+                            return
+                        elif art_mode_on is False:
+                            # TV woke into TV/HDMI mode. Second click pushes it to art mode standby.
+                            _LOGGER.info(f"{self._tv_name} in TV mode after click 1 — sending KEY_POWER (click 2) to enter art mode")
+                            try:
+                                await tv_screen_on(self._tv_ip)
+                            except Exception as err:
+                                _LOGGER.warning(f"{self._tv_name} KEY_POWER click 2 failed ({err})")
+                            await asyncio.sleep(2)
+                        else:
+                            _LOGGER.debug(f"{self._tv_name} art mode state unknown after click 1 — proceeding to retry loop")
+
+                # Retry ensure_connected + set_art_mode until TV responds (up to 60s).
+                # Covers both: post-WoL boot delay, and post-KEY_POWER mode transition.
+                deadline = asyncio.get_event_loop().time() + 60
+                last_err = None
+                while asyncio.get_event_loop().time() < deadline:
+                    try:
+                        await client.ensure_connected(timeout=8)
+                        await set_art_mode(client)
+                        _LOGGER.info(f"Switched {self._tv_name} to art mode")
+                        log_activity(
+                            self.hass, self._entry.entry_id, self._tv_id,
+                            "screen_on",
+                            "Art Mode",
+                        )
+                        return
+                    except Exception as err:
+                        last_err = err
+                        _LOGGER.debug(f"{self._tv_name} not ready yet ({err}), retrying...")
+                        await asyncio.sleep(4)
+
+                raise FrameArtError(
+                    f"{self._tv_name} did not respond within 60s: {last_err}"
+                )
+
+            # TV screen was already on — just connect and switch to art mode
             try:
-                await client.ensure_connected(timeout=4)
-            except Exception:
-                # TV unreachable — try WoL if MAC is available
-                if not self._tv_mac:
-                    raise FrameArtError(
-                        f"{self._tv_name} is unreachable and no MAC address available for WoL"
-                    )
-                _LOGGER.info(f"{self._tv_name} unreachable, sending WoL...")
-                await tv_on(self._tv_ip, self._tv_mac, client=client)
+                await client.ensure_connected(timeout=8)
+            except Exception as conn_err:
+                raise FrameArtError(f"Could not connect to art channel on {self._tv_name}: {conn_err}") from conn_err
 
             await set_art_mode(client)
             _LOGGER.info(f"Switched {self._tv_name} to art mode")

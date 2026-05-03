@@ -39,6 +39,12 @@ CONF_SELECTED_TAGSET = "selected_tagset"
 CONF_OVERRIDE_TAGSET = "override_tagset"
 CONF_OVERRIDE_EXPIRY_TIME = "override_expiry_time"
 
+# Moods
+CONF_MOOD_SENSOR = "mood_sensor"          # entity_id of HA sensor providing active mood IDs
+CONF_MOOD_OVERRIDES = "mood_overrides"    # list of mood IDs activated via service call
+CONF_MOOD_OVERRIDE_EXPIRY = "mood_override_expiry"  # ISO timestamp for override expiry
+CONF_MOOD_BASELINE_FLOOR = "mood_baseline_floor"  # float 0.0-1.0, reserved fraction for base rotation
+
 DEFAULT_LOGGING_ENABLED = True
 DEFAULT_LOG_RETENTION_MONTHS = 6
 DEFAULT_LOG_FLUSH_MINUTES = 5
