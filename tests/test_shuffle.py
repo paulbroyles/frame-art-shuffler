@@ -1484,3 +1484,127 @@ class TestFastPathConcurrency:
         )
         assert r1 is True
         assert r2 is True
+
+
+# ---------------------------------------------------------------------------
+# _async_trigger_prefetch
+# ---------------------------------------------------------------------------
+
+class TestAsyncTriggerPrefetch:
+    """_async_trigger_prefetch fires a POST and swallows errors silently."""
+
+    def _make_hass(self, post_mock):
+        hass = MagicMock()
+        session = MagicMock()
+        session.post = post_mock
+        hass.helpers = MagicMock()
+        return hass, session
+
+    def test_posts_virtual_tag_id(self):
+        """virtualTagId is included in the request body."""
+        async def _run():
+            from custom_components.frame_art_shuffler.shuffle import _async_trigger_prefetch
+
+            posted = {}
+
+            async def fake_post(url, json=None, **kwargs):
+                posted['url'] = url
+                posted['json'] = json
+                resp = MagicMock()
+                return resp
+
+            cm = MagicMock()
+            cm.__aenter__ = AsyncMock(return_value=MagicMock())
+            cm.__aexit__ = AsyncMock(return_value=False)
+
+            with patch(
+                "custom_components.frame_art_shuffler.shuffle.async_get_clientsession"
+            ) as mock_session_fn:
+                session = MagicMock()
+                session.post = MagicMock(return_value=cm)
+                mock_session_fn.return_value = session
+
+                hass = MagicMock()
+                await _async_trigger_prefetch(
+                    hass, "http://manager:8099", "device-abc", "google-wallpaper"
+                )
+
+            call_args = session.post.call_args
+            assert "prefetch/device-abc" in call_args[0][0]
+            assert call_args[1]["json"]["virtualTagId"] == "google-wallpaper"
+
+        asyncio.run(_run())
+
+    def test_includes_active_moods_when_provided(self):
+        """activeMoods is forwarded when non-empty."""
+        async def _run():
+            from custom_components.frame_art_shuffler.shuffle import _async_trigger_prefetch
+
+            cm = MagicMock()
+            cm.__aenter__ = AsyncMock(return_value=MagicMock())
+            cm.__aexit__ = AsyncMock(return_value=False)
+
+            with patch(
+                "custom_components.frame_art_shuffler.shuffle.async_get_clientsession"
+            ) as mock_session_fn:
+                session = MagicMock()
+                session.post = MagicMock(return_value=cm)
+                mock_session_fn.return_value = session
+
+                hass = MagicMock()
+                await _async_trigger_prefetch(
+                    hass, "http://manager:8099", "device-abc",
+                    "google-wallpaper", active_moods=["calm", "minimal"]
+                )
+
+            payload = session.post.call_args[1]["json"]
+            assert payload["activeMoods"] == ["calm", "minimal"]
+
+        asyncio.run(_run())
+
+    def test_omits_optional_fields_when_absent(self):
+        """tvOrientation and activeMoods are not sent when not provided."""
+        async def _run():
+            from custom_components.frame_art_shuffler.shuffle import _async_trigger_prefetch
+
+            cm = MagicMock()
+            cm.__aenter__ = AsyncMock(return_value=MagicMock())
+            cm.__aexit__ = AsyncMock(return_value=False)
+
+            with patch(
+                "custom_components.frame_art_shuffler.shuffle.async_get_clientsession"
+            ) as mock_session_fn:
+                session = MagicMock()
+                session.post = MagicMock(return_value=cm)
+                mock_session_fn.return_value = session
+
+                hass = MagicMock()
+                await _async_trigger_prefetch(
+                    hass, "http://manager:8099", "device-abc", "google-wallpaper"
+                )
+
+            payload = session.post.call_args[1]["json"]
+            assert "tvOrientation" not in payload
+            assert "activeMoods" not in payload
+
+        asyncio.run(_run())
+
+    def test_swallows_network_error_silently(self):
+        """A connection error does not propagate — fire-and-forget contract."""
+        async def _run():
+            from custom_components.frame_art_shuffler.shuffle import _async_trigger_prefetch
+
+            with patch(
+                "custom_components.frame_art_shuffler.shuffle.async_get_clientsession"
+            ) as mock_session_fn:
+                session = MagicMock()
+                session.post = MagicMock(side_effect=Exception("network down"))
+                mock_session_fn.return_value = session
+
+                hass = MagicMock()
+                # Should not raise.
+                await _async_trigger_prefetch(
+                    hass, "http://manager:8099", "device-abc", "google-wallpaper"
+                )
+
+        asyncio.run(_run())

@@ -395,6 +395,48 @@ if _HA_AVAILABLE:
 
 
 
+    async def _async_invalidate_web_prefetch_for_tv(
+        hass: Any,
+        entry: Any,
+        tv_id: str,
+        new_tagset_name: str | None,
+    ) -> None:
+        """Invalidate the web-source pre-fetch for a TV, then kick off a fresh one.
+
+        Called after a tagset assignment change so the pre-fetched image
+        (which was optimised for the old tagset's virtual tag) is replaced
+        as quickly as possible.
+        """
+        from .shuffle import _async_trigger_prefetch  # noqa: E402 - late import
+        from .shuffle import _async_select_image       # noqa: E402
+        from homeassistant.helpers.aiohttp_client import async_get_clientsession  # noqa: E402
+
+        mgr_url: str = entry.data.get("frame_art_manager_url", "http://localhost:8099")
+        registry = dr.async_get(hass)
+        device = registry.async_get_device(identifiers={(DOMAIN, tv_id)})
+        if not device:
+            return
+        device_id = device.id
+        session = async_get_clientsession(hass)
+
+        # Invalidate the stored pre-fetch.
+        try:
+            async with asyncio.timeout(5):
+                await session.delete(f"{mgr_url}/api/web-sources/prefetch/{device_id}")
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.debug("Could not delete pre-fetch for %s (non-fatal): %s", tv_id, err)
+
+        # Ask the add-on to pick the next image using the new tagset's virtual tag.
+        try:
+            tv_name = entry.data.get("tvs", {}).get(tv_id, {}).get("name", tv_id)
+            selected, _, _, _, _ = await _async_select_image(
+                hass, mgr_url, new_tagset_name, None, tv_name, recent_images=None
+            )
+            if selected and selected.get("_web_sources") and (vtid := selected.get("_virtual_tag_id")):
+                await _async_trigger_prefetch(hass, mgr_url, device_id, vtid)
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.debug("Could not start pre-fetch for %s after tagset change (non-fatal): %s", tv_id, err)
+
     async def async_setup_entry(hass: Any, entry: Any) -> bool:
         """Set up a config entry for Frame Art Shuffler."""
 
@@ -1197,42 +1239,9 @@ if _HA_AVAILABLE:
                 _make_tv_invalidator(tv_id),
             )
 
+        # Bind the module-level helper to this entry's context.
         async def _async_invalidate_and_prefetch_for_tv(tv_id: str, new_tagset_name: str | None) -> None:
-            """Invalidate the web-source pre-fetch for a TV, then kick off a fresh one.
-
-            Called after a tagset assignment change so the pre-fetched image
-            (which was optimised for the old tagset's virtual tag) is replaced
-            as quickly as possible.
-            """
-            from .shuffle import _async_trigger_prefetch  # noqa: E402 - late import
-            from .shuffle import _async_select_image       # noqa: E402
-            from homeassistant.helpers.aiohttp_client import async_get_clientsession  # noqa: E402
-
-            mgr_url: str = entry.data.get("frame_art_manager_url", "http://localhost:8099")
-            registry = dr.async_get(hass)
-            device = registry.async_get_device(identifiers={(DOMAIN, tv_id)})
-            if not device:
-                return
-            device_id = device.id
-            session = async_get_clientsession(hass)
-
-            # Invalidate the stored pre-fetch.
-            try:
-                async with asyncio.timeout(5):
-                    await session.delete(f"{mgr_url}/api/web-sources/prefetch/{device_id}")
-            except Exception as err:  # pylint: disable=broad-except
-                _LOGGER.debug("Could not delete pre-fetch for %s (non-fatal): %s", tv_id, err)
-
-            # Ask the add-on to pick the next image using the new tagset's virtual tag.
-            try:
-                tv_name = entry.data.get("tvs", {}).get(tv_id, {}).get("name", tv_id)
-                selected, _, _, _, _ = await _async_select_image(
-                    hass, mgr_url, new_tagset_name, None, tv_name, recent_images=None
-                )
-                if selected and selected.get("_web_sources") and (vtid := selected.get("_virtual_tag_id")):
-                    await _async_trigger_prefetch(hass, mgr_url, device_id, vtid)
-            except Exception as err:  # pylint: disable=broad-except
-                _LOGGER.debug("Could not start pre-fetch for %s after tagset change (non-fatal): %s", tv_id, err)
+            await _async_invalidate_web_prefetch_for_tv(hass, entry, tv_id, new_tagset_name)
 
         async def async_handle_select_tagset(call: ServiceCall) -> None:
             """Permanently switch which tagset a TV uses.
