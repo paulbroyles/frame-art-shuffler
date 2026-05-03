@@ -191,6 +191,13 @@ select_tagset:
       required: true
       selector:
         text:
+    force_shuffle:
+      name: Force Immediate Shuffle
+      description: Shuffle immediately even if the TV is currently displaying art. Default false (only shuffles if TV is off or not displaying).
+      required: false
+      default: false
+      selector:
+        boolean:
 
 override_tagset:
   name: Override Tagset
@@ -226,6 +233,13 @@ override_tagset:
           max: 10080
           unit_of_measurement: minutes
           mode: box
+    force_shuffle:
+      name: Force Immediate Shuffle
+      description: Shuffle immediately even if the TV is currently displaying art. Default false (only shuffles if TV is off or not displaying).
+      required: false
+      default: false
+      selector:
+        boolean:
 
 clear_tagset_override:
   name: Clear Tagset Override

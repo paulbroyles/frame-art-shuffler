@@ -446,8 +446,9 @@ if _HA_AVAILABLE:
 
         Supported flags (one per line, case-insensitive):
             suppress_moods: true|false
+            force_shuffle: true|false
         """
-        result = {"suppress_moods": False}
+        result: dict = {"suppress_moods": False, "force_shuffle": False}
         if not description:
             return result
         for line in description.splitlines():
@@ -459,6 +460,8 @@ if _HA_AVAILABLE:
             value = value.strip().lower()
             if key == "suppress_moods":
                 result["suppress_moods"] = value in ("true", "1", "yes")
+            elif key == "force_shuffle":
+                result["force_shuffle"] = value in ("true", "1", "yes")
         return result
 
     async def _async_setup_calendar_monitor(
@@ -500,6 +503,7 @@ if _HA_AVAILABLE:
             description = event_data.get("description")
             flags = _parse_calendar_event_description(description)
             suppress_moods = flags["suppress_moods"]
+            force_shuffle = flags["force_shuffle"]
 
             end_dt: datetime | None = event_data.get("_end_dt")
             if not end_dt:
@@ -525,8 +529,8 @@ if _HA_AVAILABLE:
                 return
 
             _LOGGER.info(
-                "Calendar monitor: applying event '%s' (suppress_moods=%s) until %s",
-                tagset_name, suppress_moods, end_dt,
+                "Calendar monitor: applying event '%s' (suppress_moods=%s, force_shuffle=%s) until %s",
+                tagset_name, suppress_moods, force_shuffle, end_dt,
             )
 
             # Apply override to all TVs
@@ -547,10 +551,16 @@ if _HA_AVAILABLE:
                     "calendar_event_started",
                     f"Calendar event: override '{tagset_name}' active until {end_dt.strftime('%H:%M')}",
                 )
-                hass.async_create_background_task(
-                    async_shuffle_tv(hass, entry, tv_id, reason="calendar_event", recent_images=None),
-                    name=f"cal-shuffle-{tv_id}",
-                )
+                if force_shuffle or not _tv_is_displaying(hass, entry, tv_id):
+                    hass.async_create_task(
+                        async_shuffle_tv(hass, entry, tv_id, reason="calendar_event", recent_images=None),
+                        name=f"cal-shuffle-{tv_id}",
+                    )
+                else:
+                    _LOGGER.debug(
+                        "Calendar event '%s': TV %s is displaying, deferring shuffle",
+                        tagset_name, tv_id,
+                    )
 
             # Schedule end timer
             async def _on_event_end(_now: Any) -> None:
@@ -602,10 +612,16 @@ if _HA_AVAILABLE:
                         "calendar_event_ended",
                         f"Calendar event: override '{tagset_name}' ended, reverted to selected tagset",
                     )
-                    hass.async_create_background_task(
-                        async_shuffle_tv(hass, entry, tv_id, reason="calendar_event_end", recent_images=None),
-                        name=f"cal-shuffle-clear-{tv_id}",
-                    )
+                    if not _tv_is_displaying(hass, entry, tv_id):
+                        hass.async_create_task(
+                            async_shuffle_tv(hass, entry, tv_id, reason="calendar_event_end", recent_images=None),
+                            name=f"cal-shuffle-clear-{tv_id}",
+                        )
+                    else:
+                        _LOGGER.debug(
+                            "Calendar event '%s' ended: TV %s is displaying, deferring shuffle",
+                            tagset_name, tv_id,
+                        )
 
         async def _async_scan_calendar(now: Any = None) -> None:
             """Fetch calendar events and apply/schedule as needed."""
@@ -635,6 +651,10 @@ if _HA_AVAILABLE:
             seen_uids: set[str] = set()
 
             for raw in events:
+                _LOGGER.debug(
+                    "Calendar monitor: raw event summary=%r start=%r end=%r uid=%r",
+                    raw.get("summary"), raw.get("start"), raw.get("end"), raw.get("uid"),
+                )
                 try:
                     start_dt = _parse_calendar_dt(raw.get("start"))
                     end_dt = _parse_calendar_dt(raw.get("end"))
@@ -746,6 +766,11 @@ if _HA_AVAILABLE:
                 return dt.replace(tzinfo=timezone.utc)
             return dt
         raise TypeError(f"Cannot parse calendar datetime: {value!r}")
+
+    def _tv_is_displaying(hass: Any, entry: Any, tv_id: str) -> bool:
+        """Return True if the TV screen is currently on (actively displaying art)."""
+        data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+        return bool(data.get("tv_status_cache", {}).get(tv_id, {}).get("screen_on", False))
 
     async def async_setup_entry(hass: Any, entry: Any) -> bool:
         """Set up a config entry for Frame Art Shuffler."""
@@ -1509,6 +1534,7 @@ if _HA_AVAILABLE:
         # whose fingerprint no longer matches and kick off a new pre-upload.
         from .shuffle import _async_pre_upload_next  # noqa: E402 - late import avoids circular
 
+        @callback
         def _invalidate_staged_for_all_tvs(*_args: Any) -> None:
             """Global tagset changed — check all TVs."""
             staged = hass.data[DOMAIN][entry.entry_id].get("staged_images", {})
@@ -1526,6 +1552,7 @@ if _HA_AVAILABLE:
 
         def _make_tv_invalidator(tid: str) -> Callable[..., None]:
             """Per-TV tagset changed — check specific TV."""
+            @callback
             def _invalidate(*_args: Any) -> None:
                 staged = hass.data[DOMAIN][entry.entry_id].get("staged_images", {})
                 entry_data = hass.data[DOMAIN][entry.entry_id]
@@ -1602,6 +1629,13 @@ if _HA_AVAILABLE:
                 _async_invalidate_and_prefetch_for_tv(tv_id, name),
                 name=f"prefetch-after-tagset-{tv_id}",
             )
+            if not _tv_is_displaying(hass, target_entry, tv_id):
+                hass.async_create_task(
+                    async_shuffle_tv(hass, target_entry, tv_id, reason="tagset_select", recent_images=None),
+                    name=f"shuffle-after-select-{tv_id}",
+                )
+            else:
+                _LOGGER.debug("Select tagset '%s' for %s: TV is displaying, deferring shuffle", name, tv_name)
 
         async def async_handle_override_tagset(call: ServiceCall) -> None:
             """Apply a temporary tagset override with required expiry.
@@ -1654,9 +1688,11 @@ if _HA_AVAILABLE:
                 name=f"prefetch-after-override-{tv_id}",
             )
 
-            # Trigger immediate shuffle to apply the override tagset
-            # Skip recency - user deliberately chose this tagset, don't constrain the pool
-            await async_shuffle_tv(hass, target_entry, tv_id, reason="override", recent_images=None)
+            force_shuffle = call.data.get("force_shuffle", False)
+            if force_shuffle or not _tv_is_displaying(hass, target_entry, tv_id):
+                await async_shuffle_tv(hass, target_entry, tv_id, reason="override", recent_images=None)
+            else:
+                _LOGGER.debug("Override tagset '%s' for %s: TV is displaying, deferring shuffle", name, tv_name)
 
         async def async_handle_clear_tagset_override(call: ServiceCall) -> None:
             """Clear an active tagset override early."""

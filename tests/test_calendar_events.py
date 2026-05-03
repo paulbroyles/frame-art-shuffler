@@ -31,15 +31,15 @@ class TestParseCalendarEventDescription:
 
     def test_none_description_returns_defaults(self):
         result = _parse_calendar_event_description(None)
-        assert result == {"suppress_moods": False}
+        assert result == {"suppress_moods": False, "force_shuffle": False}
 
     def test_empty_string_returns_defaults(self):
         result = _parse_calendar_event_description("")
-        assert result == {"suppress_moods": False}
+        assert result == {"suppress_moods": False, "force_shuffle": False}
 
     def test_no_flags_returns_defaults(self):
         result = _parse_calendar_event_description("Just a note about this event.")
-        assert result == {"suppress_moods": False}
+        assert result == {"suppress_moods": False, "force_shuffle": False}
 
     def test_suppress_moods_true(self):
         result = _parse_calendar_event_description("suppress_moods: true")
@@ -68,15 +68,33 @@ class TestParseCalendarEventDescription:
 
     def test_unknown_flags_ignored(self):
         result = _parse_calendar_event_description("unknown_flag: whatever\nfoo: bar")
-        assert result == {"suppress_moods": False}
+        assert result == {"suppress_moods": False, "force_shuffle": False}
 
     def test_lines_without_colon_ignored(self):
         result = _parse_calendar_event_description("suppress_moods true\nno colon here")
-        assert result == {"suppress_moods": False}
+        assert result == {"suppress_moods": False, "force_shuffle": False}
 
     def test_whitespace_around_key_and_value(self):
         result = _parse_calendar_event_description("  suppress_moods  :  true  ")
         assert result["suppress_moods"] is True
+
+    def test_force_shuffle_true(self):
+        result = _parse_calendar_event_description("force_shuffle: true")
+        assert result["force_shuffle"] is True
+
+    def test_force_shuffle_false_explicit(self):
+        result = _parse_calendar_event_description("force_shuffle: false")
+        assert result["force_shuffle"] is False
+
+    def test_force_shuffle_absent_defaults_false(self):
+        result = _parse_calendar_event_description("suppress_moods: true")
+        assert result["force_shuffle"] is False
+
+    def test_both_flags_together(self):
+        desc = "suppress_moods: true\nforce_shuffle: true"
+        result = _parse_calendar_event_description(desc)
+        assert result["suppress_moods"] is True
+        assert result["force_shuffle"] is True
 
 
 # ---------------------------------------------------------------------------
