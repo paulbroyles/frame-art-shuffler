@@ -166,7 +166,9 @@ if _HA_AVAILABLE:
         add them to the dictionary below. Otherwise, changing them will not trigger a reload.
         """
         tvs = data.get("tvs", {})
-        structural = {}
+        structural = {
+            "_calendar_entity_id": data.get(CONF_CALENDAR_ENTITY_ID),
+        }
         for tv_id, tv_data in tvs.items():
             structural[tv_id] = {
                 "ip": tv_data.get("ip"),
