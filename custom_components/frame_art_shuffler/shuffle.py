@@ -117,6 +117,9 @@ async def _build_local_sensor_meta(
                 for k, v in (image_meta.get("attributes") or {}).items():
                     if v is not None and v != "":
                         meta[k] = v
+                for k, v in (image_meta.get("resolvedEntityAttributes") or {}).items():
+                    if v is not None and v != "":
+                        meta[k] = v
         except Exception:
             pass
     return meta
