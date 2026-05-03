@@ -710,15 +710,23 @@ if _HA_AVAILABLE:
         )
         hass.data[DOMAIN][entry.entry_id]["calendar_unsubs"] = [unsub_state, unsub_interval]
 
-        # Defer initial scan until HA is fully started so calendar service is available.
-        # Wrapping in async_call_later with 0s delay schedules it after setup completes.
-        async def _deferred_initial_scan(now: Any) -> None:
+        # Defer initial scan until HA is fully started so all services (including
+        # calendar.get_events) are registered. On mid-session reload, HA is already
+        # running so scan immediately instead of waiting for a never-fired event.
+        from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
+        from homeassistant.core import CoreState
+
+        async def _on_ha_started(_event: Any) -> None:
             await _async_scan_calendar()
 
-        from homeassistant.helpers.event import async_call_later
-        hass.data[DOMAIN][entry.entry_id]["calendar_unsubs"].append(
-            async_call_later(hass, 0, _deferred_initial_scan)
-        )
+        if hass.state == CoreState.running:
+            hass.async_create_background_task(
+                _async_scan_calendar(), name="cal-monitor-initial"
+            )
+        else:
+            hass.data[DOMAIN][entry.entry_id]["calendar_unsubs"].append(
+                hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _on_ha_started)
+            )
 
     def _parse_calendar_dt(value: Any) -> "datetime":
         """Parse a HA calendar event start/end value to an aware datetime."""
