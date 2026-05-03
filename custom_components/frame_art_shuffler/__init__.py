@@ -610,48 +610,47 @@ if _HA_AVAILABLE:
         async def _async_scan_calendar(now: Any = None) -> None:
             """Fetch calendar events and apply/schedule as needed."""
             try:
-                result = await hass.services.async_call(
-                    "calendar",
-                    "get_events",
-                    {
-                        "entity_id": calendar_entity_id,
-                        "start_date_time": datetime.now(timezone.utc).isoformat(),
-                        "end_date_time": (datetime.now(timezone.utc) + timedelta(hours=25)).isoformat(),
-                    },
-                    blocking=True,
-                    return_response=True,
-                )
+                # Access the calendar entity directly to avoid service-layer issues.
+                entity_components = hass.data.get("entity_components", {})
+                cal_component = entity_components.get("calendar")
+                cal_entity = cal_component.get_entity(calendar_entity_id) if cal_component else None
+                if cal_entity is None:
+                    _LOGGER.warning(
+                        "Calendar monitor: entity %s not found", calendar_entity_id
+                    )
+                    return
+                start_dt = datetime.now(timezone.utc)
+                end_dt = start_dt + timedelta(hours=25)
+                events = await cal_entity.async_get_events(hass, start_dt, end_dt)
             except Exception as err:  # pylint: disable=broad-except
                 _LOGGER.warning("Calendar monitor: failed to fetch events: %s", err)
                 return
 
-            if not result:
-                _LOGGER.debug("Calendar monitor: scan returned no result")
-                return
-
-            events = result.get(calendar_entity_id, {}).get("events", [])
             _LOGGER.debug("Calendar monitor: scan found %d event(s) in 25h window", len(events))
             now_dt = datetime.now(timezone.utc)
             seen_uids: set[str] = set()
 
-            for raw in events:
-                # Parse start/end — HA returns ISO strings or date strings
-                start_raw = raw.get("start")
-                end_raw = raw.get("end")
+            for cal_event in events:
+                # CalendarEvent is a dataclass with .start, .end, .summary, .description, .uid
                 try:
-                    start_dt = _parse_calendar_dt(start_raw)
-                    end_dt = _parse_calendar_dt(end_raw)
+                    start_dt = _parse_calendar_dt(cal_event.start)
+                    end_dt = _parse_calendar_dt(cal_event.end)
                 except (ValueError, TypeError) as err:
                     _LOGGER.warning("Calendar monitor: could not parse event times: %s", err)
                     continue
 
-                uid = raw.get("uid") or raw.get("summary", "")
+                uid = getattr(cal_event, "uid", None) or cal_event.summary or ""
                 seen_uids.add(uid)
 
                 if end_dt <= now_dt:
                     continue  # already ended
 
-                event_data = {**raw, "_end_dt": end_dt, "uid": uid}
+                event_data = {
+                    "uid": uid,
+                    "summary": cal_event.summary or "",
+                    "description": getattr(cal_event, "description", None),
+                    "_end_dt": end_dt,
+                }
 
                 if start_dt <= now_dt:
                     # Currently active
@@ -672,7 +671,7 @@ if _HA_AVAILABLE:
                         upcoming_start_unsubs[uid] = start_unsub
                         _LOGGER.debug(
                             "Calendar monitor: scheduled start of '%s' at %s",
-                            raw.get("summary"), start_dt,
+                            cal_event.summary, start_dt,
                         )
 
             # Clear any active events that are no longer in the calendar
