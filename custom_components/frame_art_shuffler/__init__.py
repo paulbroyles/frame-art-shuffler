@@ -610,36 +610,39 @@ if _HA_AVAILABLE:
         async def _async_scan_calendar(now: Any = None) -> None:
             """Fetch calendar events and apply/schedule as needed."""
             try:
-                # Access the calendar entity directly to avoid service-layer issues.
-                entity_components = hass.data.get("entity_components", {})
-                cal_component = entity_components.get("calendar")
-                cal_entity = cal_component.get_entity(calendar_entity_id) if cal_component else None
-                if cal_entity is None:
-                    _LOGGER.warning(
-                        "Calendar monitor: entity %s not found", calendar_entity_id
-                    )
-                    return
-                start_dt = datetime.now(timezone.utc)
-                end_dt = start_dt + timedelta(hours=25)
-                events = await cal_entity.async_get_events(hass, start_dt, end_dt)
+                now_utc = datetime.now(timezone.utc)
+                result = await hass.services.async_call(
+                    "calendar",
+                    "get_events",
+                    {
+                        "entity_id": calendar_entity_id,
+                        "start_date_time": now_utc.isoformat(),
+                        "end_date_time": (now_utc + timedelta(hours=25)).isoformat(),
+                    },
+                    blocking=True,
+                    return_response=True,
+                )
             except Exception as err:  # pylint: disable=broad-except
                 _LOGGER.warning("Calendar monitor: failed to fetch events: %s", err)
                 return
 
+            if not result:
+                return
+
+            events = result.get(calendar_entity_id, {}).get("events", [])
             _LOGGER.debug("Calendar monitor: scan found %d event(s) in 25h window", len(events))
             now_dt = datetime.now(timezone.utc)
             seen_uids: set[str] = set()
 
-            for cal_event in events:
-                # CalendarEvent is a dataclass with .start, .end, .summary, .description, .uid
+            for raw in events:
                 try:
-                    start_dt = _parse_calendar_dt(cal_event.start)
-                    end_dt = _parse_calendar_dt(cal_event.end)
+                    start_dt = _parse_calendar_dt(raw.get("start"))
+                    end_dt = _parse_calendar_dt(raw.get("end"))
                 except (ValueError, TypeError) as err:
                     _LOGGER.warning("Calendar monitor: could not parse event times: %s", err)
                     continue
 
-                uid = getattr(cal_event, "uid", None) or cal_event.summary or ""
+                uid = raw.get("uid") or raw.get("summary") or ""
                 seen_uids.add(uid)
 
                 if end_dt <= now_dt:
@@ -647,8 +650,8 @@ if _HA_AVAILABLE:
 
                 event_data = {
                     "uid": uid,
-                    "summary": cal_event.summary or "",
-                    "description": getattr(cal_event, "description", None),
+                    "summary": raw.get("summary") or "",
+                    "description": raw.get("description"),
                     "_end_dt": end_dt,
                 }
 
@@ -671,7 +674,7 @@ if _HA_AVAILABLE:
                         upcoming_start_unsubs[uid] = start_unsub
                         _LOGGER.debug(
                             "Calendar monitor: scheduled start of '%s' at %s",
-                            cal_event.summary, start_dt,
+                            event_data["summary"], start_dt,
                         )
 
             # Clear any active events that are no longer in the calendar
@@ -689,15 +692,13 @@ if _HA_AVAILABLE:
                     except Exception:  # pylint: disable=broad-except
                         pass
 
-        def _on_calendar_state_change(event: Any) -> None:
+        async def _on_calendar_state_change(event: Any) -> None:
             """Re-scan when the calendar entity state changes."""
-            hass.async_create_background_task(
-                _async_scan_calendar(), name="cal-monitor-rescan"
-            )
+            await _async_scan_calendar()
 
         def _on_interval(now: Any) -> None:
-            """Safety-net hourly rescan (sync callback wrapping async scan)."""
-            hass.async_create_background_task(
+            """Safety-net hourly rescan — must be sync for async_track_time_interval."""
+            hass.async_create_task(
                 _async_scan_calendar(), name="cal-monitor-interval"
             )
 
@@ -721,7 +722,7 @@ if _HA_AVAILABLE:
             await _async_scan_calendar()
 
         if hass.state == CoreState.running:
-            hass.async_create_background_task(
+            hass.async_create_task(
                 _async_scan_calendar(), name="cal-monitor-initial"
             )
         else:
