@@ -694,18 +694,31 @@ if _HA_AVAILABLE:
                 _async_scan_calendar(), name="cal-monitor-rescan"
             )
 
+        def _on_interval(now: Any) -> None:
+            """Safety-net hourly rescan (sync callback wrapping async scan)."""
+            hass.async_create_background_task(
+                _async_scan_calendar(), name="cal-monitor-interval"
+            )
+
         # Subscribe to calendar state changes (fires when current/next event shifts)
         unsub_state = async_track_state_change_event(
             hass, [calendar_entity_id], _on_calendar_state_change
         )
-        # Hourly safety-net rescan
+        # Hourly safety-net rescan — must use sync callback for async_track_time_interval
         unsub_interval = async_track_time_interval(
-            hass, _async_scan_calendar, timedelta(hours=1)
+            hass, _on_interval, timedelta(hours=1)
         )
         hass.data[DOMAIN][entry.entry_id]["calendar_unsubs"] = [unsub_state, unsub_interval]
 
-        # Initial scan — catch any event that was already active on startup
-        await _async_scan_calendar()
+        # Defer initial scan until HA is fully started so calendar service is available.
+        # Wrapping in async_call_later with 0s delay schedules it after setup completes.
+        async def _deferred_initial_scan(now: Any) -> None:
+            await _async_scan_calendar()
+
+        from homeassistant.helpers.event import async_call_later
+        hass.data[DOMAIN][entry.entry_id]["calendar_unsubs"].append(
+            async_call_later(hass, 0, _deferred_initial_scan)
+        )
 
     def _parse_calendar_dt(value: Any) -> "datetime":
         """Parse a HA calendar event start/end value to an aware datetime."""
