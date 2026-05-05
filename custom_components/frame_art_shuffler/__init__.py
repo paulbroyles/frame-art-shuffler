@@ -652,8 +652,8 @@ if _HA_AVAILABLE:
 
             for raw in events:
                 _LOGGER.debug(
-                    "Calendar monitor: raw event keys=%s data=%r",
-                    list(raw.keys()), raw,
+                    "Calendar monitor: event '%s' start=%s end=%s",
+                    raw.get("summary"), raw.get("start"), raw.get("end"),
                 )
                 try:
                     start_dt = _parse_calendar_dt(raw.get("start"))
