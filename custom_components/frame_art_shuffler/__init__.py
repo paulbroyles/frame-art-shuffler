@@ -444,11 +444,22 @@ if _HA_AVAILABLE:
     def _parse_calendar_event_description(description: str | None) -> dict:
         """Parse structured flags from a Frame Art calendar event description.
 
-        Supported flags (one per line, case-insensitive):
+        Supported keys (one per line, case-insensitive):
+            uid: <uuid>              — stable manager-assigned identity
             suppress_moods: true|false
             force_shuffle: true|false
+            label: <display name>
+            linked_calendar: <entity_id>
+            linked_uid: <uid>
         """
-        result: dict = {"suppress_moods": False, "force_shuffle": False}
+        result: dict = {
+            "uid": None,
+            "suppress_moods": False,
+            "force_shuffle": False,
+            "label": None,
+            "linked_calendar": None,
+            "linked_uid": None,
+        }
         if not description:
             return result
         for line in description.splitlines():
@@ -457,11 +468,20 @@ if _HA_AVAILABLE:
                 continue
             key, _, value = line.partition(":")
             key = key.strip().lower()
-            value = value.strip().lower()
-            if key == "suppress_moods":
-                result["suppress_moods"] = value in ("true", "1", "yes")
+            value = value.strip()
+            value_lower = value.lower()
+            if key == "uid":
+                result["uid"] = value or None
+            elif key == "suppress_moods":
+                result["suppress_moods"] = value_lower in ("true", "1", "yes")
             elif key == "force_shuffle":
-                result["force_shuffle"] = value in ("true", "1", "yes")
+                result["force_shuffle"] = value_lower in ("true", "1", "yes")
+            elif key == "label":
+                result["label"] = value or None
+            elif key == "linked_calendar":
+                result["linked_calendar"] = value or None
+            elif key == "linked_uid":
+                result["linked_uid"] = value or None
         return result
 
     async def _async_setup_calendar_monitor(
@@ -500,8 +520,9 @@ if _HA_AVAILABLE:
             """Apply a calendar event as a tagset override on all TVs."""
             uid = event_data.get("uid") or event_data.get("summary", "")
             tagset_name = (event_data.get("summary") or "").strip()
-            description = event_data.get("description")
-            flags = _parse_calendar_event_description(description)
+            flags = event_data.get("_flags") or _parse_calendar_event_description(
+                event_data.get("description")
+            )
             suppress_moods = flags["suppress_moods"]
             force_shuffle = flags["force_shuffle"]
 
@@ -662,7 +683,11 @@ if _HA_AVAILABLE:
                     _LOGGER.warning("Calendar monitor: could not parse event times: %s", err)
                     continue
 
-                uid = raw.get("uid") or raw.get("summary") or ""
+                description = raw.get("description")
+                flags = _parse_calendar_event_description(description)
+                # Prefer manager-assigned uid from description; fall back to
+                # HA-native uid (if ever returned), then event summary.
+                uid = flags.get("uid") or raw.get("uid") or raw.get("summary") or ""
                 seen_uids.add(uid)
 
                 if end_dt <= now_dt:
@@ -671,8 +696,9 @@ if _HA_AVAILABLE:
                 event_data = {
                     "uid": uid,
                     "summary": raw.get("summary") or "",
-                    "description": raw.get("description"),
+                    "description": description,
                     "_end_dt": end_dt,
+                    "_flags": flags,
                 }
 
                 if start_dt <= now_dt:

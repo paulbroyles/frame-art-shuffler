@@ -29,17 +29,60 @@ from custom_components.frame_art_shuffler.shuffle import _resolve_active_moods
 class TestParseCalendarEventDescription:
     """Tests for structured flag parsing from calendar event description text."""
 
+    DEFAULTS = {
+        "uid": None,
+        "suppress_moods": False,
+        "force_shuffle": False,
+        "label": None,
+        "linked_calendar": None,
+        "linked_uid": None,
+    }
+
     def test_none_description_returns_defaults(self):
-        result = _parse_calendar_event_description(None)
-        assert result == {"suppress_moods": False, "force_shuffle": False}
+        assert _parse_calendar_event_description(None) == self.DEFAULTS
 
     def test_empty_string_returns_defaults(self):
-        result = _parse_calendar_event_description("")
-        assert result == {"suppress_moods": False, "force_shuffle": False}
+        assert _parse_calendar_event_description("") == self.DEFAULTS
 
     def test_no_flags_returns_defaults(self):
-        result = _parse_calendar_event_description("Just a note about this event.")
-        assert result == {"suppress_moods": False, "force_shuffle": False}
+        assert _parse_calendar_event_description("Just a note.") == self.DEFAULTS
+
+    def test_uid_parsed(self):
+        result = _parse_calendar_event_description("uid: 550e8400-e29b-41d4-a716-446655440000")
+        assert result["uid"] == "550e8400-e29b-41d4-a716-446655440000"
+
+    def test_uid_absent_is_none(self):
+        result = _parse_calendar_event_description("suppress_moods: true")
+        assert result["uid"] is None
+
+    def test_label_parsed(self):
+        result = _parse_calendar_event_description("label: Star Wars Day")
+        assert result["label"] == "Star Wars Day"
+
+    def test_linked_calendar_parsed(self):
+        result = _parse_calendar_event_description("linked_calendar: calendar.family")
+        assert result["linked_calendar"] == "calendar.family"
+
+    def test_linked_uid_parsed(self):
+        result = _parse_calendar_event_description("linked_uid: google-uid-xyz")
+        assert result["linked_uid"] == "google-uid-xyz"
+
+    def test_all_fields_together(self):
+        desc = (
+            "uid: my-uuid\n"
+            "label: Star Wars Day\n"
+            "suppress_moods: true\n"
+            "force_shuffle: false\n"
+            "linked_calendar: calendar.family\n"
+            "linked_uid: goog-123"
+        )
+        result = _parse_calendar_event_description(desc)
+        assert result["uid"] == "my-uuid"
+        assert result["label"] == "Star Wars Day"
+        assert result["suppress_moods"] is True
+        assert result["force_shuffle"] is False
+        assert result["linked_calendar"] == "calendar.family"
+        assert result["linked_uid"] == "goog-123"
 
     def test_suppress_moods_true(self):
         result = _parse_calendar_event_description("suppress_moods: true")
@@ -67,12 +110,10 @@ class TestParseCalendarEventDescription:
         assert result["suppress_moods"] is True
 
     def test_unknown_flags_ignored(self):
-        result = _parse_calendar_event_description("unknown_flag: whatever\nfoo: bar")
-        assert result == {"suppress_moods": False, "force_shuffle": False}
+        assert _parse_calendar_event_description("unknown_flag: whatever\nfoo: bar") == self.DEFAULTS
 
     def test_lines_without_colon_ignored(self):
-        result = _parse_calendar_event_description("suppress_moods true\nno colon here")
-        assert result == {"suppress_moods": False, "force_shuffle": False}
+        assert _parse_calendar_event_description("suppress_moods true\nno colon here") == self.DEFAULTS
 
     def test_whitespace_around_key_and_value(self):
         result = _parse_calendar_event_description("  suppress_moods  :  true  ")
