@@ -677,8 +677,53 @@ if _HA_AVAILABLE:
 
                 if start_dt <= now_dt:
                     # Currently active
-                    if uid not in active_calendar_events:
+                    existing = active_calendar_events.get(uid)
+                    if existing is None:
                         await _async_apply_calendar_event(event_data)
+                    else:
+                        # Already tracked — check if end time changed (e.g. user edited event)
+                        if existing["end_dt"] != end_dt:
+                            _LOGGER.info(
+                                "Calendar monitor: end time for '%s' changed %s → %s, updating timer",
+                                existing["tagset"], existing["end_dt"], end_dt,
+                            )
+                            old_unsub = existing.get("end_unsub")
+                            if old_unsub:
+                                try:
+                                    old_unsub()
+                                except Exception:  # pylint: disable=broad-except
+                                    pass
+
+                            async def _on_updated_end(_now: Any, _uid: str = uid) -> None:
+                                await _async_clear_calendar_event(_uid)
+
+                            new_unsub = async_track_point_in_time(
+                                hass, _on_updated_end, end_dt
+                            )
+                            existing["end_dt"] = end_dt
+                            existing["end_unsub"] = new_unsub
+                            for tv_id in list_tv_configs_fn(entry):
+                                tv_cfg = get_tv_config(entry, tv_id) or {}
+                                if tv_cfg.get(CONF_OVERRIDE_TAGSET) == existing["tagset"]:
+                                    update_tv_config_fn(
+                                        hass, entry, tv_id,
+                                        {CONF_OVERRIDE_EXPIRY_TIME: end_dt.isoformat()},
+                                    )
+                                    start_tagset_override_timer_fn(tv_id, end_dt)
+                        else:
+                            # End time unchanged — heal if override is missing from all TVs
+                            override_missing = all(
+                                (get_tv_config(entry, tv_id) or {}).get(CONF_OVERRIDE_TAGSET)
+                                != existing["tagset"]
+                                for tv_id in list_tv_configs_fn(entry)
+                            )
+                            if override_missing:
+                                _LOGGER.warning(
+                                    "Calendar monitor: override for '%s' missing from TVs, re-applying",
+                                    existing["tagset"],
+                                )
+                                active_calendar_events.pop(uid, None)
+                                await _async_apply_calendar_event(event_data)
                 else:
                     # Upcoming — schedule start timer
                     if uid not in upcoming_start_unsubs and uid not in active_calendar_events:
@@ -716,11 +761,9 @@ if _HA_AVAILABLE:
             """Re-scan when the calendar entity state changes."""
             await _async_scan_calendar()
 
-        def _on_interval(now: Any) -> None:
-            """Safety-net hourly rescan — must be sync for async_track_time_interval."""
-            hass.async_create_task(
-                _async_scan_calendar(), name="cal-monitor-interval"
-            )
+        async def _on_interval(now: Any) -> None:
+            """Safety-net hourly rescan."""
+            await _async_scan_calendar()
 
         # Subscribe to calendar state changes (fires when current/next event shifts)
         unsub_state = async_track_state_change_event(
