@@ -573,6 +573,7 @@ if _HA_AVAILABLE:
                     f"Calendar event: override '{tagset_name}' active until {end_dt.strftime('%H:%M')}",
                 )
                 if force_shuffle or not _tv_is_displaying(hass, entry, tv_id):
+                    hass.data[DOMAIN][entry.entry_id].setdefault("pending_reshuffles", set()).add(tv_id)
                     hass.async_create_task(
                         async_shuffle_tv(hass, entry, tv_id, reason="calendar_event", recent_images=None),
                         name=f"cal-shuffle-{tv_id}",
@@ -633,6 +634,9 @@ if _HA_AVAILABLE:
                         "calendar_event_ended",
                         f"Calendar event: override '{tagset_name}' ended, reverted to selected tagset",
                     )
+                    # Mark TV as needing a reshuffle. Cleared by any successful
+                    # shuffle; checked in turn_on_tv to retry if TV was in deep sleep.
+                    hass.data[DOMAIN][entry.entry_id].setdefault("pending_reshuffles", set()).add(tv_id)
                     if not _tv_is_displaying(hass, entry, tv_id):
                         hass.async_create_task(
                             async_shuffle_tv(hass, entry, tv_id, reason="calendar_event_end", recent_images=None),
@@ -1451,6 +1455,17 @@ if _HA_AVAILABLE:
                             tv_tags=tv_tags,
                         )
 
+                # If a tagset change happened while TV was in deep sleep (e.g., calendar
+                # event ended at 2am), shuffle now that the TV is accessible.
+                pending = data.get("pending_reshuffles", set())
+                if tv_id in pending:
+                    pending.discard(tv_id)
+                    _LOGGER.info("turn_on_tv: triggering pending reshuffle for %s", tv_name)
+                    hass.async_create_task(
+                        async_shuffle_tv(hass, target_entry, tv_id, reason="turn_on_reshuffle", recent_images=None),
+                        name=f"turn-on-reshuffle-{tv_id}",
+                    )
+
                 # Start motion off timer if enabled
                 tv_config = get_tv_config(target_entry, tv_id)
                 if tv_config and tv_config.get("enable_motion_control", False):
@@ -1555,10 +1570,23 @@ if _HA_AVAILABLE:
                 
                 # Signal sensors to update
                 async_dispatcher_send(hass, f"{DOMAIN}_tagset_updated_{entry.entry_id}_{tv_id}")
-                
+
                 # Clean up timer reference
                 if tv_id in tagset_override_timers:
                     del tagset_override_timers[tv_id]
+
+                # Shuffle to reverted tagset if TV is not actively displaying
+                if not _tv_is_displaying(hass, entry, tv_id):
+                    permanent_tagset = tv_config.get(CONF_SELECTED_TAGSET)
+                    hass.async_create_background_task(
+                        _async_invalidate_web_prefetch_for_tv(hass, entry, tv_id, permanent_tagset),
+                        name=f"prefetch-after-expiry-{tv_id}",
+                    )
+                    hass.data[DOMAIN][entry.entry_id].setdefault("pending_reshuffles", set()).add(tv_id)
+                    hass.async_create_task(
+                        async_shuffle_tv(hass, entry, tv_id, reason="expiry", recent_images=None),
+                        name=f"shuffle-after-expiry-{tv_id}",
+                    )
 
             unsubscribe = async_track_point_in_time(
                 hass,
@@ -1586,6 +1614,7 @@ if _HA_AVAILABLE:
                         update_tv_config(hass, entry, tv_id, {
                             CONF_OVERRIDE_TAGSET: None,
                             CONF_OVERRIDE_EXPIRY_TIME: None,
+                            CONF_CALENDAR_SUPPRESS_MOODS: False,
                         })
                         _LOGGER.info(f"Cleared expired tagset override for {tv_config.get('name', tv_id)}")
                 except (ValueError, TypeError) as e:
@@ -1699,6 +1728,7 @@ if _HA_AVAILABLE:
                 name=f"prefetch-after-tagset-{tv_id}",
             )
             if not _tv_is_displaying(hass, target_entry, tv_id):
+                hass.data[DOMAIN][target_entry.entry_id].setdefault("pending_reshuffles", set()).add(tv_id)
                 hass.async_create_task(
                     async_shuffle_tv(hass, target_entry, tv_id, reason="tagset_select", recent_images=None),
                     name=f"shuffle-after-select-{tv_id}",
@@ -1759,6 +1789,7 @@ if _HA_AVAILABLE:
 
             force_shuffle = call.data.get("force_shuffle", False)
             if force_shuffle or not _tv_is_displaying(hass, target_entry, tv_id):
+                hass.data[DOMAIN][target_entry.entry_id].setdefault("pending_reshuffles", set()).add(tv_id)
                 await async_shuffle_tv(hass, target_entry, tv_id, reason="override", recent_images=None)
             else:
                 _LOGGER.debug("Override tagset '%s' for %s: TV is displaying, deferring shuffle", name, tv_name)
@@ -1792,6 +1823,12 @@ if _HA_AVAILABLE:
                 _async_invalidate_and_prefetch_for_tv(tv_id, permanent_tagset),
                 name=f"prefetch-after-override-clear-{tv_id}",
             )
+            if not _tv_is_displaying(hass, target_entry, tv_id):
+                hass.data[DOMAIN][target_entry.entry_id].setdefault("pending_reshuffles", set()).add(tv_id)
+                hass.async_create_task(
+                    async_shuffle_tv(hass, target_entry, tv_id, reason="override_clear", recent_images=None),
+                    name=f"shuffle-after-override-clear-{tv_id}",
+                )
 
         # Register tagset assignment services
         hass.services.async_register(

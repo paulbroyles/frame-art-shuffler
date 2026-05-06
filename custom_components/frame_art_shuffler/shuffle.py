@@ -335,6 +335,21 @@ async def _async_web_source_send(
         source = art_metadata.get("source") or "web source"
         log_activity(hass, entry.entry_id, tv_id, "shuffle", f"Web source selected: \"{title}\" from {source}")
 
+        display_log = entry_data.get("display_log")
+        if display_log:
+            now_log = datetime.now(timezone.utc)
+            display_log.note_display_start(
+                tv_id=tv_id,
+                tv_name=tv_name,
+                filename=f"web:{source}/{title}",
+                tags=[selected_tag] if selected_tag else [],
+                source="shuffle",
+                shuffle_mode=None,
+                started_at=now_log,
+                tagset_name=get_active_tagset_name(entry, tv_id),
+                source_url=art_metadata.get("artworkUrl"),
+            )
+
         now = datetime.now(timezone.utc)
         shuffle_cache = entry_data.setdefault("shuffle_cache", {})
         shuffle_cache[tv_id] = {
@@ -518,6 +533,21 @@ async def _async_fast_path_shuffle(
         if coordinator := entry_data.get("coordinator"):
             await coordinator.async_set_active_image(tv_id, None, is_shuffle=True)
 
+        display_log = entry_data.get("display_log")
+        if display_log:
+            art_meta = staged.get("artwork_metadata") or staged.get("metadata", {})
+            display_log.note_display_start(
+                tv_id=tv_id,
+                tv_name=tv_name,
+                filename=f"web:{source}/{title}",
+                tags=[staged.get("selected_tag")] if staged.get("selected_tag") else [],
+                source="shuffle",
+                shuffle_mode=reason,
+                started_at=now,
+                tagset_name=get_active_tagset_name(entry, tv_id),
+                source_url=art_meta.get("artworkUrl"),
+            )
+
         _notify("success", f"Web source displayed (fast): {title}")
     else:
         image_filename = staged.get("filename", "unknown")
@@ -589,6 +619,8 @@ async def _async_fast_path_shuffle(
             except Exception as err:
                 _LOGGER.warning("Post-shuffle brightness sync failed for %s: %s", tv_name, err)
 
+    # Clear any pending-reshuffle flag — this shuffle counts as the retry.
+    entry_data.get("pending_reshuffles", set()).discard(tv_id)
     return True
 
 
@@ -901,6 +933,7 @@ async def _async_shuffle_tv_inner(
                 _async_pre_upload_next(hass, entry, tv_id, entry_data),
                 f"pre-upload-{tv_id}",
             )
+            entry_data.get("pending_reshuffles", set()).discard(tv_id)
         return ws_result
 
     image_filename = selected_image["filename"]
@@ -1022,7 +1055,9 @@ async def _async_shuffle_tv_inner(
                 except Exception as err:
                     # Don't fail the shuffle if brightness sync fails - it's logged separately
                     _LOGGER.warning(f"Post-shuffle brightness sync failed for {tv_name}: {err}")
-        
+
+        # Clear any pending-reshuffle flag — this shuffle counts as the retry.
+        entry_data.get("pending_reshuffles", set()).discard(tv_id)
         return True
 
     def _on_skip() -> None:

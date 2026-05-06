@@ -57,6 +57,7 @@ class DisplaySession:
     tagset_name: str | None = None  # active tagset name when this display occurred
     pool_size: int | None = None  # total images in pool at shuffle time
     pool_available: int | None = None  # fresh images available at shuffle time
+    source_url: str | None = None  # original artwork URL (web sources)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a JSON-friendly dict."""
@@ -80,6 +81,8 @@ class DisplaySession:
             result["pool_size"] = self.pool_size
         if self.pool_available is not None:
             result["pool_available"] = self.pool_available
+        if self.source_url is not None:
+            result["source_url"] = self.source_url
         return result
 
     @classmethod
@@ -105,6 +108,7 @@ class DisplaySession:
             tagset_name=payload.get("tagset_name"),
             pool_size=payload.get("pool_size"),
             pool_available=payload.get("pool_available"),
+            source_url=payload.get("source_url"),
         )
 
 
@@ -124,6 +128,7 @@ class _ActiveDisplay:
     tagset_name: str | None = None  # active tagset name when this display started
     pool_size: int | None = None  # total images in pool at shuffle time
     pool_available: int | None = None  # fresh images available at shuffle time
+    source_url: str | None = None  # original artwork URL (web sources)
 
 
 class DisplayLogManager:
@@ -227,6 +232,7 @@ class DisplayLogManager:
         tagset_name: str | None = None,
         pool_size: int | None = None,
         pool_available: int | None = None,
+        source_url: str | None = None,
     ) -> None:
         """Update the active display state and capture the previous session.
 
@@ -274,6 +280,7 @@ class DisplayLogManager:
             tagset_name=tagset_name,
             pool_size=pool_size,
             pool_available=pool_available,
+            source_url=source_url,
         )
 
     def note_screen_off(
@@ -988,6 +995,7 @@ class DisplayLogManager:
             tagset_name=active.tagset_name,
             pool_size=active.pool_size,
             pool_available=active.pool_available,
+            source_url=active.source_url,
         )
         self.record_session(session)
 
