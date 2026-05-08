@@ -1507,6 +1507,15 @@ if _HA_AVAILABLE:
                 if display_log:
                     display_log.note_screen_off(tv_id=tv_id, tv_name=tv_name)
 
+                # Pre-stage the next image while the TV is in art mode standby.
+                # The TV can still receive uploads when the screen is off; this ensures
+                # a fresh image is waiting on the next wake.
+                if get_tv_config(target_entry, tv_id):
+                    hass.async_create_task(
+                        async_shuffle_tv(hass, target_entry, tv_id, reason="screen_off", recent_images=None),
+                        name=f"shuffle-on-screen-off-{tv_id}",
+                    )
+
                 # Cancel motion off timer if enabled
                 tv_config = get_tv_config(target_entry, tv_id)
                 if tv_config and tv_config.get("enable_motion_control", False):
@@ -2647,6 +2656,12 @@ if _HA_AVAILABLE:
                     display_log = hass.data[DOMAIN][entry.entry_id].get("display_log")
                     if display_log:
                         display_log.note_screen_off(tv_id=tv_id, tv_name=tv_name)
+
+                    # Pre-stage the next image while TV is in art mode standby
+                    hass.async_create_task(
+                        async_shuffle_tv(hass, entry, tv_id, reason="screen_off", recent_images=None),
+                        name=f"shuffle-on-screen-off-{tv_id}",
+                    )
                 except Exception as err:
                     _LOGGER.warning(f"Auto motion: Failed to turn off {tv_name}: {err}")
                     log_activity(
