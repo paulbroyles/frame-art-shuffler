@@ -260,6 +260,7 @@ class TVConnectionManager:
         )
         self._lock = asyncio.Lock()
         self._last_art_ok: float = 0  # monotonic timestamp of last successful art op
+        self._stale_since: Optional[float] = None  # monotonic timestamp when stale channel first detected
 
     def __repr__(self) -> str:
         return f"TV({self.ip})"
@@ -267,6 +268,12 @@ class TVConnectionManager:
     @property
     def art(self) -> SamsungTVAsyncArt:
         return self._art
+
+    def stale_duration(self) -> float:
+        """Return seconds since the art channel was first detected stale, or 0.0 if healthy."""
+        if self._stale_since is None:
+            return 0.0
+        return asyncio.get_event_loop().time() - self._stale_since
 
     async def ensure_connected(self, timeout: Optional[float] = None) -> None:
         """Open the art channel connection if not already alive.
@@ -308,12 +315,15 @@ class TVConnectionManager:
             try:
                 await asyncio.wait_for(self._art.get_artmode(), timeout=2.0)
                 self._last_art_ok = now
+                self._stale_since = None  # channel is healthy
                 return  # Art channel is healthy
             except Exception:
                 _LOGGER.debug(
                     "Art channel probe failed for %s; connection is stale — reconnecting",
                     self,
                 )
+                if self._stale_since is None:
+                    self._stale_since = now
                 await self.async_close()
 
         async with self._lock:
@@ -356,6 +366,70 @@ class TVConnectionManager:
             await self._art.close()
         except Exception as err:  # pylint: disable=broad-except
             _LOGGER.debug("Error closing art client for %s: %s", self, err)
+
+    async def recover_art_channel(self, mac_address: Optional[str] = None) -> bool:
+        """Recover a stale art channel by power-cycling the TV screen.
+
+        Sends KEY_POWER via the remote WebSocket (port 8002, unaffected by the broken
+        art channel) to put the TV into standby, then wakes it back into art mode via
+        wake_into_art_mode() which handles CEC interference from Apple TV or other devices.
+
+        Returns True if the art channel is healthy and in art mode afterward, False otherwise.
+        The caller should stamp a cooldown timestamp regardless of the return value.
+        """
+        ip = self.ip
+        _LOGGER.info("Art channel recovery: starting power-cycle for %s", ip)
+
+        # 1. Confirm PowerState: on before doing anything disruptive.
+        info = await _rest_device_info(ip, timeout=5.0)
+        if not info or info.get("device", {}).get("PowerState") != "on":
+            _LOGGER.warning(
+                "Art channel recovery: %s PowerState is not 'on' — aborting", ip
+            )
+            return False
+
+        # 2. Send KEY_POWER to enter standby; poll REST until PowerState: standby.
+        try:
+            await _remote_click(ip, "KEY_POWER")
+            _LOGGER.info("Art channel recovery: KEY_POWER sent to %s — waiting for standby", ip)
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.warning("Art channel recovery: failed to send KEY_POWER to %s: %s", ip, err)
+            return False
+
+        deadline = asyncio.get_event_loop().time() + 30
+        in_standby = False
+        while asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(2)
+            info = await _rest_device_info(ip, timeout=3.0)
+            power = (info or {}).get("device", {}).get("PowerState", "")
+            if power == "standby":
+                in_standby = True
+                _LOGGER.info("Art channel recovery: %s entered standby", ip)
+                break
+
+        if not in_standby:
+            _LOGGER.warning(
+                "Art channel recovery: %s did not enter standby within 30s — aborting", ip
+            )
+            return False
+
+        # 3. Drop the stale WebSocket, then wake back into art mode.
+        # wake_into_art_mode() handles CEC interference: if the TV comes up in TV/HDMI
+        # mode instead of art mode, it sends a second KEY_POWER during the boot spinner.
+        await self.async_close()
+        ok = await wake_into_art_mode(ip, self)
+        if not ok:
+            _LOGGER.warning("Art channel recovery: failed to wake %s into art mode", ip)
+            return False
+
+        if self._stale_since is not None:
+            _LOGGER.warning(
+                "Art channel recovery: probe still failing for %s after power-cycle", ip
+            )
+            return False
+
+        _LOGGER.info("Art channel recovery: %s fully recovered", ip)
+        return True
 
 
 async def _rest_device_info(ip: str, timeout: float) -> Optional[dict]:
@@ -1376,12 +1450,11 @@ async def set_art_mode(client: TVConnectionManager) -> None:
         raise FrameArtUploadError(f"Failed to switch {client} to art mode: {err}") from err
 
 
-async def tv_screen_on(ip: str) -> None:
-    """Turn on the Frame TV screen via a short KEY_POWER click on the remote channel.
+async def _remote_click(ip: str, key: str) -> None:
+    """Send a single remote-key click to the TV via the WebSocket remote channel (port 8002).
 
-    Used when the TV is in light standby (screen off, network reachable) and needs
-    to be woken without a full WoL sequence.  A single KEY_POWER click turns the screen
-    on; the caller should then call set_art_mode() to switch to art mode.
+    Uses a short-lived connection so it works even when the art channel is stale.
+    Raises on connection failure or send error.
     """
     token_path = _token_path(ip)
     remote = SamsungTVWSAsyncRemote(
@@ -1392,10 +1465,119 @@ async def tv_screen_on(ip: str) -> None:
         name="FrameArtShuffler",
     )
     try:
-        await remote.send_commands([SendRemoteKey.click("KEY_POWER")])
-        _LOGGER.info("KEY_POWER click sent to %s (screen on)", ip)
+        await remote.send_commands([SendRemoteKey.click(key)])
     finally:
         await remote.close()
+
+
+async def wake_into_art_mode(ip: str, client: "TVConnectionManager") -> bool:
+    """Wake a Frame TV from standby into art mode, defeating CEC interference.
+
+    Samsung Frame TVs will sometimes wake in TV/HDMI mode after a CEC power-off
+    (e.g. Apple TV powers off and drags the Frame TV with it).  From TV mode,
+    set_artmode("on") is silently ignored, so we need a state-aware sequence:
+
+    1. Send KEY_POWER (first click: standby → waking, spinner appears)
+    2. Poll the art channel every 300ms — must get a response before CEC fires (~2-3s)
+       - Art mode confirmed → done ✓
+       - TV/HDMI mode detected → send second KEY_POWER during the spinner
+    3. After second click: allow 2s settle, then confirm art mode
+
+    The tight 300ms poll is intentional: CEC from Apple TV (and similar) fires
+    within 2-3 seconds of the TV waking, so the second click must land before that.
+
+    Returns True if art mode is confirmed, False if it could not be achieved.
+    """
+    _INITIAL_SETTLE = 0.5       # let the TV start waking before first probe
+    _POLL_INTERVAL = 0.3        # must beat CEC at ~2-3s — keep tight
+    _FIRST_PHASE_TIMEOUT = 5.0  # seconds to detect mode after click 1
+    _POST_CLICK2_SETTLE = 2.0   # seconds for TV to settle after click 2
+    _SECOND_PHASE_TIMEOUT = 8.0 # seconds to confirm art mode after click 2
+
+    # First KEY_POWER: from standby → waking
+    try:
+        await _remote_click(ip, "KEY_POWER")
+        _LOGGER.info("wake_into_art_mode: KEY_POWER (click 1) sent to %s", ip)
+    except Exception as err:  # pylint: disable=broad-except
+        _LOGGER.warning("wake_into_art_mode: click 1 failed for %s: %s", ip, err)
+        return False
+
+    await asyncio.sleep(_INITIAL_SETTLE)
+
+    # Phase 1: detect mode before CEC has a chance to fire.
+    art_mode_status = None
+    deadline = asyncio.get_event_loop().time() + _FIRST_PHASE_TIMEOUT
+    while asyncio.get_event_loop().time() < deadline:
+        try:
+            await client.ensure_connected(timeout=2)
+            art_mode_status = await client.art.get_artmode()
+            break  # got a definitive answer
+        except Exception:
+            await asyncio.sleep(_POLL_INTERVAL)
+
+    if art_mode_status == _ART_MODE_ON:
+        _LOGGER.info("wake_into_art_mode: %s in art mode after click 1 (clean wake)", ip)
+        return True
+
+    if art_mode_status is None:
+        _LOGGER.warning(
+            "wake_into_art_mode: art channel unreachable within %.0fs for %s",
+            _FIRST_PHASE_TIMEOUT, ip,
+        )
+        return False
+
+    # TV/HDMI mode — send second KEY_POWER during the spinner to redirect to art mode.
+    _LOGGER.info(
+        "wake_into_art_mode: %s woke in TV/HDMI mode (status=%s) — sending click 2",
+        ip, art_mode_status,
+    )
+    try:
+        await _remote_click(ip, "KEY_POWER")
+        _LOGGER.info("wake_into_art_mode: click 2 sent to %s", ip)
+    except Exception as err:  # pylint: disable=broad-except
+        _LOGGER.warning("wake_into_art_mode: click 2 failed for %s: %s", ip, err)
+        return False
+
+    # Phase 2: confirm art mode after the CEC-defeating click.
+    await asyncio.sleep(_POST_CLICK2_SETTLE)
+    deadline = asyncio.get_event_loop().time() + _SECOND_PHASE_TIMEOUT
+    while asyncio.get_event_loop().time() < deadline:
+        try:
+            await client.ensure_connected(timeout=2)
+            status = await client.art.get_artmode()
+            if status == _ART_MODE_ON:
+                _LOGGER.info("wake_into_art_mode: %s in art mode after click 2", ip)
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(_POLL_INTERVAL)
+
+    _LOGGER.warning("wake_into_art_mode: art mode not confirmed after click 2 for %s", ip)
+    return False
+
+
+async def tv_screen_on(ip: str, client: Optional["TVConnectionManager"] = None) -> bool:
+    """Wake a Frame TV from light standby into art mode.
+
+    Uses wake_into_art_mode() which handles CEC interference from Apple TV and
+    other devices.  If client is None, only the first KEY_POWER click is sent
+    (legacy behaviour — no CEC-defeating second click).
+
+    Returns True if art mode was confirmed, False otherwise.
+    Previously this function sent a single KEY_POWER click; callers that were
+    relying on that and then calling set_art_mode() separately can now use this
+    directly — the CEC-aware sequence subsumes both steps.
+    """
+    if client is not None:
+        return await wake_into_art_mode(ip, client)
+    # Fallback: no client — send a single click (legacy callers, no art-mode confirmation).
+    try:
+        await _remote_click(ip, "KEY_POWER")
+        _LOGGER.info("KEY_POWER click sent to %s (screen on, no client for art-mode check)", ip)
+        return True
+    except Exception as err:  # pylint: disable=broad-except
+        _LOGGER.warning("tv_screen_on: KEY_POWER failed for %s: %s", ip, err)
+        return False
 
 
 async def tv_off(ip: str) -> None:

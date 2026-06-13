@@ -914,6 +914,8 @@ if _HA_AVAILABLE:
             "upload_in_progress": set(),
             "auto_shuffle_next_times": {},
             "tv_model_years": {},
+            "recovery_pending": {},    # tv_id → {"pending_since": monotonic, "reason": str}
+            "art_channel_recovery": {},  # tv_id → {"cooldown_until": monotonic}
         }
 
         # Migrate tagset definitions from config entry to manager (one-time).
@@ -2519,6 +2521,118 @@ if _HA_AVAILABLE:
             if tv_config.get(CONF_ENABLE_AUTO_SHUFFLE, False):
                 _LOGGER.debug("Auto shuffle: Starting timer for %s", tv_config.get("name", tv_id))
                 start_auto_shuffle_timer(tv_id)
+
+        # ===== ART CHANNEL RECOVERY WATCHDOG =====
+        # Periodically checks for TVs with a pending stale-channel recovery and
+        # power-cycles them when the timing is appropriate (screen off, or overnight
+        # fallback when deferred too long).
+
+        # Reasons that should recover at the next watchdog tick (screen state irrelevant).
+        _IMMEDIATE_RECOVERY_REASONS = frozenset({
+            "manual", "calendar_event", "calendar_event_end", "expiry",
+            "override", "override_clear", "tagset_select",
+        })
+        _OVERNIGHT_HOURS_START = 3   # 03:00 local
+        _OVERNIGHT_HOURS_END = 5     # 05:00 local
+        _OVERNIGHT_DEFER_THRESHOLD = 3 * 3600  # defer threshold before overnight fallback (s)
+        _RECOVERY_COOLDOWN = 2 * 3600  # minimum time between recovery attempts per TV (s)
+
+        async def _async_art_channel_watchdog(_now: datetime) -> None:
+            """Check for pending art channel recoveries and execute when appropriate."""
+            data = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+            if not data:
+                return
+
+            recovery_pending: dict = data.get("recovery_pending", {})
+            art_channel_recovery: dict = data.get("art_channel_recovery", {})
+            now_mono = asyncio.get_event_loop().time()
+            local_hour = datetime.now().hour
+
+            for tv_id in list(recovery_pending):
+                tv_cfg = entry.data.get("tvs", {}).get(tv_id)
+                if not tv_cfg or not tv_cfg.get("auto_recover_art_channel", False):
+                    recovery_pending.pop(tv_id, None)
+                    continue
+
+                client = data.get("art_clients", {}).get(tv_id)
+                if not client or client.stale_duration() == 0.0:
+                    # Channel healthy again (e.g. manual power-cycle) — clear flag.
+                    recovery_pending.pop(tv_id, None)
+                    continue
+
+                # Cooldown guard — don't hammer the TV repeatedly.
+                cooldown_until = art_channel_recovery.get(tv_id, {}).get("cooldown_until", 0)
+                if now_mono < cooldown_until:
+                    continue
+
+                pending = recovery_pending[tv_id]
+                reason = pending.get("reason", "auto")
+                pending_age = now_mono - pending.get("pending_since", now_mono)
+
+                # Decide whether to recover now.
+                tv_name = tv_cfg.get("name", tv_id)
+                tv_ip = tv_cfg.get("ip", "")
+                should_recover = False
+
+                if reason in _IMMEDIATE_RECOVERY_REASONS:
+                    should_recover = True
+                else:
+                    # Scheduled origin: prefer screen-off window; fall back to overnight.
+                    try:
+                        screen_on = await is_screen_on(tv_ip)
+                    except Exception:
+                        screen_on = True  # assume screen on if we can't check
+                    if not screen_on:
+                        should_recover = True
+                    elif pending_age > _OVERNIGHT_DEFER_THRESHOLD:
+                        if _OVERNIGHT_HOURS_START <= local_hour < _OVERNIGHT_HOURS_END:
+                            should_recover = True
+                        else:
+                            log_activity(
+                                hass, entry.entry_id, tv_id,
+                                "art_channel_stale_deferred",
+                                f"Art channel stale for {tv_name} — deferring recovery "
+                                f"({pending_age / 3600:.1f}h pending; waiting for overnight window)",
+                            )
+
+                if not should_recover:
+                    continue
+
+                _LOGGER.info(
+                    "Art channel watchdog: recovering %s (reason=%s, pending=%.0fs)",
+                    tv_name, reason, pending_age,
+                )
+                mac = tv_cfg.get("mac")
+                try:
+                    ok = await client.recover_art_channel(mac_address=mac)
+                except Exception as err:  # pylint: disable=broad-except
+                    _LOGGER.warning("Art channel recovery exception for %s: %s", tv_name, err)
+                    ok = False
+
+                # Stamp cooldown regardless of outcome.
+                art_channel_recovery[tv_id] = {"cooldown_until": now_mono + _RECOVERY_COOLDOWN}
+                recovery_pending.pop(tv_id, None)
+
+                if ok:
+                    log_activity(
+                        hass, entry.entry_id, tv_id,
+                        "art_channel_recovered",
+                        f"Art channel recovered for {tv_name} (was stale for {pending_age / 60:.0f}min)",
+                    )
+                else:
+                    log_activity(
+                        hass, entry.entry_id, tv_id,
+                        "art_channel_recovery_failed",
+                        f"Art channel recovery failed for {tv_name} — will retry after cooldown",
+                    )
+
+        entry.async_on_unload(
+            async_track_time_interval(
+                hass,
+                _async_art_channel_watchdog,
+                timedelta(seconds=60),
+            )
+        )
 
         # ===== AUTO MOTION CONTROL =====
         # Per-TV motion listener and off-timer management

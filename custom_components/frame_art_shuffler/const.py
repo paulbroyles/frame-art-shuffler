@@ -49,6 +49,9 @@ CONF_MOOD_BASELINE_FLOOR = "mood_baseline_floor"  # float 0.0-1.0, reserved frac
 CONF_CALENDAR_ENTITY_ID = "calendar_entity_id"  # HA calendar entity to monitor for tagset overrides
 CONF_CALENDAR_SUPPRESS_MOODS = "calendar_suppress_moods"  # per-TV runtime flag: suppress moods during calendar event
 
+# Art channel auto-recovery
+CONF_AUTO_RECOVER_ART_CHANNEL = "auto_recover_art_channel"
+
 DEFAULT_LOGGING_ENABLED = True
 DEFAULT_LOG_RETENTION_MONTHS = 6
 DEFAULT_LOG_FLUSH_MINUTES = 5

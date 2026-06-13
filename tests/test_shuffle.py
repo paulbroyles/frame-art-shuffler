@@ -1608,3 +1608,107 @@ class TestAsyncTriggerPrefetch:
                 )
 
         asyncio.run(_run())
+
+
+class TestAsyncGuardedUpload:
+    """Tests for async_guarded_upload timeout cap (Deliverable A)."""
+
+    def _make_entry(self, tv_id="tv1"):
+        entry = MagicMock()
+        entry.entry_id = "entry1"
+        entry.data = {"tvs": {tv_id: {"name": "Test TV", "ip": "192.168.1.100"}}}
+        return entry
+
+    def _make_hass(self, entry):
+        hass = MagicMock()
+        hass.data = {
+            "frame_art_shuffler": {
+                entry.entry_id: {
+                    "upload_in_progress": set(),
+                    "last_upload_cleared_at": None,
+                }
+            }
+        }
+        return hass
+
+    def test_normal_completion_clears_flag(self):
+        """Successful work() clears upload_in_progress and returns the result."""
+        async def _run():
+            from custom_components.frame_art_shuffler.shuffle import async_guarded_upload
+
+            entry = self._make_entry()
+            hass = self._make_hass(entry)
+            result = await async_guarded_upload(hass, entry, "tv1", "upload", AsyncMock(return_value=42))
+            assert result == 42
+            assert "tv1" not in hass.data["frame_art_shuffler"][entry.entry_id]["upload_in_progress"]
+
+        asyncio.run(_run())
+
+    def test_skip_when_flag_already_set(self):
+        """Returns None without calling work() when another upload is in flight."""
+        async def _run():
+            from custom_components.frame_art_shuffler.shuffle import async_guarded_upload
+
+            entry = self._make_entry()
+            hass = self._make_hass(entry)
+            hass.data["frame_art_shuffler"][entry.entry_id]["upload_in_progress"].add("tv1")
+
+            work = AsyncMock(return_value=99)
+            result = await async_guarded_upload(hass, entry, "tv1", "upload", work)
+            assert result is None
+            work.assert_not_called()
+
+        asyncio.run(_run())
+
+    def test_exception_propagation_clears_flag(self):
+        """Exception from work() bubbles up and still clears the flag."""
+        async def _run():
+            from custom_components.frame_art_shuffler.shuffle import async_guarded_upload
+
+            entry = self._make_entry()
+            hass = self._make_hass(entry)
+            with pytest.raises(RuntimeError, match="boom"):
+                await async_guarded_upload(
+                    hass, entry, "tv1", "upload", AsyncMock(side_effect=RuntimeError("boom"))
+                )
+            assert "tv1" not in hass.data["frame_art_shuffler"][entry.entry_id]["upload_in_progress"]
+
+        asyncio.run(_run())
+
+    def test_timeout_clears_flag_and_raises_frame_art_error(self):
+        """Timeout clears upload_in_progress and raises FrameArtError, not TimeoutError."""
+        async def _run():
+            from custom_components.frame_art_shuffler.frame_tv import FrameArtError
+
+            entry = self._make_entry()
+            hass = self._make_hass(entry)
+
+            async def _hang():
+                await asyncio.sleep(9999)
+
+            with patch("custom_components.frame_art_shuffler.shuffle._GUARDED_UPLOAD_TIMEOUT", 0.05):
+                from custom_components.frame_art_shuffler.shuffle import async_guarded_upload
+                with pytest.raises(FrameArtError):
+                    await async_guarded_upload(hass, entry, "tv1", "upload", _hang)
+
+            assert "tv1" not in hass.data["frame_art_shuffler"][entry.entry_id]["upload_in_progress"]
+
+        asyncio.run(_run())
+
+    def test_timeout_error_message_includes_tv_name(self):
+        """FrameArtError raised on timeout includes the TV name for diagnostics."""
+        async def _run():
+            from custom_components.frame_art_shuffler.frame_tv import FrameArtError
+
+            entry = self._make_entry()
+            hass = self._make_hass(entry)
+
+            async def _hang():
+                await asyncio.sleep(9999)
+
+            with patch("custom_components.frame_art_shuffler.shuffle._GUARDED_UPLOAD_TIMEOUT", 0.05):
+                from custom_components.frame_art_shuffler.shuffle import async_guarded_upload
+                with pytest.raises(FrameArtError, match="Test TV"):
+                    await async_guarded_upload(hass, entry, "tv1", "upload", _hang)
+
+        asyncio.run(_run())

@@ -43,6 +43,7 @@ from .const import (
     CONF_ENABLE_DYNAMIC_BRIGHTNESS,
     CONF_ENABLE_MOTION_CONTROL,
     CONF_MOTION_OFF_DELAY,
+    CONF_AUTO_RECOVER_ART_CHANNEL,
     DEFAULT_LOGGING_ENABLED,
     DEFAULT_LOG_FLUSH_MINUTES,
     DEFAULT_LOG_RETENTION_MONTHS,
@@ -505,6 +506,7 @@ class FrameArtOptionsFlowHandler(config_entries.OptionsFlow):
                 vol.Optional(CONF_MAX_BRIGHTNESS, default=current_config.get("max_brightness", 10)): vol.All(vol.Coerce(int), vol.Range(min=1, max=10)),
                 vol.Optional(CONF_ENABLE_MOTION_CONTROL, default=current_config.get("enable_motion_control", False)): bool,
                 vol.Optional(CONF_MOTION_OFF_DELAY, default=current_config.get("motion_off_delay", 15)): vol.All(vol.Coerce(int), vol.Range(min=1, max=120)),
+                vol.Optional(CONF_AUTO_RECOVER_ART_CHANNEL, default=current_config.get("auto_recover_art_channel", False)): bool,
                 vol.Optional(CONF_REPAIR, default=False): bool,
             }
         )

@@ -131,6 +131,10 @@ SkipCallback = Callable[[], None]
 StatusCallback = Callable[[str, str], None]
 
 
+# WoL ~45s + 3 retries × ~30s = ~135s worst case for a healthy upload; cap at 150s.
+_GUARDED_UPLOAD_TIMEOUT = 150
+
+
 async def async_guarded_upload(
     hass: HomeAssistant,
     entry: Any,
@@ -158,7 +162,20 @@ async def async_guarded_upload(
 
     upload_flags.add(tv_id)
     try:
-        return await work()
+        try:
+            async with asyncio.timeout(_GUARDED_UPLOAD_TIMEOUT):
+                return await work()
+        except TimeoutError as err:
+            tv_config = get_tv_config(entry, tv_id) or {}
+            tv_name = tv_config.get("name", tv_id)
+            _LOGGER.warning(
+                "Upload for %s (%s) timed out after %ss — art channel may be stale",
+                tv_name, tv_id, _GUARDED_UPLOAD_TIMEOUT,
+            )
+            raise FrameArtError(
+                f"Upload for {tv_name} timed out after {_GUARDED_UPLOAD_TIMEOUT}s "
+                "— art channel may be stale; try again"
+            ) from err
     finally:
         upload_flags.discard(tv_id)
         data["last_upload_cleared_at"] = asyncio.get_event_loop().time()
@@ -799,6 +816,19 @@ async def async_shuffle_tv(
             f"Shuffle failed: {err}",
         )
         _notify("error", f"Shuffle failed: {err}")
+        # If the art channel is stale and auto-recovery is opt-in, flag for watchdog.
+        if tv_config and tv_config.get("auto_recover_art_channel", False):
+            entry_data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+            client = entry_data.get("art_clients", {}).get(tv_id)
+            if client and client.stale_duration() > 0:
+                entry_data.setdefault("recovery_pending", {})[tv_id] = {
+                    "pending_since": asyncio.get_event_loop().time(),
+                    "reason": reason,
+                }
+                _LOGGER.info(
+                    "Stale art channel flagged for %s (reason=%s) — watchdog will recover",
+                    tv_name, reason,
+                )
         return False
 
 
