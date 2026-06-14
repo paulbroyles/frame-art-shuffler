@@ -380,36 +380,45 @@ class TVConnectionManager:
         ip = self.ip
         _LOGGER.info("Art channel recovery: starting power-cycle for %s", ip)
 
-        # 1. Confirm PowerState: on before doing anything disruptive.
+        # 1. Check PowerState — determines whether we need to turn the TV off first.
         info = await _rest_device_info(ip, timeout=5.0)
-        if not info or info.get("device", {}).get("PowerState") != "on":
-            _LOGGER.warning(
-                "Art channel recovery: %s PowerState is not 'on' — aborting", ip
+        power_state = (info or {}).get("device", {}).get("PowerState", "")
+
+        if power_state == "standby":
+            # Already off (screen-off / art mode standby). Room is unoccupied — wake
+            # directly into art mode without a turn-off step.
+            _LOGGER.info(
+                "Art channel recovery: %s is in standby — waking directly into art mode", ip
             )
-            return False
+        elif power_state == "on":
+            # 2. Screen is on — send KEY_POWER to enter standby first, then wake back.
+            try:
+                await _remote_click(ip, "KEY_POWER")
+                _LOGGER.info("Art channel recovery: KEY_POWER sent to %s — waiting for standby", ip)
+            except Exception as err:  # pylint: disable=broad-except
+                _LOGGER.warning("Art channel recovery: failed to send KEY_POWER to %s: %s", ip, err)
+                return False
 
-        # 2. Send KEY_POWER to enter standby; poll REST until PowerState: standby.
-        try:
-            await _remote_click(ip, "KEY_POWER")
-            _LOGGER.info("Art channel recovery: KEY_POWER sent to %s — waiting for standby", ip)
-        except Exception as err:  # pylint: disable=broad-except
-            _LOGGER.warning("Art channel recovery: failed to send KEY_POWER to %s: %s", ip, err)
-            return False
+            deadline = asyncio.get_event_loop().time() + 30
+            in_standby = False
+            while asyncio.get_event_loop().time() < deadline:
+                await asyncio.sleep(2)
+                info = await _rest_device_info(ip, timeout=3.0)
+                power = (info or {}).get("device", {}).get("PowerState", "")
+                if power == "standby":
+                    in_standby = True
+                    _LOGGER.info("Art channel recovery: %s entered standby", ip)
+                    break
 
-        deadline = asyncio.get_event_loop().time() + 30
-        in_standby = False
-        while asyncio.get_event_loop().time() < deadline:
-            await asyncio.sleep(2)
-            info = await _rest_device_info(ip, timeout=3.0)
-            power = (info or {}).get("device", {}).get("PowerState", "")
-            if power == "standby":
-                in_standby = True
-                _LOGGER.info("Art channel recovery: %s entered standby", ip)
-                break
-
-        if not in_standby:
+            if not in_standby:
+                _LOGGER.warning(
+                    "Art channel recovery: %s did not enter standby within 30s — aborting", ip
+                )
+                return False
+        else:
+            # Unreachable / deep sleep — cannot recover.
             _LOGGER.warning(
-                "Art channel recovery: %s did not enter standby within 30s — aborting", ip
+                "Art channel recovery: %s PowerState is '%s' — aborting", ip, power_state
             )
             return False
 

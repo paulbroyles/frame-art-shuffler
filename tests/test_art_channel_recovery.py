@@ -202,7 +202,7 @@ class TestArtChannelWatchdog:
 
         _IMMEDIATE_RECOVERY_REASONS = frozenset({
             "manual", "calendar_event", "calendar_event_end", "expiry",
-            "override", "override_clear", "tagset_select",
+            "override", "override_clear", "tagset_select", "turn_on_reshuffle",
         })
         _OVERNIGHT_HOURS_START = 3
         _OVERNIGHT_HOURS_END = 5
@@ -352,6 +352,18 @@ class TestArtChannelWatchdog:
 
         asyncio.run(_run())
 
+    def test_turn_on_reshuffle_recovers_immediately(self):
+        """turn_on_reshuffle is an immediate reason — recovers on next tick even with screen on."""
+        async def _run():
+            entry, data, client, hass, _, _ = self._build_watchdog_scenario(
+                pending_reason="turn_on_reshuffle", screen_on=True
+            )
+            await self._run_watchdog(entry, data, client, hass, screen_on=True, local_hour=9)
+            assert "tv1" not in data["recovery_pending"]
+            assert "tv1" in data["art_channel_recovery"]
+
+        asyncio.run(_run())
+
     def test_stale_clears_if_channel_recovered_externally(self):
         """If stale_duration() → 0 between checks, pending is cleared without recovery."""
         async def _run():
@@ -481,5 +493,85 @@ class TestWakeIntoArtMode:
             ):
                 result = await wake_into_art_mode("192.168.1.50", client)
             assert result is False
+
+        asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# 5. recover_art_channel standby path
+# ---------------------------------------------------------------------------
+
+class TestRecoverArtChannelStandby:
+    """recover_art_channel handles PowerState=standby without a turn-off step."""
+
+    def _make_manager_with_stale(self, ip="192.168.1.50"):
+        mgr = _make_manager(ip)
+        mgr._stale_since = None  # will be cleared by successful wake_into_art_mode
+        return mgr
+
+    def test_standby_skips_turn_off_calls_wake(self):
+        """PowerState=standby → wake_into_art_mode called without KEY_POWER first."""
+        async def _run():
+            from custom_components.frame_art_shuffler.frame_tv import TVConnectionManager
+
+            mgr = _make_manager()
+            mgr._stale_since = None
+
+            rest_info = {"device": {"PowerState": "standby"}}
+            clicks = []
+
+            async def _fake_click(ip, key):
+                clicks.append(key)
+
+            async def _fake_wake(ip, client):
+                client._stale_since = None  # simulate successful recovery
+                return True
+
+            with patch("custom_components.frame_art_shuffler.frame_tv._rest_device_info", return_value=rest_info):
+                with patch("custom_components.frame_art_shuffler.frame_tv._remote_click", side_effect=_fake_click):
+                    with patch("custom_components.frame_art_shuffler.frame_tv.wake_into_art_mode", side_effect=_fake_wake):
+                        result = await mgr.recover_art_channel()
+
+            assert result is True
+            # No KEY_POWER sent (turn-off step skipped)
+            assert clicks == []
+
+        asyncio.run(_run())
+
+    def test_standby_returns_false_if_wake_fails(self):
+        """PowerState=standby → wake_into_art_mode fails → returns False."""
+        async def _run():
+            mgr = _make_manager()
+            mgr._stale_since = 1.0  # still stale after failed wake
+
+            rest_info = {"device": {"PowerState": "standby"}}
+
+            async def _fake_wake(ip, client):
+                return False
+
+            with patch("custom_components.frame_art_shuffler.frame_tv._rest_device_info", return_value=rest_info):
+                with patch("custom_components.frame_art_shuffler.frame_tv._remote_click", new=AsyncMock()):
+                    with patch("custom_components.frame_art_shuffler.frame_tv.wake_into_art_mode", side_effect=_fake_wake):
+                        result = await mgr.recover_art_channel()
+
+            assert result is False
+
+        asyncio.run(_run())
+
+    def test_unreachable_tv_returns_false(self):
+        """REST returns None (TV unreachable) → abort without clicking."""
+        async def _run():
+            mgr = _make_manager()
+            clicks = []
+
+            async def _fake_click(ip, key):
+                clicks.append(key)
+
+            with patch("custom_components.frame_art_shuffler.frame_tv._rest_device_info", return_value=None):
+                with patch("custom_components.frame_art_shuffler.frame_tv._remote_click", side_effect=_fake_click):
+                    result = await mgr.recover_art_channel()
+
+            assert result is False
+            assert clicks == []
 
         asyncio.run(_run())

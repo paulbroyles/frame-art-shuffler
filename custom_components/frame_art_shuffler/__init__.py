@@ -2530,7 +2530,7 @@ if _HA_AVAILABLE:
         # Reasons that should recover at the next watchdog tick (screen state irrelevant).
         _IMMEDIATE_RECOVERY_REASONS = frozenset({
             "manual", "calendar_event", "calendar_event_end", "expiry",
-            "override", "override_clear", "tagset_select",
+            "override", "override_clear", "tagset_select", "turn_on_reshuffle",
         })
         _OVERNIGHT_HOURS_START = 3   # 03:00 local
         _OVERNIGHT_HOURS_END = 5     # 05:00 local
