@@ -261,6 +261,7 @@ class TVConnectionManager:
         self._lock = asyncio.Lock()
         self._last_art_ok: float = 0  # monotonic timestamp of last successful art op
         self._stale_since: Optional[float] = None  # monotonic timestamp when stale channel first detected
+        self._on_stale_onset: Optional[callable] = None  # called once when staleness is first detected
 
     def __repr__(self) -> str:
         return f"TV({self.ip})"
@@ -324,6 +325,11 @@ class TVConnectionManager:
                 )
                 if self._stale_since is None:
                     self._stale_since = now
+                    if self._on_stale_onset is not None:
+                        try:
+                            self._on_stale_onset()
+                        except Exception:  # pylint: disable=broad-except
+                            pass
                 await self.async_close()
 
         async with self._lock:

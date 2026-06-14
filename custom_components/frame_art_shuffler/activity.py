@@ -83,6 +83,7 @@ EVENT_TYPES = {
     "select_image": ("mdi:image", "Image selected"),
     "integration_start": ("mdi:play-circle", "Integration started"),
     "error": ("mdi:alert-circle", "Error occurred"),
+    "art_channel_stale_detected": ("mdi:connection-off", "Art channel went stale"),
     "art_channel_stale_deferred": ("mdi:timer-sand", "Art channel stale — recovery deferred"),
     "art_channel_recovered": ("mdi:check-circle", "Art channel recovered"),
     "art_channel_recovery_failed": ("mdi:alert-octagon", "Art channel recovery failed"),

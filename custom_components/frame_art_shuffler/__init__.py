@@ -889,11 +889,22 @@ if _HA_AVAILABLE:
         await tagset_cache.async_refresh()
         await mood_cache.async_refresh()
 
-        art_clients = {
-            tv_id: TVConnectionManager(tv_cfg["ip"])
-            for tv_id, tv_cfg in entry.data.get("tvs", {}).items()
-            if tv_cfg.get("ip")
-        }
+        art_clients = {}
+        for tv_id, tv_cfg in entry.data.get("tvs", {}).items():
+            if not tv_cfg.get("ip"):
+                continue
+            client = TVConnectionManager(tv_cfg["ip"])
+            tv_name = tv_cfg.get("name", tv_id)
+            def _make_stale_onset_cb(_tv_id=tv_id, _tv_name=tv_name):
+                def _cb():
+                    log_activity(
+                        hass, entry.entry_id, _tv_id,
+                        "art_channel_stale_detected",
+                        f"Art channel went stale for {_tv_name}",
+                    )
+                return _cb
+            client._on_stale_onset = _make_stale_onset_cb()
+            art_clients[tv_id] = client
 
         hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
             "coordinator": coordinator,
